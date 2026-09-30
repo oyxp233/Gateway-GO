@@ -1,0 +1,589 @@
+package auth
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"s4a21-gateway/pkg/config"
+	"s4a21-gateway/pkg/logger"
+	"s4a21-gateway/pkg/models"
+	"s4a21-gateway/pkg/service"
+	"s4a21-gateway/pkg/session"
+)
+
+// Handler 实现 CommandHandler 接口，处理 TCP 命令。
+type Handler struct {
+	accountSvc    *service.AccountService
+	adminSvc      *service.AdminService
+	sessionMgr    *session.SessionManager
+	registerBonus *service.RegisterBonusService
+	// qqBindSvc 负责「账号绑定 QQ 号」（2026-09-24）。
+	//
+	// 允许为 nil：绑定是**可选增强**，没配 SMTP 时相关命令明确返回
+	// "邮件服务未开启"，而不是让整个网关起不来 —— 也没资格拖垮登录链路。
+	qqBindSvc *service.QQBindService
+	config    *config.GatewayConfig
+	logger    *logger.ConsoleLogger
+}
+
+// NewHandler 创建命令处理器。
+func NewHandler(
+	accountSvc *service.AccountService,
+	adminSvc *service.AdminService,
+	sessionMgr *session.SessionManager,
+	registerBonus *service.RegisterBonusService,
+	qqBindSvc *service.QQBindService,
+	cfg *config.GatewayConfig,
+	logger *logger.ConsoleLogger,
+) *Handler {
+	return &Handler{
+		accountSvc:    accountSvc,
+		adminSvc:      adminSvc,
+		sessionMgr:    sessionMgr,
+		registerBonus: registerBonus,
+		qqBindSvc:     qqBindSvc,
+		config:        cfg,
+		logger:        logger,
+	}
+}
+
+// Handle 处理 TCP 命令。
+func (h *Handler) Handle(req *models.GatewayRequest, clientIP string) (*models.GatewayResponse, error) {
+	// 版本门禁 + 维护模式门禁
+	if req.Cmd == models.Cmd.Login || req.Cmd == models.Cmd.Register || req.Cmd == models.Cmd.ChangePassword {
+		if gate := h.checkLauncherVersion(req); gate != nil {
+			return gate, nil
+		}
+		if gate := h.checkMaintenanceMode(req); gate != nil {
+			return gate, nil
+		}
+	}
+
+	switch req.Cmd {
+	case models.Cmd.Register:
+		return h.handleRegister(req), nil
+	case models.Cmd.Login:
+		return h.handleLogin(req, clientIP), nil
+	case models.Cmd.ChangePassword:
+		return h.handleChangePassword(req), nil
+	case models.Cmd.Health:
+		return h.handleHealth(req), nil
+	case models.Cmd.AccountInfo:
+		return h.handleAccountInfo(req), nil
+	case models.Cmd.AccountReset:
+		return h.handleAccountReset(req), nil
+	case models.Cmd.SendItems:
+		return h.handleSendItems(req), nil
+	case models.Cmd.GetRoles:
+		return h.handleGetRoles(req), nil
+	case models.Cmd.ClearMailbox:
+		return h.handleClearMailbox(req), nil
+	// ── QQ 号绑定（2026-09-24）─────────────────────────────────────────
+	// 三个命令都要求**已登录**：它们校验会话 token 而不是 auth_key。
+	// 理由：绑定是玩家自己的动作，不该由后台密钥代劳；
+	// 而且 token 已经把"是谁"绑定在会话上，玩家没法替别人绑。
+	case models.Cmd.SendBindCode:
+		return h.handleSendBindCode(req, clientIP), nil
+	case models.Cmd.BindQQ:
+		return h.handleBindQQ(req, clientIP), nil
+	case models.Cmd.UnbindQQ:
+		return h.handleUnbindQQ(req), nil
+	case models.Cmd.Version:
+		return h.handleVersion(), nil
+	default:
+		return failureResponse(req.Cmd, models.Err.UnknownCommand, "未知命令"), nil
+	}
+}
+
+func (h *Handler) handleRegister(req *models.GatewayRequest) *models.GatewayResponse {
+	account := deref(req.Account, "")
+	passwordMd5 := deref(req.PasswordMd5, "")
+
+	code := h.accountSvc.Register(account, passwordMd5)
+	if code == models.Err.Ok {
+		h.registerBonus.Register(account)
+		return successResponse(req.Cmd, "注册成功")
+	}
+	return failureResponse(req.Cmd, code, errorMessages[code])
+}
+
+func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
+	account := deref(req.Account, "")
+	passwordMd5 := deref(req.PasswordMd5, "")
+	deviceSecret := deref(req.DeviceSecret, "")
+
+	if clientIP == "" {
+		clientIP = "unknown"
+	}
+
+	// ★ QQ 号识别（2026-09-24）：登录框「账号名 / QQ 号」两个都能进。
+	//
+	// 只有「纯数字 + 绑定表命中」才翻译，其余原样返回 ——
+	// 所以账号名本身就是数字的老账号（游戏库迁移来的）行为完全不变。
+	// 歧义在绑定时就堵死了：绑定时会拒绝与现有账号名相同的 QQ 号。
+	//
+	// ⚠️ 必须在封禁检查**之前**翻译。否则被封的是账号 X、玩家用 QQ 号登录时，
+	// 封禁查的是"那个 QQ 号"这个根本不存在的账号名，封禁形同虚设。
+	if h.qqBindSvc != nil {
+		account = h.qqBindSvc.ResolveLoginAccount(account)
+	}
+
+	// 封禁检查：封禁账号不得登录。
+	// 历史版本只在心跳 CMD_HEALTH 里查封禁，被封账号重新登录直接放行
+	// （2026-09-23 真机验证发现："封禁后登录被拒" FAIL）。
+	if banned, _ := h.accountSvc.IsBanned(account); banned {
+		h.logger.Warn(fmt.Sprintf("拒绝登录: 账号=%s 已封禁 IP=%s", account, clientIP))
+		return failureResponse(req.Cmd, models.Err.Banned, errorMessages[models.Err.Banned])
+	}
+
+	result := h.accountSvc.Login(account, passwordMd5, deviceSecret, clientIP)
+	if result.ErrorCode != models.Err.Ok {
+		h.logger.Warn(fmt.Sprintf("登录失败: 账号=%s 错误码=%d IP=%s", account, result.ErrorCode, clientIP))
+		msg := errorMessages[result.ErrorCode]
+		if result.Message != nil {
+			msg = *result.Message
+		}
+		return failureResponse(req.Cmd, result.ErrorCode, msg)
+	}
+
+	h.registerBonus.ProcessOnLogin(account)
+
+	// 单账号单令牌：同一账号同时只存在一个会话。
+	// 未带 force_login 的重复登录返回 1023，由登录器弹窗让玩家选择
+	// 「踢掉之前的会话并继续」；带 force 的重复登录会踢旧会话（真断开）
+	// 并把在线时长/泡点进度结转到新会话，时长不再因重复登录清零。
+	_, alreadyOnline := h.sessionMgr.FindSessionByAccount(account)
+	if alreadyOnline && !deref(req.ForceLogin, false) {
+		h.logger.Warn(fmt.Sprintf("拒绝重复登录: 账号=%s 已在线 IP=%s", account, clientIP))
+		return failureResponse(req.Cmd, models.Err.AccountOnline,
+			"该账号已登录，如需继续将断开之前的会话")
+	}
+
+	token, _ := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, alreadyOnline)
+
+	resp := successResponse(req.Cmd)
+	resp.Token = strPtr(token)
+	resp.Cera = int64Ptr(result.Cera)
+	resp.MId = strPtr(result.MId)
+	resp.DeviceSecret = strPtr(result.DeviceSecret)
+	resp.DeviceChanged = boolPtr(result.DeviceChanged)
+	resp.LaunchArgs = strPtr(result.LaunchArgs)
+	// 已绑定的 QQ 号一并下发：登录器据此直接显示绑定状态，不用多一次往返。
+	// 注意这里的 account 已经是翻译后的**真实账号名**。
+	if h.qqBindSvc != nil {
+		if qq := h.qqBindSvc.BindingOf(account); qq != "" {
+			resp.QQNumber = strPtr(qq)
+		}
+	}
+	return resp
+}
+
+func (h *Handler) handleChangePassword(req *models.GatewayRequest) *models.GatewayResponse {
+	account := deref(req.Account, "")
+	oldPwdMd5 := deref(req.OldPwdMd5, "")
+	newPwdMd5 := deref(req.NewPwdMd5, "")
+
+	code := h.accountSvc.ChangePassword(account, oldPwdMd5, newPwdMd5)
+	if code == models.Err.Ok {
+		return successResponse(req.Cmd, "密码修改成功")
+	}
+	return failureResponse(req.Cmd, code, errorMessages[code])
+}
+
+func (h *Handler) handleHealth(req *models.GatewayRequest) *models.GatewayResponse {
+	token := deref(req.Token, "")
+	if token == "" {
+		return successResponse(req.Cmd)
+	}
+
+	sess, ok := h.sessionMgr.ValidateToken(token)
+	if !ok {
+		return failureResponse(req.Cmd, models.Err.SessionExpired, errorMessages[models.Err.SessionExpired])
+	}
+
+	banned, _ := h.accountSvc.IsBanned(sess.Account)
+	if banned {
+		h.sessionMgr.RemoveSession(token)
+		return failureResponse(req.Cmd, models.Err.Banned, errorMessages[models.Err.Banned])
+	}
+
+	return successResponse(req.Cmd)
+}
+
+func (h *Handler) handleAccountInfo(req *models.GatewayRequest) *models.GatewayResponse {
+	authKey := deref(req.AuthKey, "")
+	if !h.adminSvc.ValidateAuthKey(authKey) {
+		return failureResponse(req.Cmd, models.Err.InvalidAuthKey, "授权无效")
+	}
+
+	account := deref(req.Account, "")
+	info, err := h.accountSvc.GetAccountInfo(account)
+	if err != nil || info == nil {
+		return failureResponse(req.Cmd, models.Err.AccountNotFound, "账号不存在")
+	}
+
+	resp := successResponse(req.Cmd)
+	resp.MId = strPtr(info.MId)
+	resp.Cera = int64Ptr(info.Cera)
+	resp.TokenCera = int64Ptr(info.TokenCera)
+	resp.HappyTokenCera = int64Ptr(info.HappyTokenCera)
+	return resp
+}
+
+func (h *Handler) handleAccountReset(req *models.GatewayRequest) *models.GatewayResponse {
+	authKey := deref(req.AuthKey, "")
+	if !h.adminSvc.ValidateAuthKey(authKey) {
+		return failureResponse(req.Cmd, models.Err.InvalidAuthKey, "授权无效")
+	}
+
+	account := deref(req.Account, "")
+	newPwdMd5 := deref(req.NewPwdMd5, "")
+
+	code := h.adminSvc.ResetPassword(account, newPwdMd5)
+	if code == models.Err.Ok {
+		return successResponse(req.Cmd, "密码已重置")
+	}
+	return failureResponse(req.Cmd, code, errorMessages[code])
+}
+
+func (h *Handler) handleSendItems(req *models.GatewayRequest) *models.GatewayResponse {
+	authKey := deref(req.AuthKey, "")
+	if !h.adminSvc.ValidateAuthKey(authKey) {
+		return failureResponse(req.Cmd, models.Err.InvalidAuthKey, "授权无效")
+	}
+
+	characterId := int64PtrZero(req.CharacterId)
+	items := req.Items
+
+	if characterId <= 0 {
+		return failureResponse(req.Cmd, models.Err.InvalidCharacterId, errorMessages[models.Err.InvalidCharacterId])
+	}
+	if len(items) == 0 {
+		return failureResponse(req.Cmd, models.Err.EmptyAttachments, errorMessages[models.Err.EmptyAttachments])
+	}
+
+	result := h.adminSvc.SendItems(characterId, items)
+	if result.ErrorCode == models.Err.Ok {
+		return successResponse(req.Cmd, "邮件已投递")
+	}
+	return failureResponse(req.Cmd, result.ErrorCode, result.Message)
+}
+
+func (h *Handler) handleGetRoles(req *models.GatewayRequest) *models.GatewayResponse {
+	authKey := deref(req.AuthKey, "")
+	if !h.adminSvc.ValidateAuthKey(authKey) {
+		return failureResponse(req.Cmd, models.Err.InvalidAuthKey, "授权无效")
+	}
+
+	account := deref(req.Account, "")
+
+	result, _ := h.adminSvc.GetRoles(account)
+	if result.ErrorCode != models.Err.Ok {
+		return failureResponse(req.Cmd, result.ErrorCode, result.Message)
+	}
+
+	resp := successResponse(req.Cmd)
+	roles := make([]models.RoleInfo, len(result.Roles))
+	for i, r := range result.Roles {
+		roles[i] = models.RoleInfo{
+			CharacterId: r.CharacterId,
+			Name:        r.Name,
+			Level:       r.Level,
+			Job:         r.Job,
+			GrowType:    r.GrowType,
+			JobName:     r.JobName,
+			Exp:         r.Exp,
+		}
+	}
+	resp.Roles = roles
+	return resp
+}
+
+func (h *Handler) handleClearMailbox(req *models.GatewayRequest) *models.GatewayResponse {
+	authKey := deref(req.AuthKey, "")
+	if !h.adminSvc.ValidateAuthKey(authKey) {
+		return failureResponse(req.Cmd, models.Err.InvalidAuthKey, "授权无效")
+	}
+
+	characterId := int64PtrZero(req.CharacterId)
+	code, count := h.adminSvc.ClearMailbox(characterId)
+	if code != models.Err.Ok {
+		return failureResponse(req.Cmd, code, errorMessages[code])
+	}
+
+	resp := successResponse(req.Cmd, "邮箱已清空")
+	resp.DeletedCount = intPtr(count)
+	return resp
+}
+
+// ── QQ 号绑定（2026-09-24）──────────────────────────────────────────────
+
+// bindContext 从请求里取出「已登录账号」。返回空串表示会话无效。
+//
+// 三个绑定命令共用，走**会话 token** 校验而不是 auth_key：
+// token 已经把"是谁"绑在会话上，玩家没法拿一把后台密钥去绑别人的号；
+// 而 auth_key 是运营侧凭据，不该出现在玩家的登录器里。
+func (h *Handler) bindContext(req *models.GatewayRequest) string {
+	if h.qqBindSvc == nil {
+		return ""
+	}
+	token := deref(req.Token, "")
+	if token == "" {
+		return ""
+	}
+	sess, ok := h.sessionMgr.ValidateToken(token)
+	if !ok || sess == nil {
+		return ""
+	}
+	return sess.Account
+}
+
+// handleSendBindCode 下发绑定验证码。
+func (h *Handler) handleSendBindCode(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
+	if h.qqBindSvc == nil {
+		return failureResponse(req.Cmd, models.Err.MailServiceDisabled, "邮件服务未开启，请联系管理员")
+	}
+	account := h.bindContext(req)
+	if account == "" {
+		return failureResponse(req.Cmd, models.Err.SessionExpired, errorMessages[models.Err.SessionExpired])
+	}
+
+	code, msg := h.qqBindSvc.SendBindCode(account, deref(req.QQNumber, ""), clientIP)
+	if code == models.Err.Ok {
+		return successResponse(req.Cmd, msg)
+	}
+	return failureResponse(req.Cmd, code, msg)
+}
+
+// handleBindQQ 校验验证码并建立绑定。
+func (h *Handler) handleBindQQ(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
+	if h.qqBindSvc == nil {
+		return failureResponse(req.Cmd, models.Err.MailServiceDisabled, "邮件服务未开启，请联系管理员")
+	}
+	account := h.bindContext(req)
+	if account == "" {
+		return failureResponse(req.Cmd, models.Err.SessionExpired, errorMessages[models.Err.SessionExpired])
+	}
+
+	qqNumber := deref(req.QQNumber, "")
+	code, msg := h.qqBindSvc.Bind(account, qqNumber, deref(req.VerifyCode, ""), clientIP)
+	if code != models.Err.Ok {
+		return failureResponse(req.Cmd, code, msg)
+	}
+
+	resp := successResponse(req.Cmd, msg)
+	resp.QQNumber = strPtr(qqNumber)
+	return resp
+}
+
+// handleUnbindQQ 解除绑定。
+func (h *Handler) handleUnbindQQ(req *models.GatewayRequest) *models.GatewayResponse {
+	if h.qqBindSvc == nil {
+		return failureResponse(req.Cmd, models.Err.MailServiceDisabled, "邮件服务未开启，请联系管理员")
+	}
+	account := h.bindContext(req)
+	if account == "" {
+		return failureResponse(req.Cmd, models.Err.SessionExpired, errorMessages[models.Err.SessionExpired])
+	}
+
+	code, msg := h.qqBindSvc.Unbind(account)
+	if code != models.Err.Ok {
+		return failureResponse(req.Cmd, code, msg)
+	}
+	return successResponse(req.Cmd, msg)
+}
+
+func (h *Handler) handleVersion() *models.GatewayResponse {
+	minVersion := strings.TrimSpace(h.config.Launcher.MinVersion)
+	if minVersion == "" {
+		minVersion = "1.0.0"
+	}
+	resp := successResponse(models.Cmd.Version)
+	resp.Version = strPtr(minVersion)
+	resp.DownloadUrl = strPtr(h.config.Launcher.DownloadUrl)
+	return resp
+}
+
+// 版本门禁
+func (h *Handler) checkLauncherVersion(req *models.GatewayRequest) *models.GatewayResponse {
+	minText := strings.TrimSpace(h.config.Launcher.MinVersion)
+	if minText == "" {
+		return nil
+	}
+
+	minVer := parseVersion(minText)
+	if minVer == nil {
+		h.logger.Warn(fmt.Sprintf("[Launcher] MinVersion 配置无效: %s", minText))
+		return nil
+	}
+
+	reportedText := deref(req.LauncherVersion, "")
+	if reportedText == "" {
+		resp := failureResponse(req.Cmd, models.Err.LauncherVersionTooOld,
+			fmt.Sprintf("登录器版本过低，请更新至 v%s 以上", minText))
+		resp.Version = strPtr(minText)
+		resp.DownloadUrl = strPtr(h.config.Launcher.DownloadUrl)
+		return resp
+	}
+
+	reportedVer := parseVersion(reportedText)
+	if reportedVer == nil || reportedVer.Less(*minVer) {
+		resp := failureResponse(req.Cmd, models.Err.LauncherVersionTooOld,
+			fmt.Sprintf("登录器版本过低，请更新至 v%s 以上", minText))
+		resp.Version = strPtr(minText)
+		resp.DownloadUrl = strPtr(h.config.Launcher.DownloadUrl)
+		return resp
+	}
+
+	return nil
+}
+
+// 维护模式门禁
+func (h *Handler) checkMaintenanceMode(req *models.GatewayRequest) *models.GatewayResponse {
+	m := h.config.Maintenance
+	if !m.Enabled {
+		return nil
+	}
+
+	account := deref(req.Account, "")
+	if isMaintenanceAdmin(account, m.AdminAccounts) {
+		return nil
+	}
+
+	message := strings.TrimSpace(m.Message)
+	if message == "" {
+		message = "服务器维护中，请稍后再试"
+	}
+
+	return failureResponse(req.Cmd, models.Err.MaintenanceMode, message)
+}
+
+func isMaintenanceAdmin(account string, adminAccounts []string) bool {
+	if account == "" {
+		return false
+	}
+	for _, a := range adminAccounts {
+		if strings.EqualFold(strings.TrimSpace(a), account) {
+			return true
+		}
+	}
+	return false
+}
+
+// 辅助函数
+
+func successResponse(cmd string, msg ...string) *models.GatewayResponse {
+	resp := &models.GatewayResponse{Cmd: cmd, Ok: true, ErrorCode: models.Err.Ok}
+	if len(msg) > 0 {
+		resp.Message = strPtr(msg[0])
+	}
+	return resp
+}
+
+func failureResponse(cmd string, code int, msg string) *models.GatewayResponse {
+	return &models.GatewayResponse{Cmd: cmd, Ok: false, ErrorCode: code, Message: strPtr(msg)}
+}
+
+func int64Ptr(i int64) *int64 {
+	return &i
+}
+
+func int64PtrZero(p *int64) int64 {
+	if p != nil {
+		return *p
+	}
+	return 0
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+func deref[T any](p *T, def T) T {
+	if p != nil {
+		return *p
+	}
+	return def
+}
+
+func parseVersion(s string) *Version {
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+	patch := 0
+	if len(parts) >= 3 {
+		patch, _ = strconv.Atoi(parts[2])
+	}
+	return &Version{Major: major, Minor: minor, Patch: patch}
+}
+
+// Version 语义化版本号。
+type Version struct {
+	Major int
+	Minor int
+	Patch int
+}
+
+func (v Version) Less(other Version) bool {
+	if v.Major != other.Major {
+		return v.Major < other.Major
+	}
+	if v.Minor != other.Minor {
+		return v.Minor < other.Minor
+	}
+	return v.Patch < other.Patch
+}
+
+// errorMessages 错误码到消息的映射。
+var errorMessages = map[int]string{
+	models.Err.AccountEmpty:           "账号不能为空",
+	models.Err.AccountLength:          "账号长度不符合要求",
+	models.Err.AccountExists:          "账号已存在",
+	models.Err.PasswordEmpty:          "密码不能为空",
+	models.Err.PasswordLength:         "密码长度不符合要求",
+	models.Err.PasswordMismatch:       "两次密码输入不一致",
+	models.Err.AccountNotFound:        "账号不存在",
+	models.Err.WrongPassword:          "密码错误",
+	models.Err.SamePassword:           "新密码不能与旧密码相同",
+	models.Err.InvalidAuthKey:         "授权 auth_key 无效",
+	models.Err.IllegalChars:           "账号包含非法字符",
+	models.Err.AccountLocked:          "账号已被临时锁定，请稍后再试",
+	models.Err.InvalidCharacterId:     "收件角色ID无效",
+	models.Err.EmptyAttachments:       "邮件附件不能为空",
+	models.Err.LauncherVersionTooOld:  "登录器版本过低，请更新后重试",
+	models.Err.MaintenanceMode:        "服务器维护中，请稍后再试",
+	models.Err.RateLimited:            "请求过于频繁",
+	models.Err.UnknownCommand:         "未知命令",
+	models.Err.DecodeFailed:           "请求解码失败",
+	models.Err.BodyTooLarge:           "请求体过大",
+	models.Err.DatabaseError:          "数据库操作失败",
+	models.Err.SessionExpired:         "会话已失效",
+	models.Err.Banned:                 "账号已被封禁，请联系管理员",
+	models.Err.AccountOnline:          "该账号已登录，如需继续将断开之前的会话",
+	models.Err.DeviceChanged:          "设备已变更，无法登录",
+	models.Err.DeviceRotationCooldown: "设备密钥轮换冷却中，请稍后再试",
+	// ── QQ 号绑定（1024~1035）──────────────────────────────────────────
+	models.Err.QQNumberInvalid:          "QQ 号格式不正确（5~11 位数字）",
+	models.Err.VerifyCodeInvalid:        "验证码不正确",
+	models.Err.VerifyCodeExpired:        "验证码不存在或已过期，请重新获取",
+	models.Err.VerifyCodeAttemptsExceed: "验证码错误次数过多，请重新获取",
+	models.Err.SendTooFrequent:          "请求过于频繁，请稍后再试",
+	models.Err.MailSendFailed:           "验证码发送失败，请稍后重试或联系管理员",
+	models.Err.MailServiceDisabled:      "邮件服务未开启，请联系管理员",
+	models.Err.SendQuotaExhausted:       "今日验证码额度已用完，请联系管理员",
+	models.Err.AccountAlreadyBound:      "该账号已绑定 QQ 号，请先解绑",
+	models.Err.QQNumberTaken:            "该 QQ 号已被其他账号绑定",
+	models.Err.QQNumberConflict:         "该数字已被用作账号名，存在冲突，请联系管理员",
+	models.Err.QQNotBound:               "该账号未绑定 QQ 号",
+}

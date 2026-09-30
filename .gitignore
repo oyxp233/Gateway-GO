@@ -1,0 +1,24 @@
+# ── 构建产物（不入库）────────────────────────────────────────────
+bin/
+dist/
+dist-linux/
+*.exe
+*.bak-*
+
+# ── 运行时产物（本地生成，不入库）────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# ── 真实配置不入库（含生产凭据）──────────────────────────────────
+# appsettings.json 里 Admin.AuthKey 是**生产管理密钥明文**，
+# 一旦入库就有随仓库外流（推远端 / 打包分发）的风险，泄了必须轮换、影响线上。
+# pkg/config/config.go:406 的注释也是这个口径：「不要把真实密钥写进 appsettings.json」。
+# 结构样本见 appsettings.example.json（AuthKey 置为 CHANGE-ME-NOW 占位）。
+appsettings.json
+appsettings.override.json
+
+# ── 说明 ────────────────────────────────────────────────────────
+# wwwroot/ 必须入库：后台单页 index.html 是网关交付物的一部分
+# （线上 8443 由 admin 进程直接读盘提供）。

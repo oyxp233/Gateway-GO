@@ -1,0 +1,15 @@
+[Unit]
+Description=S4A21 Gateway (Go)
+After=network.target
+
+[Service]
+Type=simple
+User=msp
+WorkingDirectory=/opt/gateway
+ExecStart=/opt/gateway/s4a21-gateway --config /opt/gateway/appsettings.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

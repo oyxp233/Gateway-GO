@@ -1,0 +1,18 @@
+# ── 文本文件统一：入库 LF，检出按平台默认（不主动改写工作区）──────
+* text=auto
+
+# 批处理与 PowerShell 必须 CRLF：
+# cmd 对 LF-only 的 if/for 分支解析不可靠
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# ── 二进制 ────────────────────────────────────────────────────
+*.exe binary
+*.db binary
+*.so binary
+*.gz binary
+*.tar binary
+*.zip binary
+*.png binary
+*.ico binary

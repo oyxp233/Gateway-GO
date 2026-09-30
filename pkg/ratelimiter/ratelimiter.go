@@ -127,6 +127,17 @@ const (
 	// 单独成组而不是并进 launcher：上报量由插件按异常事件触发（正常游戏期间为 0），
 	// 一旦某台机器疯狂上报，限流只该丢它的上报，不该顺带把同 IP 的策略/榜单请求一起饿死。
 	GroupAntiCheat = "anticheat"
+
+	// GroupLauncherBinary 登录器插件文件下载（2026-09-30 插件增量更新）。
+	//
+	// 单独成桶的理由与上面几条同理，但**不是**为了提速 ——
+	// 本限流器的速率由 RateLimit.HttpRequestsPerMinute 全局决定，分组只分桶、
+	// 不改变速率。分开是为了让"一次冷启动拉 12 个插件文件"不占掉
+	// 同 IP 的策略(policy)/榜单(item-ranking) 额度，反之亦然。
+	//
+	// 额度是否够（单 IP 120/分）：冷启动最坏 = 1 次清单 + 12 个文件 = 13 次；
+	// 每次下载最多重试 3 次 → 39 次。120/分 有 3 倍余量。
+	GroupLauncherBinary = "launcher-binary"
 )
 
 // pathGroups 受保护路径前缀 -> 分组名。
@@ -141,6 +152,12 @@ var pathGroups = []struct {
 	// 登录器公开接口：/api/launcher/policy 与 /api/launcher/item-ranking。
 	// item-ranking 是聚合查询，必须限流（它是无鉴权公开接口）；
 	// /api/launcher/version 沿用历史行为保持不限流。
+	// ★ 顺序敏感：更具体的 /plugins/file 必须排在 /plugins 之前。
+	// PathGroup 是线性扫描、命中即返回，反过来的话下载会被归进清单那一桶。
+	{"/api/launcher/plugins/file", GroupLauncherBinary},
+	// 插件清单（2026-09-30 插件增量更新）。与 policy 同类：公开只读的策略下发，
+	// 每次启动打一次，归 launcher 桶。
+	{"/api/launcher/plugins", GroupLauncher},
 	{"/api/launcher/item-ranking", GroupLauncher},
 	{"/api/launcher/policy", GroupLauncher},
 	// online 免鉴权且每次要 join 游戏库查角色（带 5s 缓存），仍必须限流：

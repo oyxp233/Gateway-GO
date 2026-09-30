@@ -147,6 +147,46 @@ type LauncherSection struct {
 	// 与 MinVersion/DownloadUrl 共用同一条下发链路：存在网关进程内存 →
 	// /api/launcher/notice 公开只读 → 改完立刻生效，不用重启网关或登录器。
 	UpdateNotice string `json:"UpdateNotice"`
+
+	// PluginDir 是插件下发目录，相对网关运行目录（默认 "./plugins"）。
+	//
+	// 目录里放插件文件（*.dll 及其伴随 *.ini / *.xui），外加一份可选的
+	// plugins.json 元数据清单。网关按目录签名 (name,size,mtime) 判断是否变化，
+	// 变了就重算 sha256 —— 所以**丢文件进去即生效，不用重启网关**。
+	//
+	// 元数据的权威源是 plugins.json（哪个是核心插件、默认开关、显示名、顺序）。
+	// 它缺失时退化为"按 *.dll 文件名推导"，并在清单响应里置 degraded=true，
+	// 登录器据此可以拒绝继续 —— 这是刻意的失败方向：清单必须由网关控制。
+	PluginDir string `json:"PluginDir"`
+
+	// PluginBaseUrl 是下发给登录器的插件下载基址前缀（可留空）。
+	//
+	// 留空时登录器用「自己连的那个网关地址 + /api/launcher/plugins/file/」拼。
+	// 非空时可用于把插件字节的分发挪到 CDN / 对象存储：**网关只出清单（权威），
+	// 字节从别处来**，服务器出网带宽为零。清单里的 sha256 始终由网关算，改不了。
+	PluginBaseUrl string `json:"PluginBaseUrl"`
+
+	// PluginEnabled 是插件下发的总开关。**缺省（nil）视为开。**
+	//
+	// 置 false 时 /api/launcher/plugins 仍返回 200，但带 enabled=false，
+	// 登录器据此退回内置插件、完全不下载 —— 这是插件下发出问题时的
+	// **一键回滚开关**，不必回滚登录器 exe。
+	//
+	// 用 *bool 而不是 bool：现网 appsettings.json 里没有这个键，
+	// 用 bool 会把"没配"读成 false，等于把功能默认关掉。
+	PluginEnabled *bool `json:"PluginEnabled"`
+}
+
+// LauncherPluginEnabled 返回插件下发总开关的生效值（缺省视为开）。
+//
+// 收敛成一处方法而不是各处判 nil：这个值有 3 个调用点
+//（清单 handler、管理后台、自检），两处口径不一致就会出现
+//「后台显示关闭、登录器照旧下载」这类静默错位。
+func (c *GatewayConfig) LauncherPluginEnabled() bool {
+	if c.Launcher.PluginEnabled == nil {
+		return true
+	}
+	return *c.Launcher.PluginEnabled
 }
 
 type AdminSection struct {
@@ -294,6 +334,9 @@ func DefaultConfig() *GatewayConfig {
 		Launcher: LauncherSection{
 			MinVersion:  "2.0.0",
 			DownloadUrl: "",
+			// 相对网关运行目录。/opt/gateway/s4a21-gateway 的 CWD 是 /opt/gateway，
+			// 所以默认目录是 /opt/gateway/plugins。
+			PluginDir: "./plugins",
 		},
 		// SMTP 默认关。开启需要同时满足：Enabled=true + Host + Username + 授权码
 		// （授权码走环境变量 S4A21_SMTP_PASS）。默认关是刻意的 ——

@@ -54,6 +54,13 @@ type Server struct {
 	cert        *tls.Certificate
 	portStore   *proxy.PortConfigStore
 
+	// plugins 是插件下发目录的扫描器 + sha256 缓存（见 launcher_plugins.go）。
+	//
+	// 纯文件系统，**不依赖网关进程内存**，所以两个进程各持一份、共用同一个目录即可：
+	// admin 进程(8443) 负责上传/删除文件，网关进程(8080) 负责按签名重扫后下发。
+	// 不存在"改后台内存不影响玩家"那类错位，因此**不需要**走 backends 抽象。
+	plugins *pluginStore
+
 	// 公告服务：**只在网关进程**非 nil。
 	// admin 进程不注册 /api/launcher/item-ranking（公开路由），
 	// 也不需要它 —— 事件查询/弹窗历史在 admin 侧直读 db。
@@ -124,6 +131,7 @@ func NewServer(
 			cfg.RateLimit.Enabled, cfg.RateLimit.HttpRequestsPerMinute),
 		cert:      cert,
 		portStore: portStore,
+		plugins:   newPluginStore(cfg.Launcher.PluginDir),
 		sessions:  b.Sessions,
 		pvf:       b.Pvf,
 		ports:     b.Ports,
@@ -398,6 +406,17 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 	// 免鉴权，因此已挂 GroupLauncher 限流，且响应里不含账号名/IP。
 	r.HandleFunc("/api/launcher/online", s.handleLauncherOnline).Methods("GET")
 
+	// 插件下发（2026-09-30 插件增量更新，公开只读）。
+	//
+	// ★ 必须走 /api 路由：玩家端口(8080) 由 usePublicOnlyMiddleware 把非 /api 路径
+	//   一律 404，wwwroot 静态文件在玩家端口上根本不可达。详见 launcher_plugins.go 抬头。
+	//
+	// {name} 用 [^/]+ 收窄（URL.Path 已解码，所以 ..%2Fxx 会含 / 而不匹配），
+	// handler 里另有 validPluginFileName + 目录前缀双重校验。查的是清单准入表，
+	// 目录里的未登记文件不会经此接口外泄。
+	r.HandleFunc("/api/launcher/plugins", s.handleLauncherPlugins).Methods("GET")
+	r.HandleFunc("/api/launcher/plugins/file/{name:[^/]+}", s.handleLauncherPluginFile).Methods("GET")
+
 	// 心跳
 	r.HandleFunc("/api/heartbeat", s.handleHeartbeat).Methods("POST")
 
@@ -487,6 +506,22 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/announce/popups", s.handleAdminAnnouncePopups).Methods("GET")
 	r.HandleFunc("/api/admin/announce/popup", s.handleAdminAnnouncePopupSend).Methods("POST")
 	r.HandleFunc("/api/admin/announce/popup", s.handleAdminAnnouncePopupDelete).Methods("DELETE")
+
+	// 客户端插件下发（登录器插件增量更新，2026-09-30）。
+	//
+	// 管理的是**网关运行目录下的插件目录**（Launcher.PluginDir，默认 ./plugins）。
+	// 纯文件系统操作、两个进程共用同一目录，所以不走内部 API：
+	// admin 写完文件，网关进程下次收到清单请求时按目录签名自动重扫。
+	//
+	// ★ 部署前提：两个进程的 WorkingDirectory 必须一致，否则 "./plugins"
+	//   会解析到两个不同目录（admin 传的文件网关看不见）。与 Pvf.FilePath 同一前提。
+	r.HandleFunc("/api/admin/plugins", s.handleAdminPluginsList).Methods("GET")
+	r.HandleFunc("/api/admin/plugins/upload", s.handleAdminPluginUpload).Methods("POST")
+	r.HandleFunc("/api/admin/plugins/delete", s.handleAdminPluginDelete).Methods("POST")
+	r.HandleFunc("/api/admin/plugins/meta", s.handleAdminPluginMetaSave).Methods("POST")
+	// 按目录里的 *.dll 生成一份清单草稿（首次部署省得手写）。
+	// 草稿全部是"非核心 + 默认关闭"，必须人工改对核心插件与顺序。
+	r.HandleFunc("/api/admin/plugins/meta/draft", s.handleAdminPluginMetaDraft).Methods("POST")
 
 	// 服务端管理
 	r.HandleFunc("/api/admin/server/status", s.handleAdminServerStatus).Methods("GET")

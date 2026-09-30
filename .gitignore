@@ -19,6 +19,15 @@ dist-linux/
 appsettings.json
 appsettings.override.json
 
+# ── 插件目录（plugins/）──────────────────────────────────────────
+# 只入库 plugins.json（清单元数据）。插件二进制本身**不入库**：
+# 它们的唯一真源在登录器的 S4A21Launcher-WPF/PluginResources/
+# （同一批文件还被 <EmbeddedResource> 嵌进 exe），放两份必然漂移。
+# 用 tools/sync_plugins.py 从真源同步。
+plugins/*
+!plugins/plugins.json
+!plugins/README.md
+
 # ── 说明 ────────────────────────────────────────────────────────
 # wwwroot/ 必须入库：后台单页 index.html 是网关交付物的一部分
 # （线上 8443 由 admin 进程直接读盘提供）。

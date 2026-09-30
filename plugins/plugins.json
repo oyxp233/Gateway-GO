@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "key": "AZ",
+      "display_name": "AZ 客户端补丁",
+      "description": "客户端静态补丁（过壳/修正），加载链最底层。恒以服务端下发的版本为准，屏蔽游戏目录中的外部版本。",
+      "is_core": true,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 10,
+      "dll": "az.dll"
+    },
+    {
+      "key": "GameGaurd",
+      "display_name": "GameGaurd 插件加载器",
+      "description": "负责按 GameGaurd.ini 顺序加载各扩展插件。恒以服务端下发的版本为准。注意其配置 GameGaurd.ini 由登录器按清单顺序生成，不在此下发。",
+      "is_core": true,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 20,
+      "dll": "GameGaurd.dll"
+    },
+    {
+      "key": "PreventMinimize",
+      "display_name": "防最小化",
+      "description": "阻止 DNF 窗口意外最小化/失焦导致掉线（仅单开时可用）。",
+      "is_core": false,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 30,
+      "dll": "PreventMinimize.dll"
+    },
+    {
+      "key": "MultiInstance",
+      "display_name": "多开支持",
+      "description": "解除客户端单开限制，配合防最小化时建议在游戏内关闭窗口失焦优化。",
+      "is_core": false,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 40,
+      "dll": "MultiInstance.dll",
+      "ini": "MultiInstance.ini"
+    },
+    {
+      "key": "ImeFix",
+      "display_name": "输入法修复",
+      "description": "修复 DNF 内中文输入法候选框错位/无法打字问题。",
+      "is_core": false,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 50,
+      "dll": "ImeFix.dll",
+      "ini": "ImeFix.ini"
+    },
+    {
+      "key": "GameNative",
+      "display_name": "GameNative 基础库",
+      "description": "提供 XUI 挂载等基础 API，NF 等扩展依赖它。必须在依赖它的扩展之前加载。",
+      "is_core": true,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 60,
+      "dll": "GameNative.dll",
+      "ini": "GameNative.ini"
+    },
+    {
+      "key": "AutoFire",
+      "display_name": "连发",
+      "description": "技能连发辅助（按 Shift 开聊天/搜索/起名时自动暂停）。",
+      "is_core": false,
+      "default_enabled": false,
+      "config_kind": "Configured",
+      "order": 70,
+      "dll": "AutoFire.dll",
+      "ini": "AutoFire.ini"
+    },
+    {
+      "key": "EquipmentSwap",
+      "display_name": "一键换装",
+      "description": "装备方案快速切换。方案数据存在游戏目录 EquipmentSwap\\Data 下，按角色 ID 分文件，登录器不读写。",
+      "is_core": false,
+      "default_enabled": false,
+      "config_kind": "Configured",
+      "order": 80,
+      "dll": "EquipmentSwap.dll",
+      "ini": "EquipmentSwap.ini",
+      "xui": "EquipmentSwap.xui"
+    },
+    {
+      "key": "DpsMeter",
+      "display_name": "DPS 统计",
+      "description": "输出伤害统计浮窗，支持快捷键呼出、鼠标穿透、偏移与缩放。",
+      "is_core": false,
+      "default_enabled": false,
+      "config_kind": "Configured",
+      "order": 90,
+      "dll": "DpsMeter.dll",
+      "ini": "DpsMeter.ini"
+    },
+    {
+      "key": "CombatPower",
+      "display_name": "战力查看",
+      "description": "查看角色战斗力/评分明细。",
+      "is_core": false,
+      "default_enabled": false,
+      "config_kind": "None",
+      "order": 100,
+      "dll": "CombatPower.dll",
+      "ini": "CombatPower.ini"
+    },
+    {
+      "key": "NF",
+      "display_name": "NF 内辅（拾取/装备/顺图）",
+      "description": "自动拾取、一键处理、自动评分与坐标顺图（GM 模式与强制顺图已按运营要求屏蔽）。注意 NF.ini 无内嵌模板，由 NF.dll 首次运行时自建完整文件。",
+      "is_core": false,
+      "default_enabled": true,
+      "config_kind": "Configured",
+      "order": 110,
+      "dll": "NF.dll"
+    },
+    {
+      "key": "AntiCheat",
+      "display_name": "游戏内行为检测",
+      "description": "在游戏进程内采集击杀间隔/房间切换/移动速度等行为特征并上报网关。恒部署不可关闭；配置由登录器每次启动游戏时经命名管道下发（不落盘）。",
+      "is_core": true,
+      "default_enabled": true,
+      "config_kind": "None",
+      "order": 120,
+      "dll": "AntiCheatPlugin.dll"
+    }
+  ]
+}

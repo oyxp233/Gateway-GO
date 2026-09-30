@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gorilla/mux"
+
 	"s4a21-gateway/pkg/config"
+	"s4a21-gateway/pkg/ratelimiter"
 )
 
 // 管理后台插件接口的单测。
@@ -445,6 +449,90 @@ func TestAdminPluginMetaDraft(t *testing.T) {
 	s2.handleAdminPluginMetaDraft(rec2, adminReq("POST", "/api/admin/plugins/meta/draft", nil))
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("空目录应 400，实得 %d", rec2.Code)
+	}
+}
+
+// TestPluginPublicRoutesEndToEnd 走真实 router + 中间件，确认路由真的挂在了
+// 玩家端口该有的位置上，并顺带**反证**「插件不能走静态文件路径」。
+//
+// ★ 这条反证对应评估文档的一处更正：评估文档 §2.4 写「wwwroot 静态文件服务
+//   可直接当下载承载」，但双进程生产形态下 usePublicOnlyMiddleware 会把玩家端口
+//   上所有非 /api 路径一律 404。如果哪天有人"顺手"把 wwwroot 挂回玩家端口，
+//   第三条断言会变红 —— 那正是需要被拦住的回归。
+func TestPluginPublicRoutesEndToEnd(t *testing.T) {
+	dir := seedPluginDir(t)
+	s := newAdminPluginServer(t, dir)
+	// 中间件链要用限流器（NewServer 里会初始化，手动构造 Server 必须补上）
+	s.httpLimiter = ratelimiter.NewHttpRateLimiter(true, 120)
+
+	r := mux.NewRouter()
+	s.registerPublicRoutes(r)
+	s.usePublicOnlyMiddleware(r)
+
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	// ① 清单
+	resp, err := http.Get(srv.URL + "/api/launcher/plugins")
+	if err != nil {
+		t.Fatalf("取清单失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("清单应 200，实得 %d", resp.StatusCode)
+	}
+	var m PluginManifest
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatalf("清单不是合法 JSON: %v", err)
+	}
+	if !m.OK {
+		t.Fatalf("ok 应为 true")
+	}
+	if m.Degraded {
+		t.Fatalf("合法清单不该 degraded: %v", m.Messages)
+	}
+	if len(m.Plugins) != 2 {
+		t.Fatalf("应下发 2 个插件，实得 %d", len(m.Plugins))
+	}
+
+	// 顺序按 order：AZ(10) 在 NF(30) 前
+	if m.Plugins[0].Key != "AZ" || m.Plugins[1].Key != "NF" {
+		t.Fatalf("顺序应按 order 升序: %s, %s", m.Plugins[0].Key, m.Plugins[1].Key)
+	}
+
+	// 未配 PluginBaseUrl → url 必须是**相对路径**：
+	// scheme 由登录器按自己的 TLS 配置决定，网关不能替它写死 http/https。
+	f := m.Plugins[0].Files[0]
+	if f.Name != "az.dll" || f.URL != "/api/launcher/plugins/file/az.dll" {
+		t.Fatalf("文件条目不对: %+v", f)
+	}
+
+	// ② 按清单给的 url 真下一次，内容必须与清单里的 sha256 一致
+	dl, err := http.Get(srv.URL + f.URL)
+	if err != nil {
+		t.Fatalf("下载失败: %v", err)
+	}
+	defer dl.Body.Close()
+	if dl.StatusCode != http.StatusOK {
+		t.Fatalf("下载应 200，实得 %d", dl.StatusCode)
+	}
+	body, _ := io.ReadAll(dl.Body)
+	got := sha256.Sum256(body)
+	if hex.EncodeToString(got[:]) != f.SHA256 {
+		t.Fatalf("下载内容与清单 sha256 不符：清单 %s，实得 %s", f.SHA256, hex.EncodeToString(got[:]))
+	}
+
+	// ③ 反证：静态文件路径在玩家端口必须 404
+	for _, p := range []string{"/plugins/az.dll", "/wwwroot/index.html", "/index.html"} {
+		pr, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatalf("请求 %s 失败: %v", p, err)
+		}
+		pr.Body.Close()
+		if pr.StatusCode != http.StatusNotFound {
+			t.Fatalf("玩家端口上 %s 必须 404（插件下载只走 /api 路由），实得 %d",
+				p, pr.StatusCode)
+		}
 	}
 }
 

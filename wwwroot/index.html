@@ -162,6 +162,7 @@
             <div class="tab" data-tab="ports">游戏端口</div>
             <div class="tab" data-tab="anticheat">外挂监控</div>
             <div class="tab" data-tab="launcher">客户端配置</div>
+            <div class="tab" data-tab="plugins">插件管理</div>
             <div class="tab" data-tab="maintenance">维护模式</div>
         </div>
 
@@ -640,6 +641,97 @@
             </div>
         </div>
 
+        <!-- ==================== 插件管理 ==================== -->
+        <div id="plugins" class="tab-content">
+            <div class="card">
+                <h3>插件下发状态</h3>
+                <p class="muted">
+                    登录器启动时会向网关要这份<b>权威清单</b>，再按每个文件的 SHA-256 取字节。
+                    所以<b>改一个插件只需要传那一个文件</b>，玩家不必重下 127 MB 的登录器。
+                    清单必须由网关控制：一旦清单不可信（缺 plugins.json、条目非法、引用了
+                    不存在的文件、或一个核心插件都没有），登录器会<b>拒绝启动</b> ——
+                    这是刻意的失败方向，宁可拦住也不拿一份猜出来的清单去动玩家游戏目录。
+                </p>
+                <div class="row">
+                    <span>插件目录：</span><span id="pluginDir" class="muted">-</span>
+                </div>
+                <div class="row">
+                    <span>下发开关：</span><span id="pluginEnabled">-</span>
+                    <span style="margin-left: 24px;">下发给登录器：</span><span id="pluginDownstream">-</span>
+                    <span style="margin-left: 24px;">清单指纹：</span><span id="pluginRevision" class="muted">-</span>
+                </div>
+                <div class="row">
+                    <button class="btn" onclick="loadPlugins()">刷新</button>
+                    <button class="btn" onclick="draftPluginMeta()">按目录生成清单草稿</button>
+                </div>
+                <div id="pluginResult"></div>
+                <div id="pluginDegraded"></div>
+            </div>
+
+            <div class="card">
+                <h3>插件清单（plugins.json）</h3>
+                <p class="muted">
+                    「顺序」决定 GameGaurd.ini 的加载顺序，<b>越小越先加载</b>；
+                    GameNative 必须排在依赖它的扩展（NF 等）之前，顺序错了那些插件不会被加载。
+                    「核心」= 恒部署、玩家不可关闭。保存时会先整体校验，不通过不落盘。
+                </p>
+                <div style="overflow-x: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width:60px;">顺序</th>
+                                <th>Key</th>
+                                <th>显示名</th>
+                                <th>描述</th>
+                                <th>DLL</th>
+                                <th>INI</th>
+                                <th>XUI</th>
+                                <th style="width:52px;">核心</th>
+                                <th style="width:70px;">默认启用</th>
+                                <th style="width:90px;">配置界面</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="pluginMetaBody"></tbody>
+                    </table>
+                </div>
+                <div class="row">
+                    <button class="btn" onclick="addPluginMetaRow()">新增条目</button>
+                    <button class="btn" onclick="savePluginMeta()">保存清单</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>插件文件</h3>
+                <p class="muted">
+                    上传后还要在清单里引用它，才会真正下发给登录器。
+                    <b>已登记</b>的文件才能被登录器取走；未登记的文件既不下发、取不到。
+                    删除仍被清单引用的文件会被拒绝（那会让全体玩家进不去游戏），确实要删请先改清单。
+                </p>
+                <div class="row">
+                    <input type="file" id="pluginUploadInput">
+                    <button class="btn" onclick="uploadPluginFile()">上传</button>
+                </div>
+                <div style="overflow-x: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>文件名</th>
+                                <th style="width:90px;">大小</th>
+                                <th>SHA-256</th>
+                                <th style="width:60px;">角色</th>
+                                <th style="width:90px;">状态</th>
+                                <th style="width:160px;">修改时间</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="pluginFileBody"></tbody>
+                    </table>
+                </div>
+                <div id="pluginUnregistered"></div>
+            </div>
+        </div>
+
         <!-- ==================== 维护模式 ==================== -->
         <div id="maintenance" class="tab-content">
             <div class="card">
@@ -964,6 +1056,203 @@
             return await resp.json();
         }
 
+        // ==================== 插件管理 ====================
+        //
+        // 清单是登录器的权威源：登录器拿不到可信清单就**拒绝启动**。
+        // 所以这一页的每条失败路径都要说清"为什么"和"怎么修"，
+        // 而不是只弹一句"失败"。
+
+        async function loadPlugins() {
+            const data = await api('/api/admin/plugins');
+            if (!data) return;
+            if (!data.ok) {
+                showResult('pluginResult', 'error', data.message || '读取失败');
+                return;
+            }
+
+            setText('pluginDir', data.dir || '-');
+            setText('pluginRevision', truncHash(data.revision));
+            setText('pluginDownstream', `${data.downstream_count} 个插件`);
+            setText('pluginEnabled', data.plugins_enabled
+                ? '已开启'
+                : '已关闭 —— 登录器将退回内置插件');
+
+            // 退化警告必须显眼：登录器会因为这里而拒绝启动。
+            const msgs = data.messages || [];
+            const deg = document.getElementById('pluginDegraded');
+            if (data.degraded || msgs.length) {
+                deg.innerHTML = `<div class="alert alert-error">`
+                    + (data.degraded
+                        ? `<div><b>清单不可信 —— 登录器会拒绝启动，玩家进不去游戏。</b></div>`
+                        : `<div><b>提示</b></div>`)
+                    + msgs.map(m => `<div>· ${esc(m)}</div>`).join('')
+                    + `</div>`;
+            } else {
+                deg.innerHTML = '';
+            }
+
+            renderPluginMeta((data.meta && data.meta.plugins) ? data.meta.plugins : []);
+            renderPluginFiles(data.files || [], data.unregistered || []);
+        }
+
+        // 一行清单条目。用 esc() 处理 value，避免插件描述里的引号把属性截断。
+        function pluginMetaRowEl(m) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td><input type="number" data-f="order" style="width:56px;" value="${esc(String(m.order ?? 0))}"></td>
+                <td><input type="text" data-f="key" style="width:110px;" value="${esc(m.key || '')}"></td>
+                <td><input type="text" data-f="display_name" style="width:140px;" value="${esc(m.display_name || '')}"></td>
+                <td><input type="text" data-f="description" style="width:260px;" value="${esc(m.description || '')}"></td>
+                <td><input type="text" data-f="dll" style="width:150px;" value="${esc(m.dll || '')}"></td>
+                <td><input type="text" data-f="ini" style="width:150px;" value="${esc(m.ini || '')}"></td>
+                <td><input type="text" data-f="xui" style="width:130px;" value="${esc(m.xui || '')}"></td>
+                <td style="text-align:center;"><input type="checkbox" data-f="is_core"${m.is_core ? ' checked' : ''}></td>
+                <td style="text-align:center;"><input type="checkbox" data-f="default_enabled"${m.default_enabled ? ' checked' : ''}></td>
+                <td><select data-f="config_kind">
+                    <option value="None"${m.config_kind === 'Configured' ? '' : ' selected'}>无</option>
+                    <option value="Configured"${m.config_kind === 'Configured' ? ' selected' : ''}>需要配置</option>
+                </select></td>
+                <td><button class="btn" data-act="delMeta">删除</button></td>`;
+            // container 传 tr 而非 tbody：只给这一行绑定，重复渲染也不会重复挂监听。
+            bindRowActions(tr, 'data-act', { delMeta: () => tr.remove() });
+            return tr;
+        }
+
+        function renderPluginMeta(list) {
+            const tbody = document.getElementById('pluginMetaBody');
+            tbody.innerHTML = '';
+            list.forEach(m => tbody.appendChild(pluginMetaRowEl(m)));
+        }
+
+        function addPluginMetaRow() {
+            const tbody = document.getElementById('pluginMetaBody');
+            // 默认顺序取现有最大值 + 10：避免新增条目静默排到最前面，
+            // 那会改变 GameGaurd.ini 的加载顺序（GameNative 必须靠前）。
+            let maxOrder = 0;
+            tbody.querySelectorAll('tr').forEach(tr => {
+                const v = parseInt(tr.querySelector('[data-f="order"]').value, 10);
+                if (!isNaN(v) && v > maxOrder) maxOrder = v;
+            });
+            tbody.appendChild(pluginMetaRowEl({ order: maxOrder + 10, config_kind: 'None' }));
+        }
+
+        // 以表格 DOM 为准收集清单（而不是拿上次读到的 JSON 改），
+        // 这样"新增/删除条目"不需要前端再维护一份状态。
+        function collectPluginMeta() {
+            const out = [];
+            document.getElementById('pluginMetaBody').querySelectorAll('tr').forEach(tr => {
+                const val = f => {
+                    const el = tr.querySelector(`[data-f="${f}"]`);
+                    return el ? String(el.value).trim() : '';
+                };
+                const chk = f => {
+                    const el = tr.querySelector(`[data-f="${f}"]`);
+                    return !!(el && el.checked);
+                };
+                const order = parseInt(val('order'), 10);
+                out.push({
+                    key: val('key'),
+                    display_name: val('display_name'),
+                    description: val('description'),
+                    is_core: chk('is_core'),
+                    default_enabled: chk('default_enabled'),
+                    config_kind: val('config_kind') || 'None',
+                    order: isNaN(order) ? 0 : order,
+                    dll: val('dll'),
+                    ini: val('ini'),
+                    xui: val('xui')
+                });
+            });
+            return { version: 1, plugins: out };
+        }
+
+        async function savePluginMeta() {
+            const data = await api('/api/admin/plugins/meta', 'POST', collectPluginMeta());
+            if (!data) return;
+            const box = document.getElementById('pluginResult');
+            if (!data.ok) {
+                // 校验失败时后端会回具体到"第几条、哪个字段"，
+                // 直接列出来 —— 否则运维只能对着"保存失败"猜。
+                box.innerHTML = `<div class="alert alert-error">${esc(data.message || '保存失败')}`
+                    + (data.problems || []).map(p => `<div>· ${esc(p)}</div>`).join('')
+                    + `</div>`;
+                return;
+            }
+            showResult('pluginResult', 'success',
+                `${data.message}（当前下发 ${data.downstream_count} 个插件）`);
+            loadPlugins();
+        }
+
+        async function draftPluginMeta() {
+            if (!confirm('按当前目录里的 .dll 生成清单草稿？\n\n'
+                + '草稿里所有插件都是「非核心 + 默认关闭」，必须自己把核心插件改对\n'
+                + '（否则登录器拒绝启动），并确认加载顺序。\n\n'
+                + '已存在的 plugins.json 会被覆盖。')) return;
+            const data = await api('/api/admin/plugins/meta/draft', 'POST');
+            if (!data) return;
+            showResult('pluginResult', data.ok ? 'success' : 'error', data.message || '');
+            loadPlugins();
+        }
+
+        async function deletePluginFile(name, referenced) {
+            // 被清单引用的文件不给"强行删除"的入口：
+            // 删掉它 = 清单立刻不可信 = 全体玩家进不去游戏。
+            // 后端其实支持 force，留作极端情况用 curl 处理，不放按钮。
+            if (referenced) {
+                alert(`「${name}」仍被清单引用。\n\n`
+                    + `请先在「插件清单」里把它去掉并保存，再回来删除。\n`
+                    + `直接删会让清单不可信、登录器全体拒绝启动。`);
+                return;
+            }
+            if (!confirm(`确定删除「${name}」？`)) return;
+            const data = await api('/api/admin/plugins/delete', 'POST', { name, force: false });
+            if (!data) return;
+            showResult('pluginResult', data.ok ? 'success' : 'error', data.message || '');
+            loadPlugins();
+        }
+
+        async function uploadPluginFile() {
+            const input = document.getElementById('pluginUploadInput');
+            if (!input.files || !input.files.length) {
+                showResult('pluginResult', 'error', '请先选择文件');
+                return;
+            }
+            const fd = new FormData();
+            fd.append('file', input.files[0]);
+            const data = await upload('/api/admin/plugins/upload', fd);
+            if (!data) return;
+            showResult('pluginResult', data.ok ? 'success' : 'error',
+                (data.message || '') + (data.hint ? `（${data.hint}）` : ''));
+            input.value = '';
+            loadPlugins();
+        }
+
+        function renderPluginFiles(files, unregistered) {
+            const tbody = document.getElementById('pluginFileBody');
+            tbody.innerHTML = '';
+            files.forEach(f => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${esc(f.name)}</td>
+                    <td>${esc(fmtSize(f.size))}</td>
+                    <td title="${esc(f.sha256 || '')}">${esc(truncHash(f.sha256))}</td>
+                    <td>${esc(f.role || '-')}</td>
+                    <td>${f.referenced ? '已登记' : '<span class="muted">未登记</span>'}</td>
+                    <td>${esc(f.modified_utc || '-')}</td>
+                    <td><button class="btn" data-act="del">删除</button></td>`;
+                bindRowActions(tr, 'data-act', {
+                    del: () => deletePluginFile(f.name, !!f.referenced)
+                });
+                tbody.appendChild(tr);
+            });
+
+            const box = document.getElementById('pluginUnregistered');
+            box.innerHTML = (unregistered && unregistered.length)
+                ? `<div class="alert alert-error">目录里有 ${unregistered.length} 个文件未被清单引用，`
+                    + `不会下发给登录器：${esc(unregistered.join('、'))}</div>`
+                : '';
+        }
+
         // ==================== Tab 切换 ====================
 
         const tabLoaders = {
@@ -976,6 +1265,7 @@
             ports: loadGamePorts,
             anticheat: () => { loadAcPlayers(); loadAcDetections(); },
             launcher: loadLauncherConfig,
+            plugins: loadPlugins,
             maintenance: loadMaintenance,
             announce: () => { loadAnnounceConfig(); loadAnnouncePopups(1); loadAnnounceEvents(1); }
         };

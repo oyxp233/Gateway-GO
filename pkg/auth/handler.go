@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"s4a21-gateway/pkg/config"
 	"s4a21-gateway/pkg/logger"
@@ -62,7 +63,7 @@ func (h *Handler) Handle(req *models.GatewayRequest, clientIP string) (*models.G
 
 	switch req.Cmd {
 	case models.Cmd.Register:
-		return h.handleRegister(req), nil
+		return h.handleRegister(req, clientIP), nil
 	case models.Cmd.Login:
 		return h.handleLogin(req, clientIP), nil
 	case models.Cmd.ChangePassword:
@@ -96,16 +97,27 @@ func (h *Handler) Handle(req *models.GatewayRequest, clientIP string) (*models.G
 	}
 }
 
-func (h *Handler) handleRegister(req *models.GatewayRequest) *models.GatewayResponse {
+func (h *Handler) handleRegister(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
 	account := deref(req.Account, "")
 	passwordMd5 := deref(req.PasswordMd5, "")
 
-	code := h.accountSvc.Register(account, passwordMd5)
+	if clientIP == "" {
+		clientIP = "unknown"
+	}
+	// 机器码来自登录器上报（首个物理网卡 MAC）。老登录器不带 ⇒ 空串 ⇒
+	// 注册限额跳过机器维度，只按 IP 判。见 models.GatewayRequest.MachineId。
+	machineID := deref(req.MachineId, "")
+
+	// 走带限额的注册：判定与建号在同一临界区内（service.RegisterWithLimit）。
+	code, msg := h.accountSvc.RegisterWithLimit(account, passwordMd5, clientIP, machineID)
 	if code == models.Err.Ok {
 		h.registerBonus.Register(account)
 		return successResponse(req.Cmd, "注册成功")
 	}
-	return failureResponse(req.Cmd, code, errorMessages[code])
+	if msg == "" {
+		msg = errorMessages[code]
+	}
+	return failureResponse(req.Cmd, code, msg)
 }
 
 func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
@@ -155,12 +167,35 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	// 并把在线时长/泡点进度结转到新会话，时长不再因重复登录清零。
 	_, alreadyOnline := h.sessionMgr.FindSessionByAccount(account)
 	if alreadyOnline && !deref(req.ForceLogin, false) {
-		h.logger.Warn(fmt.Sprintf("拒绝重复登录: 账号=%s 已在线 IP=%s", account, clientIP))
-		return failureResponse(req.Cmd, models.Err.AccountOnline,
-			"该账号已登录，如需继续将断开之前的会话")
+		// ★ 掉线重连自动放行（2026-10-10）。
+		//
+		// 玩家掉线后重开登录器登录时，旧会话往往还没到心跳超时就被判"已在线"，
+		// 弹窗要人点确认 —— 人不在电脑前就一直进不去，几秒的网络抖动被放大成
+		// 几十秒掉线。旧会话已经"心跳停滞 + 来自同一端"时判定为掉线重连，
+		// 直接踢掉旧会话放行，不再弹窗。异地顶号（IP/设备都不同）不在此列，
+		// 仍然走 1023 弹窗，顶号保护不受影响。
+		if stale, ok := h.sessionMgr.FindStaleSessionForReconnect(
+			account, clientIP, deviceSecret, h.config.Heartbeat.StaleForceSeconds); ok {
+			h.logger.Warn(fmt.Sprintf(
+				"自动放行掉线重连: 账号=%s IP=%s 旧会话心跳停滞=%ds 旧IP=%s 阈值=%ds",
+				account, clientIP, time.Now().Unix()-stale.LastHeartbeat, stale.ClientIP,
+				h.config.Heartbeat.StaleForceSeconds))
+		} else {
+			h.logger.Warn(fmt.Sprintf("拒绝重复登录: 账号=%s 已在线 IP=%s", account, clientIP))
+			return failureResponse(req.Cmd, models.Err.AccountOnline,
+				"该账号已登录，如需继续将断开之前的会话")
+		}
 	}
 
-	token, _ := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, alreadyOnline)
+	// G-13（2026-10-04 审查）：原先写成 `token, _ := ...` 吞掉错误。
+	// ReplaceAccountSessions 内部第一步就是 GenerateToken()，失败时返回 ("", err) ⇒
+	// 登录响应 200 但 token 为空，玩家心跳与游戏连接全部鉴权失败，而服务端日志
+	// 却显示"登录成功"，极难定位。这里显式判错并回报服务端错误。
+	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, alreadyOnline)
+	if err != nil {
+		h.logger.Error(fmt.Sprintf("创建会话失败: 账号=%s IP=%s: %v", account, clientIP, err))
+		return failureResponse(req.Cmd, models.Err.DatabaseError, "服务器内部错误，请稍后重试")
+	}
 
 	resp := successResponse(req.Cmd)
 	resp.Token = strPtr(token)
@@ -395,19 +430,22 @@ func (h *Handler) handleUnbindQQ(req *models.GatewayRequest) *models.GatewayResp
 }
 
 func (h *Handler) handleVersion() *models.GatewayResponse {
-	minVersion := strings.TrimSpace(h.config.Launcher.MinVersion)
+	// G-5：Launcher 段会被管理后台在运行中改写，读一律走快照（锁内拷贝）。
+	snap := h.config.LauncherSnapshot()
+	minVersion := strings.TrimSpace(snap.MinVersion)
 	if minVersion == "" {
 		minVersion = "1.0.0"
 	}
 	resp := successResponse(models.Cmd.Version)
 	resp.Version = strPtr(minVersion)
-	resp.DownloadUrl = strPtr(h.config.Launcher.DownloadUrl)
+	resp.DownloadUrl = strPtr(snap.DownloadUrl)
 	return resp
 }
 
 // 版本门禁
 func (h *Handler) checkLauncherVersion(req *models.GatewayRequest) *models.GatewayResponse {
-	minText := strings.TrimSpace(h.config.Launcher.MinVersion)
+	snap := h.config.LauncherSnapshot() // G-5：快照读取
+	minText := strings.TrimSpace(snap.MinVersion)
 	if minText == "" {
 		return nil
 	}
@@ -423,7 +461,7 @@ func (h *Handler) checkLauncherVersion(req *models.GatewayRequest) *models.Gatew
 		resp := failureResponse(req.Cmd, models.Err.LauncherVersionTooOld,
 			fmt.Sprintf("登录器版本过低，请更新至 v%s 以上", minText))
 		resp.Version = strPtr(minText)
-		resp.DownloadUrl = strPtr(h.config.Launcher.DownloadUrl)
+		resp.DownloadUrl = strPtr(snap.DownloadUrl)
 		return resp
 	}
 
@@ -432,7 +470,7 @@ func (h *Handler) checkLauncherVersion(req *models.GatewayRequest) *models.Gatew
 		resp := failureResponse(req.Cmd, models.Err.LauncherVersionTooOld,
 			fmt.Sprintf("登录器版本过低，请更新至 v%s 以上", minText))
 		resp.Version = strPtr(minText)
-		resp.DownloadUrl = strPtr(h.config.Launcher.DownloadUrl)
+		resp.DownloadUrl = strPtr(snap.DownloadUrl)
 		return resp
 	}
 
@@ -441,7 +479,9 @@ func (h *Handler) checkLauncherVersion(req *models.GatewayRequest) *models.Gatew
 
 // 维护模式门禁
 func (h *Handler) checkMaintenanceMode(req *models.GatewayRequest) *models.GatewayResponse {
-	m := h.config.Maintenance
+	// G-5：Administrator 在管理后台开维护模式时会整体替换 Maintenance 段
+	// （含 AdminAccounts 切片头），这里必须走快照读，否则可能读到撕裂的值。
+	m := h.config.MaintenanceSnapshot()
 	if !m.Enabled {
 		return nil
 	}
@@ -586,4 +626,9 @@ var errorMessages = map[int]string{
 	models.Err.QQNumberTaken:            "该 QQ 号已被其他账号绑定",
 	models.Err.QQNumberConflict:         "该数字已被用作账号名，存在冲突，请联系管理员",
 	models.Err.QQNotBound:               "该账号未绑定 QQ 号",
+	// ── 注册限额（1036~1037）────────────────────────────────────────
+	// 这两个码的实际文案由 service.CheckRegisterLimit 动态拼（带上限数值），
+	// 这里是兜底：万一走了不带的路径，玩家至少能看懂发生了什么。
+	models.Err.RegisterIpLimit:      "同一网络今日注册账号已达上限，请明天再试或联系管理员",
+	models.Err.RegisterMachineLimit: "该设备注册账号数已达上限，请联系管理员",
 }

@@ -282,9 +282,10 @@ func NewRemoteRuntimeConfigBackend(c *Client) httprouter.RuntimeConfigBackend {
 type runtimeConfigResponse struct {
 	// Launcher 直接复用 httprouter.LauncherView：json tag 与内部 API 一致，
 	// 后端加字段时只改一处，不会出现「内部 API 返回了、远端结构没接」的漏接。
-	Launcher    httprouter.LauncherView    `json:"launcher"`
-	Maintenance httprouter.MaintenanceView `json:"maintenance"`
-	Online      int                        `json:"online"`
+	Launcher      httprouter.LauncherView      `json:"launcher"`
+	Maintenance   httprouter.MaintenanceView   `json:"maintenance"`
+	RegisterLimit httprouter.RegisterLimitView `json:"register_limit"`
+	Online        int                          `json:"online"`
 }
 
 func (b *RemoteRuntimeConfigBackend) fetch() (*runtimeConfigResponse, error) {
@@ -354,6 +355,39 @@ func (b *RemoteRuntimeConfigBackend) SetMaintenance(enabled *bool, message *stri
 		return 0, err
 	}
 	return resp.Kicked, nil
+}
+
+func (b *RemoteRuntimeConfigBackend) RegisterLimit() (httprouter.RegisterLimitView, error) {
+	resp, err := b.fetch()
+	if err != nil {
+		return httprouter.RegisterLimitView{}, err
+	}
+	return resp.RegisterLimit, nil
+}
+
+func (b *RemoteRuntimeConfigBackend) SetRegisterLimit(enabled *bool, perIPPerDay, perMachine *int) (bool, error) {
+	if enabled == nil && perIPPerDay == nil && perMachine == nil {
+		return false, nil
+	}
+	m := map[string]interface{}{}
+	if enabled != nil {
+		m["enabled"] = *enabled
+	}
+	if perIPPerDay != nil {
+		m["per_ip_per_day"] = *perIPPerDay
+	}
+	if perMachine != nil {
+		m["per_machine"] = *perMachine
+	}
+
+	var resp struct {
+		Changed bool `json:"changed"`
+	}
+	if err := b.c.do(http.MethodPost, "/internal/runtime-config",
+		map[string]interface{}{"register_limit": m}, &resp); err != nil {
+		return false, err
+	}
+	return resp.Changed, nil
 }
 
 // OnlineCount 返回网关侧的在线会话数（维护页用；与 Sessions.Count 同源）。

@@ -234,12 +234,21 @@ func main() {
 	// 启动清理服务
 	go func() {
 		ticker := newHeartbeatTicker(cfg.Heartbeat.CheckIntervalSeconds)
+		// G-16：拿到的是 *Ticker（不是裸 channel），退出时 Stop 掉。
+		defer ticker.Stop()
 		for {
 			select {
-			case <-ticker:
-				cleaned := sessionMgr.CleanExpiredSessions(cfg.Heartbeat.TimeoutSeconds)
+			case <-ticker.C:
+				// 明细打点（2026-10-10）：以前只有「清理超时会话: N」，出事后
+				// 回答不了"清的是谁、心跳停了多久、当时在不在游戏里"。
+				// 这里逐条打账号 / 停滞秒数 / 游戏连接数，便于回看是不是误清。
+				cleaned, details := sessionMgr.CleanExpiredSessionsWithDetails(cfg.Heartbeat.TimeoutSeconds)
 				if cleaned > 0 {
 					log.Info(fmt.Sprintf("清理超时会话: %d", cleaned))
+				}
+				for _, d := range details {
+					log.Info(fmt.Sprintf("会话超时清理: 账号=%s m_id=%s IP=%s 心跳停滞=%ds 游戏连接=%d 频道连接=%d",
+						d.Account, d.MId, d.ClientIP, d.StaleSecs, d.GameConns, d.ProxyConns))
 				}
 			case <-done:
 				return
@@ -339,7 +348,16 @@ func isWeakAuthKey(key string) bool {
 // done 全局停止信号。
 var done = make(chan struct{})
 
-// newHeartbeatTicker 创建定时器。
-func newHeartbeatTicker(intervalSeconds int) <-chan time.Time {
-	return time.NewTicker(time.Duration(intervalSeconds) * time.Second).C
+// newHeartbeatTicker 创建心跳清理定时器。
+//
+// G-16（2026-10-08，审查报告）：原先返回 `time.NewTicker(...).C` —— 把 Ticker 对象
+// 直接丢掉，此后**谁也没法 Stop 它**（循环退出后运行时定时器仍挂到进程结束）。
+// 改为返回 *time.Ticker，由调用方 defer Stop。
+//
+// 顺带挡掉 <=0：`time.NewTicker(0)` 会 panic，而间隔来自外部可改的配置。
+func newHeartbeatTicker(intervalSeconds int) *time.Ticker {
+	if intervalSeconds <= 0 {
+		intervalSeconds = 60
+	}
+	return time.NewTicker(time.Duration(intervalSeconds) * time.Second)
 }

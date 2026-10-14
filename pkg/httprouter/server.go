@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,6 +62,12 @@ type Server struct {
 	// admin 进程(8443) 负责上传/删除文件，网关进程(8080) 负责按签名重扫后下发。
 	// 不存在"改后台内存不影响玩家"那类错位，因此**不需要**走 backends 抽象。
 	plugins *pluginStore
+
+	// launcherUpdate 是登录器自更新分发（2026-10-01，见 launcher_update.go）。
+	// 与 plugins 同模式：纯文件系统 + currentStamp（size+mtime）签名校验，
+	// 两个进程各持一份共用 launcher_update/ 目录 —— admin 上传后网关进程
+	// 下一次请求自动感知新版本，不需要跨进程通知。
+	launcherUpdate *service.LauncherUpdateService
 
 	// 公告服务：**只在网关进程**非 nil。
 	// admin 进程不注册 /api/launcher/item-ranking（公开路由），
@@ -132,6 +140,7 @@ func NewServer(
 		cert:      cert,
 		portStore: portStore,
 		plugins:   newPluginStore(cfg.Launcher.PluginDir),
+		launcherUpdate: service.NewLauncherUpdateService(cfg, logger),
 		sessions:  b.Sessions,
 		pvf:       b.Pvf,
 		ports:     b.Ports,
@@ -316,15 +325,23 @@ func tlsLabel(cert *tls.Certificate) string {
 }
 
 func (s *Server) listenAndServe(server *http.Server, cert *tls.Certificate) {
+	var err error
 	if cert != nil {
-		if err := server.ListenAndServeTLS("", ""); err != nil {
-			s.logger.Fatal(fmt.Sprintf("HTTPS 服务启动失败: %v", err))
-		}
+		err = server.ListenAndServeTLS("", "")
+	} else {
+		err = server.ListenAndServe()
+	}
+	// http.ErrServerClosed 是优雅关闭（Shutdown/Close）的正常返回值，绝不能当故障。
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
 		return
 	}
-	if err := server.ListenAndServe(); err != nil {
-		s.logger.Fatal(fmt.Sprintf("HTTP 服务启动失败: %v", err))
-	}
+	// G-8（2026-10-04 审查）：原先这里只调 logger.Fatal，而 ConsoleLogger.Fatal
+	// **只写一行日志、不退出**；加上这段跑在 serveOn 的 goroutine 里 ——
+	// 于是 8080/8443 被占用时网关照常打印"已启动"，实际少了一个端口，问题要等到
+	// 玩家连不上才被发现。端口起不来就是致命错误：写日志后显式 os.Exit(1)，
+	// 让 systemd 按失败处理（重启/告警），而不是假装健康地跑着。
+	s.logger.Error(fmt.Sprintf("%s服务启动/运行失败（端口可能被占用）: %v", tlsLabel(cert), err))
+	os.Exit(1)
 }
 
 func (s *Server) portSplitMiddleware(next http.Handler) http.Handler {
@@ -395,6 +412,18 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 	// 登录器策略
 	r.HandleFunc("/api/launcher/policy", s.handleLauncherPolicy).Methods("GET")
 
+	// PVF 增量包下载（2026-09-30 PVF 增量更新，公开只读）。
+	//
+	// 与插件下载同组限流（launcher-binary）：它同样是"版本更新时才发生一次"的
+	// 大文件传输（实测 219 KB ~ 10.8 MB），不该占心跳/策略/榜单那份额度。
+	//
+	// ★ 端点是**无参**的：下发哪一份完全由网关当前状态决定（GetDelta）。
+	//   客户端拿到的包是否匹配自己那版，由包头部（与 policy）里的 from_hash 判定，
+	//   合成结果再由整文件 SHA-256 兜底 —— 不给客户端"点菜"的能力。
+	//   存在竞态（取到 policy 后管理员又传了新 PVF），此时合成产物校验不过，
+	//   客户端会保留旧文件并拒绝进游戏，下一次登录就拿到新的一份。
+	r.HandleFunc("/api/launcher/pvf/delta", s.handleLauncherPvfDelta).Methods("GET")
+
 	// 登录器物品榜单（史诗/传说/神器三榜，公开只读）
 	r.HandleFunc("/api/launcher/item-ranking", s.handleLauncherItemRanking).Methods("GET")
 
@@ -416,6 +445,12 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 	// 目录里的未登记文件不会经此接口外泄。
 	r.HandleFunc("/api/launcher/plugins", s.handleLauncherPlugins).Methods("GET")
 	r.HandleFunc("/api/launcher/plugins/file/{name:[^/]+}", s.handleLauncherPluginFile).Methods("GET")
+
+	// 登录器自更新（2026-10-01，公开只读）。与插件同因走 /api 路由。
+	// delta 必须带 ?from=<本地exe hash>；2.3.8 及更早客户端不认识这组端点。
+	r.HandleFunc("/api/launcher/update", s.handleLauncherUpdateManifest).Methods("GET")
+	r.HandleFunc("/api/launcher/update/exe", s.handleLauncherUpdateExe).Methods("GET")
+	r.HandleFunc("/api/launcher/update/delta", s.handleLauncherUpdateDelta).Methods("GET")
 
 	// 心跳
 	r.HandleFunc("/api/heartbeat", s.handleHeartbeat).Methods("POST")
@@ -446,6 +481,9 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/upload-pvf", s.handleAdminUploadPvf).Methods("POST")
 	r.HandleFunc("/api/admin/pvf/register", s.handlePvfRegister).Methods("POST")
 	r.HandleFunc("/api/admin/pvf/unregister", s.handlePvfUnregister).Methods("POST")
+	// 版本历史与回退（2026-09-30 方案①：任意历史版 → 按需增量 / 一键回退）
+	r.HandleFunc("/api/admin/pvf/history", s.handleAdminPvfHistory).Methods("GET")
+	r.HandleFunc("/api/admin/pvf/rollback", s.handleAdminPvfRollback).Methods("POST")
 
 	// 完整性策略
 	r.HandleFunc("/api/admin/integrity", s.handleAdminIntegrity).Methods("GET")
@@ -519,15 +557,24 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/plugins/upload", s.handleAdminPluginUpload).Methods("POST")
 	r.HandleFunc("/api/admin/plugins/delete", s.handleAdminPluginDelete).Methods("POST")
 	r.HandleFunc("/api/admin/plugins/meta", s.handleAdminPluginMetaSave).Methods("POST")
-	// 按目录里的 *.dll 生成一份清单草稿（首次部署省得手写）。
-	// 草稿全部是"非核心 + 默认关闭"，必须人工改对核心插件与顺序。
-	r.HandleFunc("/api/admin/plugins/meta/draft", s.handleAdminPluginMetaDraft).Methods("POST")
+	// ★ 2026-09-30 移除了 "/api/admin/plugins/meta/draft"（按目录生成清单草稿）。
+	//   它会**整体覆盖** plugins.json 且把每条都写成"非核心 + 默认关闭"，
+	//   误触一次就要手工把 12 条的顺序与核心标记全部重排回来（真实踩过）。
+	//   首次部署的清单以仓库里的 plugins/plugins.json 为准，不再由后台推导。
+
+	// 登录器版本管理（2026-10-01 自更新）。与插件同模式：纯文件系统、
+	// 两个进程共用 launcher_update/ 目录，不走内部 API。
+	// ★ /api/admin/launcher/upload 收 134 MiB exe，已加 bodylimit 白名单。
+	r.HandleFunc("/api/admin/launcher/versions", s.handleAdminLauncherVersions).Methods("GET")
+	r.HandleFunc("/api/admin/launcher/upload", s.handleAdminLauncherUpload).Methods("POST")
+	r.HandleFunc("/api/admin/launcher/rollback", s.handleAdminLauncherRollback).Methods("POST")
 
 	// 服务端管理
 	r.HandleFunc("/api/admin/server/status", s.handleAdminServerStatus).Methods("GET")
 	r.HandleFunc("/api/admin/server/control", s.handleAdminServerControl).Methods("POST")
 	r.HandleFunc("/api/admin/server/logs", s.handleAdminServerLogs).Methods("GET")
 	r.HandleFunc("/api/admin/server/pvf", s.handleAdminServerPvf).Methods("POST")
+	r.HandleFunc("/api/admin/server/pvf/info", s.handleAdminServerPvfInfo).Methods("GET")
 	r.HandleFunc("/api/admin/server/backup", s.handleAdminServerBackup).Methods("POST")
 	r.HandleFunc("/api/admin/server/backups", s.handleAdminServerBackups).Methods("GET")
 
@@ -547,6 +594,11 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	// 维护模式
 	r.HandleFunc("/api/admin/maintenance", s.handleAdminMaintenanceGet).Methods("GET")
 	r.HandleFunc("/api/admin/maintenance", s.handleAdminMaintenancePost).Methods("POST")
+
+	// 注册限额（反批量注册，2026-10-13）
+	r.HandleFunc("/api/admin/register-limit", s.handleAdminRegisterLimitGet).Methods("GET")
+	r.HandleFunc("/api/admin/register-limit", s.handleAdminRegisterLimitPost).Methods("POST")
+	r.HandleFunc("/api/admin/register-logs", s.handleAdminRegisterLogs).Methods("GET")
 
 	// 外挂检测查询
 	r.HandleFunc("/api/admin/anticheat/detections", s.handleAdminAntiCheatDetections).Methods("GET")
@@ -700,9 +752,10 @@ func (s *Server) handleInternalApplyPorts(w http.ResponseWriter, r *http.Request
 
 // internalRuntimeConfig 是内部 API 的运行时配置视图。
 type internalRuntimeConfig struct {
-	Launcher    LauncherView    `json:"launcher"`
-	Maintenance MaintenanceView `json:"maintenance"`
-	Online      int             `json:"online"`
+	Launcher      LauncherView      `json:"launcher"`
+	Maintenance   MaintenanceView   `json:"maintenance"`
+	RegisterLimit RegisterLimitView `json:"register_limit"`
+	Online        int               `json:"online"`
 }
 
 func (s *Server) buildInternalRuntimeConfig() (internalRuntimeConfig, error) {
@@ -720,6 +773,12 @@ func (s *Server) buildInternalRuntimeConfig() (internalRuntimeConfig, error) {
 	}
 	out.Maintenance = mv
 
+	rv, err := s.runtime.RegisterLimit()
+	if err != nil {
+		return out, err
+	}
+	out.RegisterLimit = rv
+
 	online, _ := s.sessions.Count()
 	out.Online = online
 	return out, nil
@@ -732,10 +791,11 @@ func (s *Server) handleInternalRuntimeConfigGet(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":          true,
-		"launcher":    out.Launcher,
-		"maintenance": out.Maintenance,
-		"online":      out.Online,
+		"ok":             true,
+		"launcher":       out.Launcher,
+		"maintenance":    out.Maintenance,
+		"register_limit": out.RegisterLimit,
+		"online":         out.Online,
 	})
 }
 
@@ -751,6 +811,11 @@ func (s *Server) handleInternalRuntimeConfigSet(w http.ResponseWriter, r *http.R
 			Message       *string  `json:"message"`
 			AdminAccounts []string `json:"admin_accounts"`
 		} `json:"maintenance"`
+		RegisterLimit *struct {
+			Enabled     *bool `json:"enabled"`
+			PerIPPerDay *int  `json:"per_ip_per_day"`
+			PerMachine  *int  `json:"per_machine"`
+		} `json:"register_limit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "bad json"})
@@ -760,6 +825,16 @@ func (s *Server) handleInternalRuntimeConfigSet(w http.ResponseWriter, r *http.R
 	changed := false
 	if body.Launcher != nil {
 		c, err := s.runtime.SetLauncher(body.Launcher.MinVersion, body.Launcher.DownloadURL, body.Launcher.UpdateNotice)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		changed = changed || c
+	}
+
+	if body.RegisterLimit != nil {
+		c, err := s.runtime.SetRegisterLimit(body.RegisterLimit.Enabled,
+			body.RegisterLimit.PerIPPerDay, body.RegisterLimit.PerMachine)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
 			return
@@ -945,13 +1020,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLauncherVersion(w http.ResponseWriter, r *http.Request) {
-	minVer := strings.TrimSpace(s.config.Launcher.MinVersion)
+	lz := s.config.LauncherSnapshot() // G-5：运行时可变段走快照
+	minVer := strings.TrimSpace(lz.MinVersion)
 	if minVer == "" {
 		minVer = "1.0.0"
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"version":      minVer,
-		"download_url": s.config.Launcher.DownloadUrl,
+		"download_url": lz.DownloadUrl,
 	})
 }
 
@@ -965,20 +1041,58 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 	whiteDigest := listDigest(snap.WhiteList)
 	blackDigest := listDigest(snap.BlackList)
 	allowedDigest := namesDigest(snap.AllowedModules)
+	// G-2（2026-10-04 审查）：本端点是**免鉴权公开端点、每个登录器启动必打**。
+	// GetPvfInfo 在「PVF 文件在、但哈希失败」时会返回 nil（它把 RefreshCache 的
+	// error 吞掉后返回 s.info），直接解引用就是进程级 panic，重启后重复命中
+	// ⇒ 崩溃循环。composeFingerprint 已容忍 nil，下面的 pvfObj 也必须判空
+	// （同文件 handleAdminPvfHistory 就是先判空再取字段）。
 	fingerprint := composeFingerprint(snap.Revision, pvfInfo, whiteDigest, blackDigest, allowedDigest)
 
 	changed := force || rev != fingerprint
 
-	var pvfUtc interface{} = pvfInfo.ModifiedUtc
-	if pvfInfo.ModifiedUtc == "" {
-		pvfUtc = nil
+	// nil 时下发空指纹：登录器拿不到匹配的 hash 就不会替换本地 PVF
+	// （有整文件 SHA-256 兜底），比让网关崩掉好得多。
+	pvfObj := map[string]interface{}{
+		"hash": "", "algo": "", "size": int64(0), "modified_utc": nil,
 	}
+	if pvfInfo != nil {
+		var pvfUtc interface{}
+		if pvfInfo.ModifiedUtc != "" {
+			pvfUtc = pvfInfo.ModifiedUtc
+		}
+		pvfObj = map[string]interface{}{
+			"hash": pvfInfo.Hash, "algo": pvfInfo.Algo,
+			"size": pvfInfo.Size, "modified_utc": pvfUtc,
+		}
+	}
+	// PVF 增量更新（2026-09-30）：只有当网关手里有一份「上一版 → 当前版」的增量包，
+	// 且它的 to_hash 就是当前 PVF 时才下发（GetDelta 内部已校）。
+	//
+	// 登录器的用法：本地 PVF 的 SHA-256
+	//   == pvf.hash          → 直接锁定（现状，无需下载）
+	//   == pvf.delta.from_hash → 下 url 并合成，校验 to_hash 后原子替换
+	//   其它                  → 没有可用增量，维持现状（提示手动更新客户端）
+	//
+	// url 给相对路径：登录器自己有"连的是哪个网关"，与插件下载口径一致，
+	// 换成 CDN/对象存储时只改这里（或另加绝对 URL 字段），客户端不用动。
+	if d := s.pvfSvc.GetDelta(); d != nil {
+		pvfObj["delta"] = map[string]interface{}{
+			"from_hash":   d.FromHash,
+			"to_hash":     d.ToHash,
+			"to_size":     d.ToSize,
+			"size":        d.Size,
+			"url":         "/api/launcher/pvf/delta",
+			"algo":        "block2048",
+			"created_utc": d.CreatedUtc,
+		}
+	}
+
 	resp := map[string]interface{}{
 		"ok":             true,
 		"changed":        changed,
 		"fingerprint":    fingerprint,
 		"revision":       snap.Revision,
-		"pvf":            map[string]interface{}{"hash": pvfInfo.Hash, "algo": pvfInfo.Algo, "size": pvfInfo.Size, "modified_utc": pvfUtc},
+		"pvf":            pvfObj,
 		"white_digest":   whiteDigest,
 		"black_digest":   blackDigest,
 		"allowed_digest": allowedDigest,
@@ -1168,14 +1282,24 @@ func (s *Server) handleAdminUploadPvf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	// 版本备注（2026-09-30 方案①）：随上传写进 pvf_history 记录，
+	// 后台「版本历史」表展示、回退时人工辨认用。可空。
+	name := strings.TrimSpace(r.FormValue("name"))
+
+	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "no pvf file"})
 		return
 	}
 	defer file.Close()
 
-	info, err := s.pvfSvc.ReplacePvf(file)
+	// 浏览器（尤其老 IE）可能给整个本地路径，只留文件名进记录。
+	filename := ""
+	if header != nil {
+		filename = filepath.Base(filepath.Clean(header.Filename))
+	}
+
+	info, err := s.pvfSvc.ReplacePvf(file, name, filename)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "message": err.Error()})
 		return
@@ -1186,6 +1310,61 @@ func (s *Server) handleAdminUploadPvf(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "mode": "file", "hash": info.Hash, "algo": info.Algo,
 		"size": info.Size, "modified_utc": info.ModifiedUtc,
+	})
+}
+
+// handleAdminPvfHistory 版本历史列表（后台「PVF 版本历史」表）。
+// GetHistory 内部带惰性 seed（当前版/.bak 版不在史会先入史），因此
+// 首次打开该页就能看到可回退的版本 —— 不依赖运维先走过上传流程。
+func (s *Server) handleAdminPvfHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+	entries := s.pvfSvc.GetHistory()
+	currentHash := ""
+	if info := s.pvfSvc.GetPvfInfo(); info != nil {
+		currentHash = info.Hash
+	}
+	out := make([]map[string]interface{}, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, map[string]interface{}{
+			"hash":        e.Hash,
+			"size":        e.Size,
+			"name":        e.Name,
+			"filename":    e.Filename,
+			"stored_utc":  e.StoredUtc,
+			"is_current":  strings.EqualFold(e.Hash, currentHash),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok": true, "current_hash": currentHash, "entries": out,
+	})
+}
+
+// handleAdminPvfRollback 回退到历史版本。
+// 走 PvfService.RollbackPvf（完整 ReplacePvf 链路：备份 → 替换 → 刷新 →
+// 重建固定增量 → 历史入档），随后与 upload-pvf 同样的收尾（Bump + 通知网关）。
+// 回退后：在**回退前版本**上的玩家，下次登录会走增量更新降到回退版。
+func (s *Server) handleAdminPvfRollback(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+	var body struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "请求体不是合法 JSON"})
+		return
+	}
+	info, err := s.pvfSvc.RollbackPvf(body.Hash)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": err.Error()})
+		return
+	}
+	s.integritySvc.Bump()
+	s.notifyPvfChanged()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok": true, "hash": info.Hash, "algo": info.Algo, "size": info.Size,
 	})
 }
 
@@ -1277,9 +1456,13 @@ func (s *Server) handleAdminIntegrityUpload(w http.ResponseWriter, r *http.Reque
 				errs = append(errs, fmt.Sprintf("%s: %v", f.Filename, err))
 				continue
 			}
-			defer file.Close()
 
+			// G-14（2026-10-08，审查报告）：**不要**在这里 defer file.Close()。
+			// 这是循环体 —— defer 要等整个 handler 返回才执行，批量上传（成百个分片）
+			// 会把句柄全压在手里，撞 ulimit -n 时报的是"打开文件过多"，
+			// 看着像系统资源问题，其实是这里攒出来的。
 			hash, algo := security.ComputeFileFingerprint(file)
+			file.Close()
 			entries = append(entries, models.FingerprintEntry{
 				FileName: f.Filename, Hash: hash, Algorithm: algo, Size: f.Size,
 				Display: fmt.Sprintf("%s [%s]", f.Filename, utils.ShortHash(hash)),
@@ -1886,13 +2069,16 @@ func errCodeOf(err error) string {
 }
 
 // deleteLogsSuffix 拼出"是否清理流水"的提示后缀。
+//
+// 三类流水一起说：注册奖励 / 反作弊 / 注册流水（register_logs）。
+// 注册流水还有个副作用必须让管理员知道 —— 清掉它等于**返还该 IP / 机器码的注册配额**。
 func deleteLogsSuffix(p *database.AccountDeletePreview) string {
 	if p.PurgedLogs {
-		return "，审计流水已一并清理"
+		return "，审计流水（奖励/反作弊/注册）已一并清理，该 IP/机器码的注册配额随之释放"
 	}
-	if p.BonusLogs > 0 || p.AntiCheatRows > 0 {
-		return fmt.Sprintf("；保留审计流水 %d 条奖励 / %d 条反作弊（如需清理请勾选清理流水）",
-			p.BonusLogs, p.AntiCheatRows)
+	if p.BonusLogs > 0 || p.AntiCheatRows > 0 || p.RegisterRows > 0 {
+		return fmt.Sprintf("；保留审计流水 %d 条奖励 / %d 条反作弊 / %d 条注册（如需清理请勾选清理流水）",
+			p.BonusLogs, p.AntiCheatRows, p.RegisterRows)
 	}
 	return ""
 }
@@ -2264,8 +2450,39 @@ func (s *Server) handleAdminServerLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": result.Error == "", "error": result.Error, "result": result})
 }
 
+// handleAdminServerPvf 替换**服务端使用的** PVF（明文，DfoServer 读的那份）。
+//
+// ★★ 2026-09-30 方案调整后的边界（别再把两者合并回去）：
+//
+//	「替换服务端 PVF」（本端点）→ 服务端文件夹。**不**登记客户端校验指纹、
+//	    **不**生成增量包、**不**写版本历史、**不**通知网关。
+//	「上传 PVF」（/api/admin/upload-pvf）→ 网关侧保存的「客户端基准」
+//	    （将来可换成加密版）。客户端的校验指纹 / 增量更新 / 版本历史围绕它。
+//
+// 两条路径必须指向**不同文件**。指向同一个文件时，本端点会把客户端的 `.bak`
+// 覆盖成新版自己 ⇒ rebuildDelta 产出 from==to 的自差分 ⇒ 全体旧版客户端进不去
+// —— 这正是 09-30 那次线上事故。所以这里加一道硬守卫，宁可拒绝也不留隐患。
 func (s *Server) handleAdminServerPvf(w http.ResponseWriter, r *http.Request) {
 	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	// 路径守卫放在解析 multipart **之前**：先把不允许的操作挡掉，连文件都不收。
+	target, err := s.serverMgr.ResolvePvfPath()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": err.Error()})
+		return
+	}
+	if managed := s.pvfSvc.PvfPath(); sameFilePath(target, managed) {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok": false,
+			"message": fmt.Sprintf(
+				"拒绝替换：服务端 PVF 与网关管理的客户端 PVF 指向同一个文件（%s）。"+
+					"在此配置下替换服务端 PVF 会覆盖客户端的增量基线 .bak，"+
+					"生成「新版→新版」的自差分，导致旧版客户端全部进不去。"+
+					"请把「客户端基准」（Pvf.FilePath）与服务端 PVF 配到不同文件"+
+					"（服务端用明文、网关侧存客户端基准），或改用「上传 PVF」。", target),
+		})
 		return
 	}
 
@@ -2282,7 +2499,53 @@ func (s *Server) handleAdminServerPvf(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	result := s.serverMgr.ReplacePvf(file)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": result.Ok, "error": result.Error, "result": result})
+	if !result.Ok {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": result.Error})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok": true, "path": result.Path, "hash": result.Hash, "algo": result.Algo,
+		"size": result.Size, "modified_utc": result.ModifiedUtc,
+		"note": "仅更新服务端使用的 PVF；客户端校验指纹与增量更新不受影响",
+	})
+}
+
+// handleAdminServerPvfInfo 读服务端 PVF 的当前落盘信息。
+//
+// 与 /api/pvf/info（客户端基准）**刻意分开**：这两份是不同文件、各自独立版本，
+// 页面必须分别显示，否则运维会以为改一个另一个跟着变。
+func (s *Server) handleAdminServerPvfInfo(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+	info, err := s.serverMgr.ServerPvfInfo()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok": true, "path": info.Path, "hash": info.Hash, "algo": info.Algo,
+		"size": info.Size, "modified_utc": info.ModifiedUtc,
+		"client_path": s.pvfSvc.PvfPath(),
+	})
+}
+
+// sameFilePath 判断两个路径是否指向同一个文件。
+//
+// 优先用 os.SameFile（能识破软链/不同写法的同一路径）；文件还没落盘时
+// 退化为 Clean 后比较 —— 保守方向正确：认不出「相同」只是少拦一次，
+// 认错「相同」会挡住正常上传。
+func sameFilePath(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	if errA == nil && errB == nil {
+		return os.SameFile(fa, fb)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 func (s *Server) handleAdminServerBackup(w http.ResponseWriter, r *http.Request) {
@@ -2464,6 +2727,111 @@ func (s *Server) handleAdminMaintenancePost(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// ==================== 注册限额（2026-10-13）====================
+//
+// 判定发生在**网关进程**的 TCP 注册路径上（service.CheckRegisterLimit），
+// 所以权威值只在网关内存里。admin 进程必须经运行时配置后端转发，
+// 让它改自己的副本会出现「后台显示已改、注册照旧不拦」的静默失效。
+
+func (s *Server) handleAdminRegisterLimitGet(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	rv, err := s.runtime.RegisterLimit()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":            true,
+		"enabled":       rv.Enabled,
+		"per_ip_per_day": rv.PerIPPerDay,
+		"per_machine":    rv.PerMachine,
+		"override_file":  config.OverrideFileName,
+	})
+}
+
+func (s *Server) handleAdminRegisterLimitPost(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	var body struct {
+		Enabled     *bool `json:"enabled"`
+		PerIPPerDay *int  `json:"per_ip_per_day"`
+		PerMachine  *int  `json:"per_machine"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "参数错误"})
+		return
+	}
+
+	changed, err := s.runtime.SetRegisterLimit(body.Enabled, body.PerIPPerDay, body.PerMachine)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("[Admin] 注册限额配置更新失败: %v", err))
+		// 值域错误是**用户输入问题**，回 400 并原样透出原因，让后台能提示到具体字段；
+		// 其它错误（落盘失败等）才是 500。
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "取值必须在") {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]interface{}{"ok": false, "message": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "changed": changed})
+}
+
+// handleAdminRegisterLogs 查注册流水（按 IP 或机器码）。
+//
+// 用途：玩家来问"为什么我注册不了"时，后台要能立刻看到"这个 IP / 这台机器
+// 最近注册了哪些号"。纯读、不依赖网关内存，admin 进程直读自己的 db 句柄即可。
+func (s *Server) handleAdminRegisterLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "logs": []interface{}{}})
+		return
+	}
+
+	ip := strings.TrimSpace(r.URL.Query().Get("ip"))
+	machine := strings.TrimSpace(r.URL.Query().Get("machine"))
+	limit := parseIntParam(r.URL.Query().Get("limit"), 20)
+
+	var (
+		logs []database.RegistrationLog
+		err  error
+	)
+	switch {
+	case ip != "":
+		logs, err = s.db.ListRecentRegistrationLogsByIP(ip, limit)
+	case machine != "":
+		logs, err = s.db.ListRecentRegistrationLogsByMachine(machine, limit)
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "需要 ip 或 machine 参数"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+
+	out := make([]map[string]interface{}, 0, len(logs))
+	for _, l := range logs {
+		out = append(out, map[string]interface{}{
+			"account":    l.Account,
+			"m_id":       l.MID,
+			"ip":         l.IP,
+			"machine_id": l.MachineID,
+			"created_at": l.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "logs": out})
+}
+
 // ==================== 辅助函数 ====================
 
 func (s *Server) checkAdmin(w http.ResponseWriter, r *http.Request) bool {
@@ -2537,7 +2905,9 @@ func deref[T any](p *T, def T) T {
 	return def
 }
 
-func extractAccountNames(sessions []*models.Session) []string {
+// extractAccountNames 从会话快照里取出账号名。
+// G-9（2026-10-04 审查）：GetAllSessions 改为返回值快照后，这里同步改成值切片。
+func extractAccountNames(sessions []models.Session) []string {
 	names := make([]string, 0, len(sessions))
 	for _, s := range sessions {
 		names = append(names, s.Account)
@@ -2584,12 +2954,23 @@ func composeFingerprint(revision int, pvf *models.PvfInfo, white, black, allowed
 // ReportToken 由登录器下发（放入请求体，与原网关契约一致），
 // 是服务端归因依据，缺省或不合法一律 401。
 type AntiCheatReportRequest struct {
-	ReportToken string               `json:"reportToken"`
-	Account     string               `json:"account"`
-	Detections  []AntiCheatDetection `json:"detections"`
+	ReportToken string `json:"reportToken"`
+	Account     string `json:"account"`
+	// PlayerName 角色名。客户端从 [Identity] playerName 取（由登录器渲染下发）。
+	// 空串是合法值：登录器没渲染该字段、或玩家还在选人界面时都会是空。
+	PlayerName string               `json:"playerName"`
+	Detections []AntiCheatDetection `json:"detections"`
 }
 
 // AntiCheatDetection 单条检测记录。
+//
+// 末尾两个字段来自新版客户端插件（老客户端不发，缺省为 0，兼容）：
+//   - Exempt  ：命中时自研组件（NF.dll / EquipmentSwap.dll）是否在场。只作区分，
+//     命中一律照常入库 —— 丢弃会让外挂靠加载同名 DLL 把自己从数据里抹掉。
+//   - DedupID ：客户端生成的去重 ID，本期仅存档（见 database 建表处注释）。
+//
+// 注意 DedupID 在 JSON 里是可能超过 2^53 的整数，浏览器侧（JS）拿到会丢精度；
+// 后台只展示不参与计算，且 Go 侧按 uint64 原样收，不受影响。
 type AntiCheatDetection struct {
 	RuleName       string  `json:"ruleName"`
 	Description    string  `json:"description"`
@@ -2597,6 +2978,14 @@ type AntiCheatDetection struct {
 	ThresholdValue float64 `json:"thresholdValue"`
 	Timestamp      int64   `json:"timestamp"`
 	Evidence       string  `json:"evidence"`
+	Exempt         int     `json:"exempt"`
+	DedupID        uint64  `json:"dedupId"`
+	// RoomNumber / MapID：插件一直在发这两个字段（ACReporter 的 roomNumber / mapId），
+	// 而早期网关的结构里没有它们 —— json 解码不报错、直接丢弃。补上之后，
+	// 「击杀间隔过短」这类命中才能还原出「在哪张图的哪个房间」。
+	// 老客户端不发时为 0，与「城镇/未知」同义，不区分。
+	RoomNumber int `json:"roomNumber"`
+	MapID      int `json:"mapId"`
 }
 
 // handleAntiCheatReport 接收客户端外挂检测上报。
@@ -2639,7 +3028,23 @@ func (s *Server) handleAntiCheatReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 存储检测记录到数据库
+	// 角色名是「报文级」字段（一批检测同属一次会话快照），逐条冗余写进每一行，
+	// 明细查询才能按角色直接过滤，不必再回表拼报文。
+	//
+	// ★ 角色名**由网关解析**，不用客户端自报的值：插件读不到角色名（客户端里账号/角色名
+	// 加密存放，且明文副本没有任何静态指针指向，详见 database.CurrentRoleName 的注释）。
+	// 这里取「账号 → 当前角色」，与 /api/launcher/online 的在线角色同一口径；
+	// 本 handler 已校验 reportToken，此刻该账号必然在线，推定成立。
 	now := time.Now().Unix()
+	fromDB := ""
+	if s.db != nil {
+		fromDB = s.db.CurrentRoleName(account)
+	}
+	playerName, roleMismatch := pickPlayerName(req.PlayerName, fromDB)
+	if roleMismatch {
+		s.logger.Warn(fmt.Sprintf("[AntiCheat] role_name_mismatch: 会话=%s 客户端自报=%s 网关解析=%s IP=%s",
+			account, strings.TrimSpace(req.PlayerName), fromDB, clientIP))
+	}
 	detections := make([]database.AntiCheatDetection, len(req.Detections))
 	for i, d := range req.Detections {
 		detections[i] = database.AntiCheatDetection{
@@ -2652,6 +3057,11 @@ func (s *Server) handleAntiCheatReport(w http.ResponseWriter, r *http.Request) {
 			ClientIP:       clientIP,
 			Account:        account,
 			ReportedAt:     now,
+			Exempt:         d.Exempt,
+			DedupID:        int64(d.DedupID),
+			RoomNumber:     d.RoomNumber,
+			MapID:          d.MapID,
+			PlayerName:     playerName,
 		}
 	}
 
@@ -2666,6 +3076,24 @@ func (s *Server) handleAntiCheatReport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// pickPlayerName 决定最终入库的角色名，并回报两个来源是否不一致。
+//
+// 优先级：客户端自报 > 网关解析。
+//   - 客户端自报非空 → 用它。它是那个进程的真实角色，比任何推定都准；
+//   - 否则用网关解析值（当前唯一可用的来源，插件恒为空串）；
+//   - 两个都有值但不相等 → 仍然用客户端的，但把 mismatch 回报给调用方打 Warn
+//     —— 那条日志是「插件终于读到角色名了」的唯一信号，别把它静默掉。
+//
+// 做成纯函数是为了能直接断言优先级，不必起一整套 Server + 库 + 会话。
+func pickPlayerName(clientName, fromDB string) (name string, mismatch bool) {
+	client := strings.TrimSpace(clientName)
+	server := strings.TrimSpace(fromDB)
+	if client == "" {
+		return server, false
+	}
+	return client, server != "" && server != client
+}
+
 // AntiCheatDetectionResponse 检测记录响应。
 type AntiCheatDetectionResponse struct {
 	ID             string  `json:"id"`
@@ -2677,6 +3105,42 @@ type AntiCheatDetectionResponse struct {
 	Evidence       string  `json:"evidence"`
 	ClientIP       string  `json:"clientIp"`
 	ReportedAt     int64   `json:"reportedAt"`
+	// Exempt=1 表示这条命中发生时自研组件在场，后台据此打「豁免」标记。
+	Exempt int `json:"exempt"`
+	// Account 是会话解析出来的账号（可信）；PlayerName 是客户端自报的角色名（可能为空）。
+	// 后台「检测明细」要按这两项区分与筛选，所以必须回传，不能只靠玩家汇总页。
+	Account    string `json:"account"`
+	PlayerName string `json:"playerName"`
+	// RoomNumber / MapID 触发时所在房间号与地图ID。0 = 客户端未提供（老客户端）。
+	RoomNumber int `json:"roomNumber"`
+	MapID      int `json:"mapId"`
+}
+
+// toAntiCheatResponses 把库记录转成后台响应体。
+//
+// 两个 handler（全表明细 / 单账号明细）共用这一份转换，避免以后加字段时
+// 只改一处、另一个接口悄悄少一个字段。
+func toAntiCheatResponses(detections []database.AntiCheatDetection) []AntiCheatDetectionResponse {
+	resp := make([]AntiCheatDetectionResponse, len(detections))
+	for i, d := range detections {
+		resp[i] = AntiCheatDetectionResponse{
+			ID:             fmt.Sprintf("%d", d.ID),
+			RuleName:       d.RuleName,
+			Description:    d.Description,
+			ActualValue:    d.ActualValue,
+			ThresholdValue: d.ThresholdValue,
+			Timestamp:      d.EventTimestamp,
+			Evidence:       d.Evidence,
+			ClientIP:       d.ClientIP,
+			ReportedAt:     d.ReportedAt,
+			Exempt:         d.Exempt,
+			Account:        d.Account,
+			PlayerName:     d.PlayerName,
+			RoomNumber:     d.RoomNumber,
+			MapID:          d.MapID,
+		}
+	}
+	return resp
 }
 
 // AntiCheatPlayerSummary 玩家检测汇总。
@@ -2697,10 +3161,27 @@ func (s *Server) handleAdminAntiCheatDetections(w http.ResponseWriter, r *http.R
 	}
 
 	// 分页参数
-	limit := parseLimit(r.URL.Query().Get("limit"), 50)
-	offset := parseOffset(r.URL.Query().Get("offset"))
+	q := r.URL.Query()
+	limit := parseLimit(q.Get("limit"), 50)
+	offset := parseOffset(q.Get("offset"))
 
-	detections, total, err := s.db.GetAntiCheatDetections(limit, offset)
+	// 筛选参数（全部可选）。空值 = 该条件不生效。
+	// 对外用短参数名（role / rule），避免把库列名直接暴露给前端。
+	f := database.AntiCheatFilter{
+		Account:    strings.TrimSpace(q.Get("account")),
+		PlayerName: strings.TrimSpace(q.Get("role")),
+		RuleName:   strings.TrimSpace(q.Get("rule")),
+		Keyword:    strings.TrimSpace(q.Get("keyword")),
+		Since:      parseInt64Seconds(q.Get("since")),
+		Until:      parseInt64Seconds(q.Get("until")),
+	}
+	// exempt 缺省 = 不限；只有显式给 0/1 才过滤。
+	// 用指针传是为了避开「零值 0 静默变成『只看非豁免』」这个陷阱。
+	if v, ok := parseOptionalInt(q.Get("exempt")); ok && (v == 0 || v == 1) {
+		f.ExemptFilter = &v
+	}
+
+	detections, total, err := s.db.QueryAntiCheatDetections(f, limit, offset)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
 			"ok": false, "error": err.Error(),
@@ -2708,23 +3189,9 @@ func (s *Server) handleAdminAntiCheatDetections(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	resp := make([]AntiCheatDetectionResponse, len(detections))
-	for i, d := range detections {
-		resp[i] = AntiCheatDetectionResponse{
-			ID:             fmt.Sprintf("%d", d.ID),
-			RuleName:       d.RuleName,
-			Description:    d.Description,
-			ActualValue:    d.ActualValue,
-			ThresholdValue: d.ThresholdValue,
-			Timestamp:      d.EventTimestamp,
-			Evidence:       d.Evidence,
-			ClientIP:       d.ClientIP,
-			ReportedAt:     d.ReportedAt,
-		}
-	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true, "detections": resp, "total": total, "limit": limit, "offset": offset,
+		"ok": true, "detections": toAntiCheatResponses(detections),
+		"total": total, "limit": limit, "offset": offset,
 	})
 }
 
@@ -2765,10 +3232,24 @@ func (s *Server) handleAdminAntiCheatPlayerDetails(w http.ResponseWriter, r *htt
 	vars := mux.Vars(r)
 	account := vars["account"]
 
-	limit := parseLimit(r.URL.Query().Get("limit"), 50)
-	offset := parseOffset(r.URL.Query().Get("offset"))
+	q := r.URL.Query()
+	limit := parseLimit(q.Get("limit"), 50)
+	offset := parseOffset(q.Get("offset"))
 
-	detections, total, err := s.db.GetAntiCheatDetectionsByAccount(account, limit, offset)
+	// 账号来自 URL 路径（必定非空）；角色名与其它条件作为附加过滤。
+	f := database.AntiCheatFilter{
+		Account:    account,
+		PlayerName: strings.TrimSpace(q.Get("role")),
+		RuleName:   strings.TrimSpace(q.Get("rule")),
+		Keyword:    strings.TrimSpace(q.Get("keyword")),
+		Since:      parseInt64Seconds(q.Get("since")),
+		Until:      parseInt64Seconds(q.Get("until")),
+	}
+	if v, ok := parseOptionalInt(q.Get("exempt")); ok && (v == 0 || v == 1) {
+		f.ExemptFilter = &v
+	}
+
+	detections, total, err := s.db.QueryAntiCheatDetections(f, limit, offset)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
 			"ok": false, "error": err.Error(),
@@ -2776,23 +3257,9 @@ func (s *Server) handleAdminAntiCheatPlayerDetails(w http.ResponseWriter, r *htt
 		return
 	}
 
-	resp := make([]AntiCheatDetectionResponse, len(detections))
-	for i, d := range detections {
-		resp[i] = AntiCheatDetectionResponse{
-			ID:             fmt.Sprintf("%d", d.ID),
-			RuleName:       d.RuleName,
-			Description:    d.Description,
-			ActualValue:    d.ActualValue,
-			ThresholdValue: d.ThresholdValue,
-			Timestamp:      d.EventTimestamp,
-			Evidence:       d.Evidence,
-			ClientIP:       d.ClientIP,
-			ReportedAt:     d.ReportedAt,
-		}
-	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true, "account": account, "detections": resp, "total": total,
+		"ok": true, "account": account,
+		"detections": toAntiCheatResponses(detections), "total": total,
 	})
 }
 
@@ -2818,6 +3285,36 @@ func parseOffset(s string) int {
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// parseOptionalInt 解析可选的整数筛选参数。
+//
+// 返回 ok=false 表示「参数没给 / 非法」= 该条件不生效。刻意与「给了 0」区分开：
+// 筛选 exempt=0（只看非豁免）是合法需求，不能和「没给」混为一谈。
+func parseOptionalInt(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseInt64Seconds 解析可选的秒级时间戳筛选参数。
+// 空串 / 非法 / <=0 一律返回 0（= 该条件不生效）。
+func parseInt64Seconds(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
 		return 0
 	}
 	return n

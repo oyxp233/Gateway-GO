@@ -155,9 +155,20 @@ var pathGroups = []struct {
 	// ★ 顺序敏感：更具体的 /plugins/file 必须排在 /plugins 之前。
 	// PathGroup 是线性扫描、命中即返回，反过来的话下载会被归进清单那一桶。
 	{"/api/launcher/plugins/file", GroupLauncherBinary},
+	// PVF 增量包下载（2026-09-30 PVF 增量更新）。同样是"版本更新时才发生一次"的
+	// 大文件传输（实测 219 KB ~ 10.8 MB），与插件下载共用一个桶：
+	// 两者都是登录启动阶段的一次性拉取，不会互相挤占（同一时刻只会发生一件）。
+	{"/api/launcher/pvf/delta", GroupLauncherBinary},
 	// 插件清单（2026-09-30 插件增量更新）。与 policy 同类：公开只读的策略下发，
 	// 每次启动打一次，归 launcher 桶。
 	{"/api/launcher/plugins", GroupLauncher},
+	// 登录器自更新（2026-10-04 审查 G-3）：/api/launcher/update（清单）、
+	// /update/exe（134 MiB 全量 exe）、/update/delta（差分）原先**完全不在限流表里** ——
+	// PathGroup() 返回空串，限流中间件直接放行。而 /update/exe 是无鉴权大文件下载、
+	// /update/delta 会对整个 exe 重算 SHA-256 + 块索引，外部可直接打满出口带宽与 CPU。
+	// 归 launcher-binary 桶（与插件文件、PVF 增量同类：登录启动阶段的一次性拉取）。
+	// ★ 前缀匹配覆盖整条 /update 子树（清单 / exe / delta），无需逐条列。
+	{"/api/launcher/update", GroupLauncherBinary},
 	{"/api/launcher/item-ranking", GroupLauncher},
 	{"/api/launcher/policy", GroupLauncher},
 	// online 免鉴权且每次要 join 游戏库查角色（带 5s 缓存），仍必须限流：

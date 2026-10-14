@@ -77,7 +77,9 @@ func TestAdminPluginsRequiresAuth(t *testing.T) {
 		{"upload", "POST", "/api/admin/plugins/upload", s.handleAdminPluginUpload},
 		{"delete", "POST", "/api/admin/plugins/delete", s.handleAdminPluginDelete},
 		{"meta", "POST", "/api/admin/plugins/meta", s.handleAdminPluginMetaSave},
-		{"draft", "POST", "/api/admin/plugins/meta/draft", s.handleAdminPluginMetaDraft},
+		// ★ 2026-09-30 移除 "draft"（/api/admin/plugins/meta/draft）：按目录生成清单草稿
+		//   会整体覆盖 plugins.json，后台误触一次就要手工重排全部顺序，已整条删掉。
+		//   ⇒ 往这里加新端点时记住：这张表同时承担"未鉴权必须 401"的契约。
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -406,51 +408,10 @@ func TestAdminPluginMetaSaveThenScanIsNotDegraded(t *testing.T) {
 	}
 }
 
-// TestAdminPluginMetaDraft 草稿生成：必须全是非核心、非默认启用。
-func TestAdminPluginMetaDraft(t *testing.T) {
-	dir := t.TempDir()
-	writePluginFile(t, dir, "az.dll", []byte("a"))
-	writePluginFile(t, dir, "NF.dll", []byte("b"))
-	writePluginFile(t, dir, "readme.txt", []byte("c"))
-	s := newAdminPluginServer(t, dir)
-
-	rec := httptest.NewRecorder()
-	s.handleAdminPluginMetaDraft(rec, adminReq("POST", "/api/admin/plugins/meta/draft", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("生成草稿应 200，实得 %d（%s）", rec.Code, rec.Body.String())
-	}
-
-	raw, err := os.ReadFile(filepath.Join(dir, pluginMetaFileName))
-	if err != nil {
-		t.Fatalf("草稿没落盘: %v", err)
-	}
-	var doc pluginMetaDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("草稿不是合法 JSON: %v", err)
-	}
-	if len(doc.Plugins) != 2 {
-		t.Fatalf("应生成 2 条（readme.txt 不算），实得 %d", len(doc.Plugins))
-	}
-	for _, m := range doc.Plugins {
-		if m.IsCore || m.DefaultEnabled {
-			t.Fatalf("草稿绝不能把插件标成核心/默认启用: %+v", m)
-		}
-	}
-
-	// 草稿状态下必须 degraded（没有核心插件）—— 提示运维"还不能上线"
-	if !s.plugins.Snapshot().degraded {
-		t.Fatalf("草稿（无核心插件）应 degraded")
-	}
-
-	// 空目录 → 400
-	empty := t.TempDir()
-	s2 := newAdminPluginServer(t, empty)
-	rec2 := httptest.NewRecorder()
-	s2.handleAdminPluginMetaDraft(rec2, adminReq("POST", "/api/admin/plugins/meta/draft", nil))
-	if rec2.Code != http.StatusBadRequest {
-		t.Fatalf("空目录应 400，实得 %d", rec2.Code)
-	}
-}
+// ★ 2026-09-30 移除 TestAdminPluginMetaDraft：对应的 handler 与路由已整条删掉
+// （后台"按目录生成清单草稿"按钮会整体覆盖 plugins.json 且全部写成非核心/默认关闭，
+//   误触一次就要手工重排 12 条顺序，安南要求去掉）。
+// 降级清单本身的覆盖仍在 launcher_plugins_test.go —— degradedMetas 是运行期兜底，没动。
 
 // TestPluginPublicRoutesEndToEnd 走真实 router + 中间件，确认路由真的挂在了
 // 玩家端口该有的位置上，并顺带**反证**「插件不能走静态文件路径」。

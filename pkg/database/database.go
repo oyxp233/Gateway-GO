@@ -143,6 +143,29 @@ func (db *Database) EnsureInitialized() error {
 
 	CREATE INDEX IF NOT EXISTS idx_rblog_account ON register_bonus_logs(account, status);
 
+	-- 注册流水（2026-10-13）：注册限额的**唯一计数依据**。
+	--
+	-- 为什么不能拿 accounts 表凑合：那张表只有 created_at（且网关库这一列是
+	-- "导入时刻"，见 §16），既没有注册来源 IP，也没有机器码，两个判据都算不出来。
+	--
+	-- machine_id 允许为空串：老登录器不带机器码。判定侧对空值**跳过机器维度**，
+	-- 绝不能把"空"当成一个共同的机器去计数。
+	CREATE TABLE IF NOT EXISTS register_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account TEXT NOT NULL,
+		m_id TEXT NOT NULL DEFAULT '',
+		ip TEXT NOT NULL DEFAULT '',
+		machine_id TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL
+	);
+
+	-- (ip, created_at) 供「同一 IP 当日注册数」按范围统计。
+	CREATE INDEX IF NOT EXISTS idx_register_logs_ip ON register_logs(ip, created_at);
+	-- machine_id 供「同一机器码累计注册数」直接点查。
+	CREATE INDEX IF NOT EXISTS idx_register_logs_machine ON register_logs(machine_id);
+	-- account 供「删账号时预演统计 / 按 purgeLogs 清流水」点查（2026-10-13 接入）。
+	CREATE INDEX IF NOT EXISTS idx_register_logs_account ON register_logs(account);
+
 	CREATE TABLE IF NOT EXISTS anticheat_detections (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		rule_name TEXT NOT NULL,
@@ -153,12 +176,35 @@ func (db *Database) EnsureInitialized() error {
 		evidence TEXT DEFAULT '',
 		client_ip TEXT DEFAULT '',
 		account TEXT DEFAULT '',
-		reported_at INTEGER NOT NULL
+		reported_at INTEGER NOT NULL,
+		-- 客户端插件的「自家组件在场」标记：1 = 该命中发生时，配置里列出的自研组件
+		-- （NF.dll / EquipmentSwap.dll 等）已在本进程内。**只作区分，不影响是否入库** ——
+		-- 命中一律照常落库，否则外挂只要加载一个同名 DLL 就能把自己从数据里抹掉。
+		-- 列序刻意紧跟 reported_at：ALTER TABLE ADD COLUMN 只能追加在末尾，
+		-- 新库也按同样顺序建，新旧库列布局才一致（本项目查询都是显式列名，不依赖顺序）。
+		exempt INTEGER DEFAULT 0,
+		-- 客户端生成的去重 ID（PID<<32 | 自增序号，进程内单调，跨进程不冲突）。
+		-- 本期只「收下来」留作幂等依据，**不加 UNIQUE 索引**：存量行全是默认 0，
+		-- 一旦加唯一约束会整表冲突。要做真去重时改用部分索引
+		-- （CREATE UNIQUE INDEX ... WHERE dedup_id > 0）并同步改插入为 INSERT OR IGNORE。
+		dedup_id INTEGER DEFAULT 0,
+		-- 房间号 / 地图ID：客户端插件一直在发（ACReporter 的 roomNumber / mapId），
+		-- 但网关早期版本的请求结构里没有这两个字段，被 json 解码静默丢掉。
+		-- 现补上，供后台「击杀间隔过短」等规则把现场还原出来。
+		room_number INTEGER DEFAULT 0,
+		map_id INTEGER DEFAULT 0,
+		-- 角色名：插件从 [Identity] playerName 取（登录器渲染，可能为空）；
+		-- 空串表示「该客户端没提供角色」，与老版本客户端字段缺失同义。
+		player_name TEXT DEFAULT ''
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_anticheat_rule ON anticheat_detections(rule_name);
 	CREATE INDEX IF NOT EXISTS idx_anticheat_account ON anticheat_detections(account);
 	CREATE INDEX IF NOT EXISTS idx_anticheat_reported ON anticheat_detections(reported_at);
+	-- ⚠️ idx_anticheat_player 刻意不在这里建：这段 schema 是 CREATE TABLE IF NOT EXISTS，
+	-- 老库会整段跳过建表、但 CREATE INDEX 仍会执行 —— 而那时 player_name 列还没补
+	-- （补列在 migrateSchema 里），会直接报 "no such column: player_name" 把启动打挂。
+	-- 该索引统一放到 migrateSchema，紧随 ensureColumn 之后，新旧库都覆盖。
 
 	-- ========================================================================
 	-- 全服公告（2026-09-24）
@@ -320,6 +366,33 @@ func (db *Database) migrateSchema() error {
 	// announce_popups.deleted_at：软删除是后加的，老库没有这一列。
 	// 补上之后，删除公告才是"不再显示"而不是"物理消失"。
 	if err := db.ensureColumn("announce_popups", "deleted_at", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
+	// anticheat_detections.exempt / dedup_id：客户端插件上报的「自家组件在场」标记与去重 ID。
+	// 老库没有这两列，而新版客户端已经在发这两个字段 —— 缺列会让整批上报写失败
+	// （INSERT 列数与表不符），所以必须在这里补上，且 insert 语句已同步带这两列。
+	if err := db.ensureColumn("anticheat_detections", "exempt", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("anticheat_detections", "dedup_id", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
+	// anticheat_detections.room_number / map_id / player_name：明细查询要按
+	// 「副本 / 房间 / 角色」还原现场。老库没有这三列，缺列会让整批上报写失败
+	// （INSERT 列数与表不符），所以必须在这里补，且 INSERT 语句已同步带上。
+	if err := db.ensureColumn("anticheat_detections", "room_number", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("anticheat_detections", "map_id", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("anticheat_detections", "player_name", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := db.gatewayDB.Exec(
+		"CREATE INDEX IF NOT EXISTS idx_anticheat_player ON anticheat_detections(player_name)"); err != nil {
 		return err
 	}
 
@@ -486,6 +559,12 @@ func (db *Database) ExecTx(fn func(tx *sql.Tx) error) error {
 
 // ExecTxBoth 在网关库和游戏库上执行事务（跨库事务，非原子，需调用方处理补偿）。
 func (db *Database) ExecTxBoth(fn func(txGw *sql.Tx, txGame *sql.Tx) error) error {
+	// G-12（2026-10-04 审查）：下面两个 defer 闭包捕获的是**本行声明**的 err。
+	// 原先写成 `if err := fn(...); err != nil`，那个 `:=` 声明的是**新变量**（遮蔽），
+	// 于是外层 err 全程为 nil ⇒ fn 失败时两个事务都**不会回滚**；txGw.Commit() 失败时
+	// txGame 也永不回滚。当前还没有调用点，属定时炸弹 —— 一旦用上就是写锁永久占用
+	// + 连接泄漏。这里改用 `var err error` + 赋值（不是短声明），让 defer 真正看到错误。
+	var err error
 	txGw, err := db.gatewayDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
@@ -509,15 +588,15 @@ func (db *Database) ExecTxBoth(fn func(txGw *sql.Tx, txGame *sql.Tx) error) erro
 		}()
 	}
 
-	if err := fn(txGw, txGame); err != nil {
+	if err = fn(txGw, txGame); err != nil {
 		return err
 	}
 
-	if err := txGw.Commit(); err != nil {
+	if err = txGw.Commit(); err != nil {
 		return err
 	}
 	if txGame != nil {
-		if err := txGame.Commit(); err != nil {
+		if err = txGame.Commit(); err != nil {
 			return err
 		}
 	}
@@ -1461,13 +1540,27 @@ type AntiCheatDetection struct {
 	ClientIP       string
 	Account        string
 	ReportedAt     int64
+	// Exempt 命中时自家组件是否在场（客户端标记）。1 = 可能是自研插件造成的，
+	// 供后台区分「内辅噪音」与真外挂；0 也包含「老版本客户端没这个字段」。
+	Exempt int
+	// DedupID 客户端生成的去重 ID，本期仅存档（见建表处注释）。
+	DedupID int64
+	// RoomNumber / MapID 触发时所在房间号与地图ID（客户端上报）。
+	RoomNumber int
+	MapID      int
+	// PlayerName 角色名。空串 = 客户端未提供（老客户端，或登录器没渲染该字段）。
+	PlayerName string
 }
+
+// antiCheatInsertSQL 单条 / 批量插入共用，避免两处列名与占位符数量不一致。
+// 列序与建表处 + ensureColumn 的追加顺序一致（查询都是显式列名，不依赖顺序）。
+const antiCheatInsertSQL = "INSERT INTO anticheat_detections (rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at, exempt, dedup_id, room_number, map_id, player_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
 // InsertAntiCheatDetection 插入外挂检测记录。
 func (db *Database) InsertAntiCheatDetection(d *AntiCheatDetection) error {
 	_, err := db.gatewayDB.Exec(
-		"INSERT INTO anticheat_detections (rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt,
+		antiCheatInsertSQL,
+		d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt, d.Exempt, d.DedupID, d.RoomNumber, d.MapID, d.PlayerName,
 	)
 	return err
 }
@@ -1482,8 +1575,8 @@ func (db *Database) InsertAntiCheatDetections(detections []AntiCheatDetection) e
 
 	for _, d := range detections {
 		_, err := tx.Exec(
-			"INSERT INTO anticheat_detections (rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt,
+			antiCheatInsertSQL,
+			d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt, d.Exempt, d.DedupID, d.RoomNumber, d.MapID, d.PlayerName,
 		)
 		if err != nil {
 			return err
@@ -1493,17 +1586,82 @@ func (db *Database) InsertAntiCheatDetections(detections []AntiCheatDetection) e
 	return tx.Commit()
 }
 
-// GetAntiCheatDetections 获取检测记录列表（分页）。
-func (db *Database) GetAntiCheatDetections(limit, offset int) ([]AntiCheatDetection, int, error) {
+// AntiCheatFilter 检测明细的查询条件。除 ExemptFilter 外，零值一律表示「该条件不生效」。
+//
+// 所有值都走占位符绑定：WHERE 片段本身是常量，只有值进 args，**不做字符串拼接**。
+type AntiCheatFilter struct {
+	Account    string // 精确匹配账号
+	PlayerName string // 精确匹配角色名
+	RuleName   string // 精确匹配规则名
+	// ExemptFilter 豁免过滤。用指针而非 int，是为了避开「零值 0 静默变成
+	// 『只看非豁免』」这个陷阱：nil = 不限，指向 0 = 只看非豁免，指向 1 = 只看豁免。
+	ExemptFilter *int
+	// Keyword 同时对 account / player_name / evidence / description 做模糊匹配。
+	Keyword string
+	// Since / Until 按 reported_at（服务端接收时间，秒）过滤，闭区间。0 = 不限。
+	Since int64
+	Until int64
+}
+
+// where 把条件编译成 " WHERE ..." 片段与对应参数。无条件时返回空串。
+func (f AntiCheatFilter) where() (string, []interface{}) {
+	var clauses []string
+	var args []interface{}
+	if f.Account != "" {
+		clauses = append(clauses, "account = ?")
+		args = append(args, f.Account)
+	}
+	if f.PlayerName != "" {
+		clauses = append(clauses, "player_name = ?")
+		args = append(args, f.PlayerName)
+	}
+	if f.RuleName != "" {
+		clauses = append(clauses, "rule_name = ?")
+		args = append(args, f.RuleName)
+	}
+	if f.ExemptFilter != nil {
+		clauses = append(clauses, "exempt = ?")
+		args = append(args, *f.ExemptFilter)
+	}
+	if f.Keyword != "" {
+		clauses = append(clauses,
+			"(account LIKE ? OR player_name LIKE ? OR evidence LIKE ? OR description LIKE ?)")
+		kw := "%" + f.Keyword + "%"
+		args = append(args, kw, kw, kw, kw)
+	}
+	if f.Since > 0 {
+		clauses = append(clauses, "reported_at >= ?")
+		args = append(args, f.Since)
+	}
+	if f.Until > 0 {
+		clauses = append(clauses, "reported_at <= ?")
+		args = append(args, f.Until)
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+// antiCheatSelectCols 明细查询的列清单，三处 SELECT 共用，避免列数与 Scan 错位。
+const antiCheatSelectCols = "id, rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at, exempt, dedup_id, room_number, map_id, player_name"
+
+// QueryAntiCheatDetections 按条件分页查询检测明细，返回 (记录, 命中总数, 错误)。
+//
+// 排序用 reported_at DESC, id DESC：reported_at 只到秒，同一批上报会撞车，
+// 补 id 才能保证分页稳定（否则翻页可能重复或漏行）。
+func (db *Database) QueryAntiCheatDetections(f AntiCheatFilter, limit, offset int) ([]AntiCheatDetection, int, error) {
+	whereSQL, args := f.where()
+
 	var total int
-	if err := db.gatewayDB.QueryRow("SELECT COUNT(*) FROM anticheat_detections").Scan(&total); err != nil {
+	if err := db.gatewayDB.QueryRow(
+		"SELECT COUNT(*) FROM anticheat_detections"+whereSQL, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	rows, err := db.gatewayDB.Query(
-		"SELECT id, rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at FROM anticheat_detections ORDER BY reported_at DESC LIMIT ? OFFSET ?",
-		limit, offset,
-	)
+	sqlText := "SELECT " + antiCheatSelectCols + " FROM anticheat_detections" + whereSQL +
+		" ORDER BY reported_at DESC, id DESC LIMIT ? OFFSET ?"
+	rows, err := db.gatewayDB.Query(sqlText, append(append([]interface{}{}, args...), limit, offset)...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1512,7 +1670,9 @@ func (db *Database) GetAntiCheatDetections(limit, offset int) ([]AntiCheatDetect
 	detections := make([]AntiCheatDetection, 0)
 	for rows.Next() {
 		var d AntiCheatDetection
-		if err := rows.Scan(&d.ID, &d.RuleName, &d.Description, &d.ActualValue, &d.ThresholdValue, &d.EventTimestamp, &d.Evidence, &d.ClientIP, &d.Account, &d.ReportedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.RuleName, &d.Description, &d.ActualValue, &d.ThresholdValue,
+			&d.EventTimestamp, &d.Evidence, &d.ClientIP, &d.Account, &d.ReportedAt, &d.Exempt,
+			&d.DedupID, &d.RoomNumber, &d.MapID, &d.PlayerName); err != nil {
 			return nil, 0, err
 		}
 		detections = append(detections, d)
@@ -1521,32 +1681,14 @@ func (db *Database) GetAntiCheatDetections(limit, offset int) ([]AntiCheatDetect
 	return detections, total, nil
 }
 
+// GetAntiCheatDetections 获取检测记录列表（分页，无筛选条件）。
+func (db *Database) GetAntiCheatDetections(limit, offset int) ([]AntiCheatDetection, int, error) {
+	return db.QueryAntiCheatDetections(AntiCheatFilter{}, limit, offset)
+}
+
 // GetAntiCheatDetectionsByAccount 获取指定账号的检测记录。
 func (db *Database) GetAntiCheatDetectionsByAccount(account string, limit, offset int) ([]AntiCheatDetection, int, error) {
-	var total int
-	if err := db.gatewayDB.QueryRow("SELECT COUNT(*) FROM anticheat_detections WHERE account = ?", account).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := db.gatewayDB.Query(
-		"SELECT id, rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at FROM anticheat_detections WHERE account = ? ORDER BY reported_at DESC LIMIT ? OFFSET ?",
-		account, limit, offset,
-	)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	detections := make([]AntiCheatDetection, 0)
-	for rows.Next() {
-		var d AntiCheatDetection
-		if err := rows.Scan(&d.ID, &d.RuleName, &d.Description, &d.ActualValue, &d.ThresholdValue, &d.EventTimestamp, &d.Evidence, &d.ClientIP, &d.Account, &d.ReportedAt); err != nil {
-			return nil, 0, err
-		}
-		detections = append(detections, d)
-	}
-
-	return detections, total, nil
+	return db.QueryAntiCheatDetections(AntiCheatFilter{Account: account}, limit, offset)
 }
 
 // GetAntiCheatPlayerSummary 获取玩家检测汇总。
@@ -1561,7 +1703,8 @@ func (db *Database) GetAntiCheatPlayerSummary(limit, offset int) ([]map[string]i
 			account,
 			COUNT(*) as detection_count,
 			MAX(reported_at) as last_detection_at,
-			GROUP_CONCAT(DISTINCT rule_name) as rule_names
+			GROUP_CONCAT(DISTINCT rule_name) as rule_names,
+			COALESCE(GROUP_CONCAT(DISTINCT NULLIF(player_name, '')), '') as player_names
 		FROM anticheat_detections 
 		WHERE account != '' 
 		GROUP BY account 
@@ -1575,16 +1718,25 @@ func (db *Database) GetAntiCheatPlayerSummary(limit, offset int) ([]map[string]i
 
 	summaries := make([]map[string]interface{}, 0)
 	for rows.Next() {
-		var account, ruleNames string
+		var account, ruleNames, playerNames string
 		var count, lastAt int64
-		if err := rows.Scan(&account, &count, &lastAt, &ruleNames); err != nil {
+		if err := rows.Scan(&account, &count, &lastAt, &ruleNames, &playerNames); err != nil {
 			return nil, 0, err
+		}
+		// player_names 用 NULLIF 滤掉空角色名：一个账号里老客户端行（player_name=''）
+		// 不该在汇总里显示成"有个没名字的角色"。
+		// 注意 GROUP_CONCAT(DISTINCT ...) 在 SQLite 里分隔符固定为逗号，无法自定义 ——
+		// 角色名本身含逗号才会拆错，这个约束在可接受范围内。
+		players := []string{}
+		if playerNames != "" {
+			players = strings.Split(playerNames, ",")
 		}
 		summaries = append(summaries, map[string]interface{}{
 			"account":         account,
 			"detectionCount":  count,
 			"lastDetectionAt": lastAt,
 			"ruleNames":       strings.Split(ruleNames, ","),
+			"playerNames":     players,
 		})
 	}
 

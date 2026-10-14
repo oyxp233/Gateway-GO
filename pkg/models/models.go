@@ -103,6 +103,9 @@ type ErrorCode struct {
 	QQNumberTaken            int
 	QQNumberConflict         int
 	QQNotBound               int
+	// ── 注册限额（1036~1037，2026-10-13）─────────────────────────────
+	RegisterIpLimit      int
+	RegisterMachineLimit int
 }
 
 var Err = ErrorCode{
@@ -142,7 +145,11 @@ var Err = ErrorCode{
 	QQNumberTaken:            1033,
 	QQNumberConflict:         1034,
 	QQNotBound:               1035,
-	RateLimited:              3002,
+	// 注册限额。两个码分开而不是共用一个：登录器/后台排障时要能一眼看出
+	// 是被"同一 IP 当日刷太多"还是"同一台机器号太多"挡下的。
+	RegisterIpLimit:      1036,
+	RegisterMachineLimit: 1037,
+	RateLimited:          3002,
 	UnknownCommand:           3003,
 	DecodeFailed:             3005,
 	BodyTooLarge:             3009,
@@ -160,6 +167,16 @@ type GatewayRequest struct {
 	AuthKey         *string `json:"auth_key,omitempty"`
 	DeviceSecret    *string `json:"device_secret,omitempty"`
 	LauncherVersion *string `json:"launcher_version,omitempty"`
+	// MachineId 是登录器上报的机器码（2026-10-13）。
+	//
+	// 用途**仅限**注册限额计数（同一台机器累计注册几个号），不参与登录鉴权。
+	// 取值由登录器推导（首个物理网卡 MAC），因此**可伪造** —— 这是刻意接受的：
+	// 网关在公网上物理看不到玩家 MAC（那是二层地址），要按机器限就只能相信客户端。
+	// 定位是"提高批量注册的成本"，不是不可绕过的封禁。
+	//
+	// 老登录器不带此字段 ⇒ 为空串 ⇒ 注册限额**跳过机器维度**、只按 IP 判。
+	// 绝不能把空值当成同一个机器计数（那会全服注册不了）。
+	MachineId *string `json:"machine_id,omitempty"`
 	// ForceLogin 强制登录：账号已在线时踢掉旧会话并登录。
 	// 未携带（false）时若账号已在线，登录返回 AccountOnline(1023)。
 	ForceLogin  *bool             `json:"force_login,omitempty"`
@@ -245,6 +262,76 @@ type PvfInfo struct {
 	Size        int64
 	ModifiedUtc string
 }
+
+// PvfDeltaInfo 描述一份「上一版 → 当前版」的 PVF 增量包。
+//
+// ★ ToHash 必须恒等于当前 PvfInfo.Hash —— 网关只在两者一致时才把它写进 policy，
+// 否则登录器会拿一份合成完对不上的包去替换本地 PVF（虽然最终有整文件 SHA-256 兜底，
+// 但那是浪费玩家一次 200 KB~11 MB 的下载 + 一次失败重试）。
+type PvfDeltaInfo struct {
+	FromHash   string // 客户端必须持有的旧版 SHA-256（大写）
+	ToHash     string // 目标版本 SHA-256（大写）
+	ToSize     int64  // 目标版本字节数
+	Size       int64  // delta 包字节数
+	Path       string // delta 文件路径
+	CreatedUtc string
+}
+
+// PvfHistoryEntry 是一条 PVF 历史版本记录（pvf_history/index.json 的一行）。
+//
+// 历史文件本体按内容寻址存为 <Hash>.pvf，同 hash 重复上传只留一条记录 ——
+// Name/Filename 只在**首次**入史时写入，之后不覆盖（用户给旧版起的备注不该被
+// 后续同名上传顶掉）。
+type PvfHistoryEntry struct {
+	Hash      string `json:"hash"`                 // 大写 SHA-256（= 文件名）
+	Size      int64  `json:"size"`                 // 字节数
+	Name      string `json:"name,omitempty"`       // 显示名（上传时填的备注，如「神器进深渊池」）
+	Filename  string `json:"filename,omitempty"`   // 上传时的原文件名
+	StoredUtc string `json:"stored_utc"`           // 首次入史时间（RFC3339）
+}
+
+// ============================================================================
+// 登录器自更新（2026-10-01）
+// ============================================================================
+
+// LauncherDeltaInfo 与 PvfDeltaInfo 字段完全同构（A21D 是通用文件差分），
+// 独立命名避免「登录器在下 PVF」的语义混淆。
+type LauncherDeltaInfo = PvfDeltaInfo
+
+// LauncherBuildEntry 是一条登录器构建记录（launcher_update/history/index.json 的一行）。
+//
+// 与 PVF 历史的区别：多一个 Version（登录器版本号，上传时必填、格式 x.y.z）——
+// 强更判据（本地 version < 网关 MinVersion）与管理页展示都要用它。
+type LauncherBuildEntry struct {
+	Hash      string `json:"hash"`               // 大写 SHA-256（= 文件名）
+	Version   string `json:"version"`            // 登录器版本号（x.y.z，上传时必填）
+	Size      int64  `json:"size"`               // 字节数
+	Name      string `json:"name,omitempty"`     // 显示名（上传备注）
+	Filename  string `json:"filename,omitempty"` // 上传时的原文件名
+	StoredUtc string `json:"stored_utc"`         // 首次入史时间（毫秒精度 RFC3339）
+}
+
+// LauncherUpdateManifest 是 GET /api/launcher/update 的响应体（snake_case，
+// 与插件清单/policy 的既有口径一致，登录器 System.Text.Json 直接反序列化）。
+//
+// 判据约定（登录器侧）：
+//   - enabled=false        → 服务端关闭自更新，客户端跳过检查（一键回滚开关）；
+//   - version/hash 为空    → 服务端从未上传过任何版本，客户端跳过检查；
+//   - 本地 exe hash == hash → 已是最新（唯一硬判据，版本号仅用于展示与强更阈值）；
+//   - 其余                  → 有新版：本地 version < min_version 时强制更新，
+//                            否则弹窗可跳过。
+type LauncherUpdateManifest struct {
+	OK         bool   `json:"ok"`
+	Enabled    bool   `json:"enabled"`
+	Version    string `json:"version,omitempty"`
+	Hash       string `json:"hash,omitempty"`
+	Size       int64  `json:"size,omitempty"`
+	StoredUtc  string `json:"stored_utc,omitempty"`
+	MinVersion string `json:"min_version"` // 网关内存态 Launcher.MinVersion（强更阈值）
+	FullURL    string `json:"full_url"`    // 全量 exe 下载（相对路径）
+	DeltaURL   string `json:"delta_url"`   // 按需 delta 基址（登录器拼 ?from=<本地hash>）
+}
+
 
 // BroadcastRequest 表示全服发放请求。
 type BroadcastRequest struct {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"s4a21-gateway/pkg/database"
 	"s4a21-gateway/pkg/logger"
 	"s4a21-gateway/pkg/models"
+	"s4a21-gateway/pkg/pvfdiff"
 	"s4a21-gateway/pkg/security"
 	"s4a21-gateway/pkg/session"
 	"s4a21-gateway/pkg/utils"
@@ -26,6 +28,15 @@ type AccountService struct {
 	db     *database.Database
 	config *config.GatewayConfig
 	logger *logger.ConsoleLogger
+
+	// registerMu 串行化「限额判定 → 建号 → 落流水」这一段临界区（2026-10-13）。
+	//
+	// 为什么必须加锁：判据是"先 COUNT 再 INSERT"。两条 SQL 之间若插进另一个注册
+	// 请求，两边都会数到"还没超"然后双双入库 —— 限额写的是 2，实际能注册 3、4 个。
+	// 注册是低频动作（全服一天几十次），一把互斥锁的代价可以忽略。
+	//
+	// 注意：本结构体因此**不可按值拷贝**，全仓均以 *AccountService 传递。
+	registerMu sync.Mutex
 }
 
 // NewAccountService 创建账号服务。
@@ -123,6 +134,112 @@ func (s *AccountService) Register(name, passwordMd5 string) int {
 	}
 
 	return models.Err.Ok
+}
+
+// RegisterWithLimit 带注册限额的注册：限额判定与建号在同一临界区内完成。
+//
+// 返回 (models.Err.Ok, "") 表示注册成功；否则返回错误码与文案。
+// message 为空时调用方用 errorMessages[code] 兜底。
+//
+// 调用方（auth.handler）必须在**客户端 IP 可用的地方**调用它 —— 原 Register
+// 不带来源信息，算不出限额。clientIP 由 TCP 远端地址得到（不是客户端自填）。
+func (s *AccountService) RegisterWithLimit(name, passwordMd5, ip, machineID string) (int, string) {
+	name = utils.TrimSpace(name)
+	ip = utils.TrimSpace(ip)
+	machineID = utils.TrimSpace(machineID)
+
+	s.registerMu.Lock()
+	defer s.registerMu.Unlock()
+
+	if code, msg := s.CheckRegisterLimit(ip, machineID); code != models.Err.Ok {
+		// 单独再打一条**带账号名**的拒绝日志。
+		//
+		// CheckRegisterLimit 内部那条明细只有 IP/机器码 —— 玩家来问"我注册不了"
+		// 时，运营手里只有账号名，没有账号名的日志等于查不到。这与登录路径的
+		// 「拒绝重复登录: 账号=…」保持同一风格，排障时一眼能对上。
+		s.logger.Warn(fmt.Sprintf("拒绝注册: 账号=%s IP=%s machine=%s 原因码=%d",
+			name, ip, maskMachineID(machineID), code))
+		return code, msg
+	}
+
+	code := s.Register(name, passwordMd5)
+	if code != models.Err.Ok {
+		return code, ""
+	}
+
+	// 落流水。★ 写失败**不改判注册结果**：账号已经建好了，把玩家挡回去只会让他
+	// 重试、然后撞上 1003「账号已存在」，反而更像"注册功能坏了"。
+	// 代价是这一条注册不占后续配额（限额被小幅放松），可接受。
+	mID := ""
+	if acc, err := s.db.GetAccountByName(name); err == nil && acc != nil {
+		mID = acc.MId
+	}
+	if err := s.db.InsertRegistrationLog(name, mID, ip, machineID, utils.NowUnix()); err != nil {
+		s.logger.Error(fmt.Sprintf("写注册流水失败（不影响注册成功）: account=%s ip=%s err=%v", name, ip, err))
+	}
+
+	return models.Err.Ok, ""
+}
+
+// CheckRegisterLimit 判定本次注册是否触顶（2026-10-13）。
+//
+// 返回 (models.Err.Ok, "") 表示放行；否则返回错误码与给玩家看的文案。
+// 两条判据的取值都走**运行时快照**（config.RegisterLimitSnapshot）——
+// 管理员在后台改完立即生效，不用重启网关。
+//
+// 语义（与 config.RegisterLimitSection 的注释保持一致）：
+//   - 总开关关 ⇒ 一律放行（一键回滚）。
+//   - ip 为空 / machineID 为空 ⇒ **跳过该维度**，不是当成同一个空值去计数。
+//     机器码缺失是常态（老登录器不带该字段），若把空串当共同机器，全服瞬间注册不了。
+//   - 阈值 <= 0 ⇒ 该维度不限制。
+//   - 查库失败 ⇒ **放行**并记 WARN。限额是防刷的软约束，注册是玩家的硬需求；
+//     库抖一下就把全服注册堵死，代价远大于"这一波没限住"。
+func (s *AccountService) CheckRegisterLimit(ip, machineID string) (int, string) {
+	if s == nil || s.config == nil || s.db == nil {
+		return models.Err.Ok, ""
+	}
+	limit := s.config.RegisterLimitSnapshot()
+	if !limit.Enabled {
+		return models.Err.Ok, ""
+	}
+
+	// ① 同一来源 IP 的当日注册数。
+	if limit.PerIPPerDay > 0 && ip != "" {
+		n, err := s.db.CountRegistrationsByIPSince(ip, startOfToday())
+		if err != nil {
+			s.logger.Warn(fmt.Sprintf("统计同 IP 当日注册数失败（跳过 IP 限额）: ip=%s err=%v", ip, err))
+		} else if n >= limit.PerIPPerDay {
+			s.logger.Warn(fmt.Sprintf("注册被 IP 限额拦下: ip=%s 今日已注册=%d 上限=%d", ip, n, limit.PerIPPerDay))
+			return models.Err.RegisterIpLimit,
+				fmt.Sprintf("同一网络今日注册账号已达上限（%d 个），请明天再试或联系管理员", limit.PerIPPerDay)
+		}
+	}
+
+	// ② 同一机器码的累计注册数（不限时间窗）。
+	if limit.PerMachine > 0 && machineID != "" {
+		n, err := s.db.CountRegistrationsByMachine(machineID)
+		if err != nil {
+			s.logger.Warn(fmt.Sprintf("统计同机器码注册数失败（跳过机器限额）: machine=%s err=%v", maskMachineID(machineID), err))
+		} else if n >= limit.PerMachine {
+			s.logger.Warn(fmt.Sprintf("注册被机器限额拦下: machine=%s 已注册=%d 上限=%d",
+				maskMachineID(machineID), n, limit.PerMachine))
+			return models.Err.RegisterMachineLimit,
+				fmt.Sprintf("该设备注册账号数已达上限（%d 个），请联系管理员", limit.PerMachine)
+		}
+	}
+
+	return models.Err.Ok, ""
+}
+
+// maskMachineID 给机器码脱敏后再进日志。
+//
+// 机器码由 MAC 推导，属于设备标识：日志会被打包、会被截图、会被贴进群里排障，
+// 完整值落盘只是无谓的扩散。保留前 4 后 4 足够在排障时对齐"是不是同一台"。
+func maskMachineID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:4] + "***" + id[len(id)-4:]
 }
 
 // Login 登录账号。
@@ -311,8 +428,10 @@ func (s *AccountService) ListAccounts(keyword string, page, pageSize int) (int, 
 
 	// QQ 号绑定一次批量取回（一页可能 500 个账号，逐行查就是 500 次 SQL）。
 	names := make([]string, 0, len(accounts))
+	mIds := make([]string, 0, len(accounts))
 	for _, a := range accounts {
 		names = append(names, a.Name)
+		mIds = append(mIds, a.MId)
 	}
 	qqBindings, err := s.db.QQNumbersByAccounts(names)
 	if err != nil {
@@ -324,10 +443,14 @@ func (s *AccountService) ListAccounts(keyword string, page, pageSize int) (int, 
 		qqBindings = map[string]string{}
 	}
 
+	// G-11（2026-10-04 审查）：三币种也改成一次批量取回（原先逐行调
+	// GetCurrencyTripleByMId = 一页最多 500 次跨库查询）。
+	ceraByMId := s.db.GetCurrencyTriplesByMIds(mIds)
+
 	for _, a := range accounts {
 		cera := a.Cera
-		if c, _, _, ok := s.db.GetCurrencyTripleByMId(a.MId); ok {
-			cera = c
+		if t, ok := ceraByMId[a.MId]; ok {
+			cera = t.Cera
 		}
 		result = append(result, map[string]interface{}{
 			"name": a.Name, "m_id": a.MId, "cera": cera,
@@ -840,12 +963,33 @@ func (s *BanService) QueryBans(keyword string, page, pageSize int) (int, []map[s
 }
 
 // PvfService PVF 指纹服务。
+// deltaFileName 是增量包在 DeltaDir 里的固定文件名。
+//
+// 只保留一份：客户端只可能从「上一版」升到「当前版」，更老的版本没有对应 delta。
+const deltaFileName = "current.delta"
+
 type PvfService struct {
 	config *config.GatewayConfig
 	logger *logger.ConsoleLogger
 	mu     sync.RWMutex
 	info   *models.PvfInfo
 	mode   string
+	// delta 是当前可下发的「上一版 → 当前版」增量包，可能为 nil。
+	// 仅在 pvf_delta/current.delta 存在**且它的 to_hash == 当前 PVF hash** 时才有值
+	// —— 见 loadDeltaLocked 的说明。
+	delta *models.PvfDeltaInfo
+	// histMu 只保护 pvf_history/index.json 的读-改-写（与 s.mu 互不嵌套，
+	// 锁顺序恒为 histMu → s.mu，反向不存在）。
+	histMu sync.Mutex
+	// replaceMu 串行化 ReplacePvf 的整条链路（备份→写盘→刷新→重建 delta→入历史）。
+	//
+	// G-6（2026-10-04 审查）：原先全程无互斥，并发上传时第二次 BackupFile 会把
+	// 第一次刚写好的新版备份成 .bak ⇒ rebuildDelta 产出 from == to 的**自差分**
+	// ——这正是 09-30「全体旧版客户端进不去」的成因形态。
+	// 跨进程那一层（upload-pvf 在 gateway 与 admin 都注册）另见 acquirePvfReplaceLock。
+	replaceMu sync.Mutex
+	// deltaGroup 合并「同一个 from 的并发按需增量生成」（G-4 / G-10）。
+	deltaGroup keyedGroup
 }
 
 // NewPvfService 创建 PVF 服务。
@@ -880,6 +1024,510 @@ func (s *PvfService) GetSourceMode() string {
 	return s.mode
 }
 
+// PvfPath 返回网关管理的 PVF 文件路径（即 config.Pvf.FilePath）。
+//
+// 用它做「另一条上传入口是否指向同一个文件」的守卫：服务端 PVF 与网关管理的
+// PVF 必须是同一个文件，否则走那条入口会绕过增量更新链路与指纹登记。
+func (s *PvfService) PvfPath() string {
+	return s.config.Pvf.FilePath
+}
+
+// DeltaDir 返回 PVF 增量包目录（相对路径按网关运行目录解析）。
+func (s *PvfService) DeltaDir() string {
+	dir := strings.TrimSpace(s.config.Pvf.DeltaDir)
+	if dir == "" {
+		dir = "./pvf_delta"
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
+// GetDelta 返回当前可下发的增量包；没有可用增量时返回 nil（调用方据此省略 policy 字段）。
+//
+// ★ 这里再校一次 ToHash == 当前 PVF hash。loadDeltaLocked 已经校过一次，
+// 但「替换 PVF 失败/刷新缓存」与「读 delta」之间存在窗口，多一道不会有害，
+// 而漏掉的代价是**把玩家本地 PVF 合成成一份错的内容**。
+func (s *PvfService) GetDelta() *models.PvfDeltaInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.delta == nil || s.info == nil || s.info.Hash == "" {
+		return nil
+	}
+	if !strings.EqualFold(s.delta.ToHash, s.info.Hash) {
+		return nil
+	}
+	return s.delta
+}
+
+// loadDeltaLocked 从磁盘装载增量包 —— 网关重启后不必重新生成。
+// 调用方必须已持有写锁。
+func (s *PvfService) loadDeltaLocked() {
+	s.delta = nil
+	if s.info == nil || s.info.Hash == "" {
+		return
+	}
+
+	path := filepath.Join(s.DeltaDir(), deltaFileName)
+	if !utils.FileExists(path) {
+		return
+	}
+
+	h, err := pvfdiff.Inspect(path)
+	if err != nil {
+		s.logger.Warn("PVF 增量包头部不可读，本次不下发增量: " + err.Error())
+		return
+	}
+	// 磁盘上这份增量包对应的**不是**当前 PVF ⇒ 绝不能外发。
+	// 典型场景：运维手动换了 Script.pvf（没走 upload-pvf），delta 就过时了。
+	if !strings.EqualFold(h.ToHash, s.info.Hash) {
+		s.logger.Warn(fmt.Sprintf(
+			"PVF 增量包已过期（to=%s，当前=%s），本次不下发增量",
+			shortHash(h.ToHash), shortHash(s.info.Hash)))
+		return
+	}
+
+	stats, _ := utils.GetFileStats(path)
+	created := ""
+	if stats != nil {
+		created = stats.ModifiedUtc
+	}
+	s.delta = &models.PvfDeltaInfo{
+		FromHash:   h.FromHash,
+		ToHash:     h.ToHash,
+		ToSize:     h.ToSize,
+		Size:       h.TotalSize,
+		Path:       path,
+		CreatedUtc: created,
+	}
+}
+
+// rebuildDelta 用 path+".bak"（上一版）与 path（当前版）生成增量包。
+//
+// 刻意**不返回错误**：调用它的路径上 PVF 已经替换成功了，没有任何理由因为
+// "出不了 delta" 就回退整个替换。但失败时必须把 delta 置空 ——
+// 宁可这次不下发增量（玩家走手动更新），也不能下发一份对不上的包。
+func (s *PvfService) rebuildDelta(path string) {
+	dir := s.DeltaDir()
+	final := filepath.Join(dir, deltaFileName)
+
+	clearDelta := func() {
+		s.mu.Lock()
+		s.delta = nil
+		s.mu.Unlock()
+	}
+
+	bak := path + ".bak"
+	if !utils.FileExists(bak) {
+		clearDelta()
+		s.logger.Warn("PVF 已替换但缺少 .bak 备份，无法生成增量包")
+		return
+	}
+	if err := utils.MkdirAll(dir); err != nil {
+		clearDelta()
+		s.logger.Warn("创建 PVF 增量目录失败（本次不提供增量更新）: " + err.Error())
+		return
+	}
+
+	t0 := time.Now()
+	tmp := final + ".tmp"
+	st, err := pvfdiff.Build(bak, path, tmp, pvfdiff.DefaultBlockSize)
+	if err != nil {
+		os.Remove(tmp)
+		clearDelta()
+		s.logger.Warn("生成 PVF 增量包失败（本次不提供增量更新）: " + err.Error())
+		return
+	}
+
+	// G-6（2026-10-04 审查）：拒绝「自差分」（from == to）。
+	//
+	// 出现它只有两种可能，都意味着 .bak 不是真正的"上一版"：
+	//   ① 并发替换 —— 第二次 BackupFile 把第一次刚写好的新版覆盖成了 .bak
+	//      （2026-09-30「全体旧版客户端进不去」就是这种形态）；
+	//   ② 本次上传的内容与当前版**完全相同**（幂等重传）。
+	// 这两种情况生成出来的 delta 是个"把玩家本地文件改回它自己"的空补丁，
+	// 下发它等于给玩家一个**看似成功、实则内容错误**的更新路径。
+	// 宁可本次不给增量（玩家走全量），也不能落地一份自差分。
+	if strings.EqualFold(st.FromHash, st.ToHash) {
+		os.Remove(tmp)
+		clearDelta()
+		s.logger.Warn(fmt.Sprintf(
+			"PVF 自差分已拒绝：.bak 与当前文件内容相同（%s）—— 本次不下发增量。"+
+				"若刚发生过并发上传，请确认 .bak 是否是期望的上一版",
+			shortHash(st.ToHash)))
+		return
+	}
+
+	if err := os.Rename(tmp, final); err != nil {
+		os.Remove(tmp)
+		clearDelta()
+		s.logger.Warn("落地 PVF 增量包失败（本次不提供增量更新）: " + err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	s.loadDeltaLocked()
+	s.mu.Unlock()
+
+	if s.GetDelta() == nil {
+		// 落地了但装载不上（头部坏 / to_hash 对不上）—— 已经在 loadDeltaLocked 里记过日志
+		return
+	}
+	s.logger.Info(fmt.Sprintf(
+		"PVF 增量包已生成: %s → %s, %d 字节 (%.2f%%), 指令 %d 条, 耗时 %.2fs",
+		shortHash(st.FromHash), shortHash(st.ToHash),
+		st.DeltaSize, st.DeltaRatio()*100, st.InstrCount, time.Since(t0).Seconds()))
+}
+
+// ============================================================================
+// PVF 历史版本（2026-09-30 方案①「按需增量 + 回退」）
+//
+// 存储：pvf_history/<大写SHA-256>.pvf（内容寻址，同版本只存一份）
+//	 + pvf_history/index.json（显示名 / 原文件名 / 首次入史时间）
+//
+// 写入方：PvfService.ReplacePvf / RollbackPvf / GetHistory 的惰性 seed
+//（都在管理动作路径上，单人低频；gateway 与 admin 两进程理论上都能触达
+// 这些路由，但 index.json 的读-改-写都收在 histMu + 原子 rename 内，
+// 实际并发窗口仅剩「两个后台页面同时点按钮」，接受）。
+// 读取方：管理后台版本历史表、/api/launcher/pvf/delta?from=<hash> 按需生成。
+// ============================================================================
+
+// HistoryDir 返回 PVF 历史版本目录（相对路径按网关运行目录解析）。
+func (s *PvfService) HistoryDir() string {
+	dir := strings.TrimSpace(s.config.Pvf.HistoryDir)
+	if dir == "" {
+		dir = "./pvf_history"
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
+// historyKeep 返回历史保留版数上限。
+func (s *PvfService) historyKeep() int {
+	if s.config.Pvf.HistoryKeep > 0 {
+		return s.config.Pvf.HistoryKeep
+	}
+	return 20
+}
+
+const pvfHistoryIndexName = "index.json"
+
+// loadHistoryIndex 读历史索引（文件不存在 → nil）。调用方须持有 histMu。
+func (s *PvfService) loadHistoryIndex() []models.PvfHistoryEntry {
+	raw, err := os.ReadFile(filepath.Join(s.HistoryDir(), pvfHistoryIndexName))
+	if err != nil {
+		return nil
+	}
+	var entries []models.PvfHistoryEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		s.logger.Warn("PVF 历史索引不可读（按空处理）: " + err.Error())
+		return nil
+	}
+	return entries
+}
+
+// saveHistoryIndex 原子写历史索引。调用方须持有 histMu。
+func (s *PvfService) saveHistoryIndex(entries []models.PvfHistoryEntry) error {
+	raw, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := s.HistoryDir()
+	if err := utils.MkdirAll(dir); err != nil {
+		return err
+	}
+	final := filepath.Join(dir, pvfHistoryIndexName)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
+}
+
+// archiveHistory 把一份 PVF 文件存进历史。
+// 内容寻址：目标文件 <HASH>.pvf 已存在则跳过拷贝；
+// 索引已有同 hash 记录则直接返回（**不覆盖**用户之前起的显示名）。
+// 返回是否新增了记录。
+func (s *PvfService) archiveHistory(path, name, filename string) (bool, error) {
+	hash, err := security.ComputeFileFingerprintPath(path)
+	if err != nil {
+		return false, err
+	}
+	stats, _ := utils.GetFileStats(path)
+
+	dir := s.HistoryDir()
+	if err := utils.MkdirAll(dir); err != nil {
+		return false, err
+	}
+	dst := filepath.Join(dir, hash+".pvf")
+	if !utils.FileExists(dst) {
+		tmp := dst + ".tmp"
+		if err := utils.CopyFile(path, tmp); err != nil {
+			os.Remove(tmp)
+			return false, err
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			os.Remove(tmp)
+			return false, err
+		}
+	}
+
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	entries := s.loadHistoryIndex()
+	for _, e := range entries {
+		if strings.EqualFold(e.Hash, hash) {
+			return false, nil // 已在历史：文件与记录都不动
+		}
+	}
+	entry := models.PvfHistoryEntry{
+		Hash: hash,
+		Name: strings.TrimSpace(name),
+		Filename: strings.TrimSpace(filename),
+		// 毫秒精度：秒级会在「同一次上传连续入档两版」时撞值，
+		// GetHistory 的新→旧排序就把旧版排到最前（UI 顶部显示错版本）。
+		StoredUtc: time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00"),
+	}
+	if stats != nil {
+		entry.Size = stats.Size
+	}
+	entries = append(entries, entry)
+	entries = s.pruneHistoryLocked(entries)
+	if err := s.saveHistoryIndex(entries); err != nil {
+		return false, err
+	}
+	s.logger.Info(fmt.Sprintf("PVF 版本已入历史: %s（%s）%d 字节",
+		utils.ShortHash(hash), entry.Name, entry.Size))
+	return true, nil
+}
+
+// pruneHistoryLocked 超限删最老。绝不删两类版本：
+//   - 当前版（GetPvfInfo().Hash —— 回退目标 / 按需增量终点）
+//   - 固定 delta 基线（delta.FromHash —— 玩家手上最常见的那版）
+//
+// 调用方须持有 histMu。
+func (s *PvfService) pruneHistoryLocked(entries []models.PvfHistoryEntry) []models.PvfHistoryEntry {
+	keep := s.historyKeep()
+	if len(entries) <= keep {
+		return entries
+	}
+	protected := map[string]bool{}
+	if info := s.GetPvfInfo(); info != nil && info.Hash != "" {
+		protected[strings.ToUpper(info.Hash)] = true
+	}
+	s.mu.RLock()
+	if s.delta != nil && s.delta.FromHash != "" {
+		protected[strings.ToUpper(s.delta.FromHash)] = true
+	}
+	s.mu.RUnlock()
+
+	// StoredUtc 升序 = 最老在前；稳定排序保证同时间的按入史先后删。
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].StoredUtc < entries[j].StoredUtc })
+	var kept []models.PvfHistoryEntry
+	for _, e := range entries {
+		if len(kept) < keep || protected[strings.ToUpper(e.Hash)] {
+			kept = append(kept, e)
+			continue
+		}
+		// 删文件 + 跳过记录。文件删失败也照常跳过（残留文件无索引引用，无害）。
+		os.Remove(filepath.Join(s.HistoryDir(), e.Hash+".pvf"))
+		s.logger.Info(fmt.Sprintf("PVF 历史超限清理: %s（%s）", utils.ShortHash(e.Hash), e.Name))
+	}
+	// 恢复新→旧的展示顺序由 GetHistory 排序，这里不额外处理。
+	return kept
+}
+
+// GetHistory 返回历史列表（新→旧）。带惰性 seed：当前版与 .bak 版
+// 不在历史时先入史 —— 覆盖「目录被清空 / 从未走过上传流程」的部署，
+// 保证「回退到上一版」在任何状态下都可用。
+func (s *PvfService) GetHistory() []models.PvfHistoryEntry {
+	s.seedHistory(s.config.Pvf.FilePath)
+	s.seedHistory(s.config.Pvf.FilePath + ".bak")
+
+	s.histMu.Lock()
+	entries := s.loadHistoryIndex()
+	s.histMu.Unlock()
+
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].StoredUtc > entries[j].StoredUtc })
+	return entries
+}
+
+// seedHistory 把一份 PVF 存进历史（已存在则无操作）。
+func (s *PvfService) seedHistory(path string) {
+	if !utils.FileExists(path) {
+		return
+	}
+	hash, err := security.ComputeFileFingerprintPath(path)
+	if err != nil {
+		return
+	}
+	if utils.FileExists(filepath.Join(s.HistoryDir(), hash+".pvf")) {
+		return
+	}
+	if _, err := s.archiveHistory(path, "", ""); err != nil {
+		s.logger.Warn("PVF 历史自动存档失败（" + path + "）: " + err.Error())
+	}
+}
+
+// RollbackPvf 回退到某个历史版本。走完整 ReplacePvf 链路：
+// 备份当前版（成为新固定 delta 的 from）→ 替换 → RefreshCache → 重建增量 →
+// 通知网关，因此回退后**在当前版的玩家**下次登录会增量降到回退版。
+func (s *PvfService) RollbackPvf(hash string) (*models.PvfInfo, error) {
+	normalized := NormalizeHashArg(hash)
+	if normalized == "" {
+		return nil, fmt.Errorf("hash 必须是 64 位十六进制 SHA-256")
+	}
+	src := filepath.Join(s.HistoryDir(), normalized+".pvf")
+	if !utils.FileExists(src) {
+		return nil, fmt.Errorf("历史版本不存在：%s", utils.ShortHash(normalized))
+	}
+	if info := s.GetPvfInfo(); info != nil && strings.EqualFold(info.Hash, normalized) {
+		return nil, fmt.Errorf("该版本就是当前版本")
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// name 留空：该 hash 已在历史（内容寻址），不会新建记录，也不覆盖显示名。
+	return s.ReplacePvf(f, "", "")
+}
+
+// NormalizeHashArg 归一化外部传入的 hash 参数：大写 + 严格 64 位十六进制。
+// 非法输入返回空串 —— 这也是路径拼接的安全闸（杜绝 ?from=../../ 之类穿越）。
+func NormalizeHashArg(h string) string {
+	h = strings.ToUpper(strings.TrimSpace(h))
+	if len(h) != 64 {
+		return ""
+	}
+	for i := 0; i < len(h); i++ {
+		c := h[i]
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) {
+			return ""
+		}
+	}
+	return h
+}
+
+// clearOnDemandDeltas 删除全部按需增量缓存（from_*.delta）。
+// 上传/回退换了当前版后，旧缓存的 to_hash 全部过期 —— 不删会被
+// GetOnDemandDelta 的「缓存有效性校验」逐个作废，不如一次性清掉。
+func (s *PvfService) clearOnDemandDeltas() {
+	dir := s.DeltaDir()
+	items, err := os.ReadDir(dir)
+	if err != nil {
+		return // 目录不存在 = 没有缓存，正常
+	}
+	for _, it := range items {
+		if !it.IsDir() && strings.HasPrefix(it.Name(), "from_") && strings.HasSuffix(it.Name(), ".delta") {
+			os.Remove(filepath.Join(dir, it.Name()))
+		}
+	}
+}
+
+// GetOnDemandDelta 按 ?from=<hash> 返回「任意历史版 → 当前版」的增量包。
+//
+// 三层：缓存命中 → 历史现场生成（缓存复用）→ nil（404）。
+// 任何一步的产物都要过 Inspect 双校验（from == 请求值 && to == 当前版 hash）
+// 才会下发 —— 与固定增量同一条安全底线：绝不让玩家合成出对不上的文件。
+// 返回 nil 的所有情形（含「from == 当前版」即已是最新）都由调用方回 404。
+func (s *PvfService) GetOnDemandDelta(fromRaw string) *models.PvfDeltaInfo {
+	from := NormalizeHashArg(fromRaw)
+	if from == "" {
+		return nil
+	}
+	info := s.GetPvfInfo()
+	if info == nil || info.Hash == "" {
+		return nil
+	}
+	if strings.EqualFold(from, info.Hash) {
+		return nil // 已是最新
+	}
+
+	dir := s.DeltaDir()
+	cache := filepath.Join(dir, "from_"+from+".delta")
+	if d := s.inspectDeltaFile(cache, from, info.Hash); d != nil {
+		return d // 缓存命中
+	}
+
+	// 生成路径：G-4 / G-10 —— 同一个 from 的并发请求只让一个真去算，其余等待并共享结果。
+	// 限流是按 IP 分桶的，不同 IP 之间不共享，一批同版本玩家同时上线会一起打到这条路径。
+	v, _ := s.deltaGroup.do(from, onDemandBuildWait, func() any {
+		if d := s.inspectDeltaFile(cache, from, info.Hash); d != nil {
+			return d // 等待期间已有别的调用生成好了
+		}
+		if utils.FileExists(cache) {
+			os.Remove(cache) // 有文件但校验不过（to 过期/损坏）→ 作废重建
+		}
+
+		histPath := filepath.Join(s.HistoryDir(), from+".pvf")
+		curPath := s.config.Pvf.FilePath
+		if !utils.FileExists(histPath) || !utils.FileExists(curPath) {
+			return nil // 历史里没有这版（或当前 PVF 缺失）
+		}
+		if err := utils.MkdirAll(dir); err != nil {
+			return nil
+		}
+
+		t0 := time.Now()
+		// G-4：tmp 名带 pid + 纳秒后缀。原先固定为 cache+".tmp"，并发的调用
+		// （甚至 gateway / admin 两个进程）会共写同一文件：os.Create 截断 +
+		// 写入交错 ⇒ 产出损坏包，而 Rename 之后谁也看不出来。
+		tmp := fmt.Sprintf("%s.tmp-%d-%d", cache, os.Getpid(), time.Now().UnixNano())
+		st, err := pvfdiff.Build(histPath, curPath, tmp, pvfdiff.DefaultBlockSize)
+		if err != nil {
+			os.Remove(tmp)
+			s.logger.Warn("PVF 按需增量包生成失败: " + err.Error())
+			return nil
+		}
+		if err := os.Rename(tmp, cache); err != nil {
+			os.Remove(tmp)
+			return nil
+		}
+		s.logger.Info(fmt.Sprintf(
+			"PVF 按需增量包已生成: %s → %s, %d 字节 (%.2f%%), 指令 %d 条, 耗时 %.2fs",
+			shortHash(st.FromHash), shortHash(st.ToHash),
+			st.DeltaSize, st.DeltaRatio()*100, st.InstrCount, time.Since(t0).Seconds()))
+
+		return s.inspectDeltaFile(cache, from, info.Hash)
+	})
+	if v == nil {
+		return nil
+	}
+	d, _ := v.(*models.PvfDeltaInfo)
+	return d
+}
+
+// inspectDeltaFile 读取一个 delta 文件并做 from/to 双校验；不通过返回 nil。
+func (s *PvfService) inspectDeltaFile(path, wantFrom, wantTo string) *models.PvfDeltaInfo {
+	if !utils.FileExists(path) {
+		return nil
+	}
+	h, err := pvfdiff.Inspect(path)
+	if err != nil {
+		return nil
+	}
+	if !strings.EqualFold(h.FromHash, wantFrom) || !strings.EqualFold(h.ToHash, wantTo) {
+		return nil
+	}
+	stats, _ := utils.GetFileStats(path)
+	created := ""
+	if stats != nil {
+		created = stats.ModifiedUtc
+	}
+	return &models.PvfDeltaInfo{
+		FromHash:   h.FromHash,
+		ToHash:     h.ToHash,
+		ToSize:     h.ToSize,
+		Size:       h.TotalSize,
+		Path:       path,
+		CreatedUtc: created,
+	}
+}
+
 // RefreshCache 刷新 PVF 指纹缓存。
 //
 // 采用流式计算全文件 SHA-256（PVF 可达数百 MB），避免整文件读入内存；
@@ -889,12 +1537,25 @@ func (s *PvfService) RefreshCache() error {
 	if !utils.FileExists(path) {
 		s.mu.Lock()
 		s.info = &models.PvfInfo{Path: path, Hash: "", Algo: security.FileFingerprintAlgo, Size: 0, ModifiedUtc: ""}
+		s.loadDeltaLocked() // info.Hash 为空 ⇒ 顺带把 delta 清掉
 		s.mu.Unlock()
 		return nil
 	}
 
 	hash, err := security.ComputeFileFingerprintPath(path)
 	if err != nil {
+		// 审查报告 G-2：这里直接 return err 会留下 s.info == nil，
+		// 而 GetPvfInfo() 会把这个 error 吞掉、返回 nil ⇒ /api/launcher/policy
+		// （免鉴权、每个登录器启动必打）解引用 nil，进程级 panic + 崩溃循环。
+		// 另外 s.info 保持 nil 会让**每个** policy 请求都重算一次全文件 SHA-256。
+		// 处置：有旧 info 就保留（对外表现不变），没有就落一个"指纹不可用"的零值
+		// （Path 保留）；两条路都不留 nil。错误本身照旧返回给调用方。
+		s.mu.Lock()
+		if s.info == nil {
+			s.info = &models.PvfInfo{Path: path, Hash: "", Algo: security.FileFingerprintAlgo, Size: 0, ModifiedUtc: ""}
+			s.loadDeltaLocked()
+		}
+		s.mu.Unlock()
 		return err
 	}
 
@@ -909,18 +1570,100 @@ func (s *PvfService) RefreshCache() error {
 		ModifiedUtc: stats.ModifiedUtc,
 	}
 	s.mode = "file"
+	// 指纹变了 ⇒ 顺带重新判定磁盘上的增量包还配不配得上（配不上就置空）。
+	// 这一步同时覆盖「运维直接替换了 Script.pvf，没走 upload-pvf」的情况。
+	s.loadDeltaLocked()
 	s.mu.Unlock()
 	return nil
 }
 
+// ── G-6：跨进程的 PVF 替换锁 ───────────────────────────────────────────────
+//
+// replaceMu 只挡得住**本进程内**的并发；admin 与 gateway 是两个进程、各自注册了
+// upload-pvf，而 .bak 是**共享的磁盘资源**：两边同时走
+//「BackupFile → 写盘 → rebuildDelta」，就会互相把对方刚写好的新版覆盖成 .bak，
+// 最终产出 from == to 的自差分。所以再补一层文件锁。
+//
+// 用 O_CREATE|O_EXCL 的锁文件（<pvf>.lock）而不是 flock：O_EXCL 是 POSIX 与
+// Windows 都保证原子性的最小公倍数，而 flock 的语义两边并不一致。
+const (
+	// pvfReplaceLockPoll 抢锁轮询间隔。
+	pvfReplaceLockPoll = 200 * time.Millisecond
+	// pvfReplaceLockStale 残留锁判定阈值：持锁进程崩溃/整机断电会留下永不释放的
+	// 锁文件，超过这个时长就强制接管，否则 PVF 从此再也换不了。
+	pvfReplaceLockStale = 10 * time.Minute
+)
+
+// pvfReplaceLockWait 抢锁的最长等待。上传 PVF 是低频人工操作，
+// 30 秒足够覆盖"两个后台上传按钮被同时点到"，超出就直接报错让人重试。
+//
+// ★ 用 var 而非 const：测试要把"有进程持锁"的用例压到毫秒级，
+// 否则光等这个超时就得跑 30 秒。
+var pvfReplaceLockWait = 30 * time.Second
+
+// acquirePvfReplaceLock 抢跨进程的 PVF 替换锁，返回释放函数（幂等：重复调用只删一次）。
+func (s *PvfService) acquirePvfReplaceLock() (func(), error) {
+	lockPath := s.config.Pvf.FilePath + ".lock"
+	deadline := time.Now().Add(pvfReplaceLockWait)
+	forced := false
+
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err == nil {
+			// 内容只为排障：谁在什么时候持的锁（admin 与 gateway 可能不同机/不同 pid）。
+			fmt.Fprintf(f, "pid=%d time=%s\n",
+				os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+			f.Close()
+			return func() { os.Remove(lockPath) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("创建 PVF 替换锁失败（%s）: %w", lockPath, err)
+		}
+
+		// 锁已存在：判残留。只强制接管一次 —— 否则 os.Remove 一直失败时会死循环。
+		if !forced {
+			if st, serr := os.Stat(lockPath); serr == nil && time.Since(st.ModTime()) > pvfReplaceLockStale {
+				s.logger.Warn(fmt.Sprintf(
+					"发现残留的 PVF 替换锁（%s，%s 未更新）——强制接管",
+					lockPath, time.Since(st.ModTime()).Round(time.Second)))
+				forced = true
+				if rerr := os.Remove(lockPath); rerr == nil {
+					continue
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("另一个进程正在替换 PVF（锁文件 %s），请稍后重试", lockPath)
+		}
+		time.Sleep(pvfReplaceLockPoll)
+	}
+}
+
 // ReplacePvf 替换 PVF 文件。
-func (s *PvfService) ReplacePvf(src io.Reader) (*models.PvfInfo, error) {
+//
+// name/filename 来自管理后台（显示备注 + 原上传文件名），写进历史记录 ——
+// 仅该版本**首次**入史时生效，重复上传同内容不会覆盖旧备注。
+func (s *PvfService) ReplacePvf(src io.Reader, name, filename string) (*models.PvfInfo, error) {
+	// G-6（2026-10-04 审查）：整条链路必须互斥（见 replaceMu / acquirePvfReplaceLock）。
+	s.replaceMu.Lock()
+	defer s.replaceMu.Unlock()
+
 	path := s.config.Pvf.FilePath
+
+	// 目录先建好，否则下面的跨进程锁文件（<pvf>.lock）落在不存在的目录里会失败。
 	if err := utils.MkdirAll(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
 
-	// 备份旧文件
+	unlock, err := s.acquirePvfReplaceLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	// 备份旧文件。★ 这个 .bak 同时是**生成增量包的旧版本输入** ——
+	// 别为了省 75 MB 磁盘把它去掉，否则登录器永远只能全量更新。
 	utils.BackupFile(path)
 
 	// 写入新文件
@@ -943,6 +1686,23 @@ func (s *PvfService) ReplacePvf(src io.Reader) (*models.PvfInfo, error) {
 	if err := s.RefreshCache(); err != nil {
 		return nil, err
 	}
+
+	// ★ 生成「上一版 → 当前版」增量包（登录器据此做增量更新）。
+	//   放在替换**成功之后**，且内部不返回错误：PVF 已经换好了，
+	//   不该因为"出不了 delta"就把整个替换回退；失败只会让本次没有增量可用。
+	s.rebuildDelta(path)
+
+	// ★ 历史存档（2026-09-30 方案①）：旧版（.bak）与新版都入史（内容寻址去重），
+	//   供「版本回退」与 ?from=<hash> 按需增量使用。失败只记日志 ——
+	//   替换已经成功，历史缺失的代价只是少一个可回退/可按需的版本。
+	s.clearOnDemandDeltas() // 当前版已换 ⇒ 旧 from_*.delta 的 to 全部过期
+	if _, err := s.archiveHistory(path+".bak", "", ""); err != nil {
+		s.logger.Warn("PVF 旧版入历史失败（不影响替换）: " + err.Error())
+	}
+	if _, err := s.archiveHistory(path, name, filename); err != nil {
+		s.logger.Warn("PVF 新版入历史失败（不影响替换）: " + err.Error())
+	}
+
 	return s.GetPvfInfo(), nil
 }
 
@@ -984,15 +1744,34 @@ func derefString(p *string, def string) string {
 	return def
 }
 
+// fileStamp 是策略文件的"版本指纹"。
+//
+// 只看 (修改时间, 字节数)：够轻（一次 stat，不用读文件内容，也不用起 fsnotify）、
+// 也够准 —— 管理员在后台改名单必然走到一次 saveLocked 重写整个文件，
+// 大文件几乎必变、小文件改条目数必变；再叠加纳秒级 mtime，实际不可能漏判。
+type fileStamp struct {
+	modNano int64
+	size    int64
+}
+
 // IntegrityStore 完整性策略存储。
 //
 // 策略会持久化到 <configDir>/integrity_policy.json，重启后自动加载，
 // 避免进程重启导致全部白/黑名单与放行模块丢失。
+//
+// ★★ 运行时还必须能被**别的进程**改醒（2026-10-12 修）：
+// 管理后台是独立的 s4a21-admin 进程，它在 `/api/admin/integrity/*` 上增删条目后
+// 只更新**它自己**的内存并把 `integrity_policy.json` 重写落盘；
+// 而给登录器下发名单的 `/api/launcher/policy` 跑在**网关进程**里，读的是网关自己那份内存快照。
+// 修复前网关只在构造时 load 一次 ⇒ 后台改完，网关下发的一直是旧名单，
+// 只有重启网关进程（= 全体在线玩家掉线）才生效。
+// 现在 Snapshot() 每次先看一眼文件指纹，变了就热加载，做到「后台保存 → 玩家下次拉策略即为新名单」，零掉线。
 type IntegrityStore struct {
 	mu         sync.RWMutex
 	snapshot   *models.IntegritySnapshot
 	policyPath string
 	logger     *logger.ConsoleLogger
+	diskStamp  fileStamp
 }
 
 // IntegrityPolicyFileName 完整性策略持久化文件名。
@@ -1016,7 +1795,9 @@ func NewIntegrityStore(configDir string, log *logger.ConsoleLogger) *IntegritySt
 	}
 	if configDir != "" {
 		s.policyPath = filepath.Join(configDir, IntegrityPolicyFileName)
-		s.load()
+		s.loadLocked()
+		// 记下"当前盘上的样子"，之后 Snapshot 才能分辨"变了"还是"没动过"。
+		s.diskStamp = s.statPolicy()
 	}
 	return s
 }
@@ -1035,8 +1816,14 @@ func (s *IntegrityStore) logError(msg string) {
 	}
 }
 
-// load 从磁盘加载策略。文件不存在或解析失败时保持默认空策略（不阻断启动）。
+// load 供构造期调用（此刻没有并发，无需加锁）。
 func (s *IntegrityStore) load() {
+	s.loadLocked()
+}
+
+// loadLocked 从磁盘加载策略。文件不存在或解析失败时保持现有内存策略（不阻断启动）。
+// 调用方必须已持有写锁。
+func (s *IntegrityStore) loadLocked() {
 	if s.policyPath == "" {
 		return
 	}
@@ -1070,6 +1857,45 @@ func (s *IntegrityStore) load() {
 		snap.Revision, len(snap.WhiteList), len(snap.BlackList), len(snap.AllowedModules)))
 }
 
+// statPolicy 读取策略文件当下的指纹；路径为空 / 文件不存在 / 不可读一律返回零值。
+func (s *IntegrityStore) statPolicy() fileStamp {
+	if s.policyPath == "" {
+		return fileStamp{}
+	}
+	fi, err := os.Stat(s.policyPath)
+	if err != nil {
+		return fileStamp{}
+	}
+	return fileStamp{modNano: fi.ModTime().UnixNano(), size: fi.Size()}
+}
+
+// reloadIfChangedLocked 检测到策略文件被**外部**改写时重载内存快照。
+//
+// 典型场景就是这次要修的 bug：管理后台（s4a21-admin 进程）增删条目后重写了
+// integrity_policy.json，而网关进程的内存快照还停在它自己启动那一刻。
+//
+// 设计取舍：
+//   - 只 stat 不读内容：一次 stat 的代价相对一次 policy 请求可以忽略，
+//     比起"每次请求都 ReadFile + Unmarshal"（几 KB JSON）便宜一个量级；
+//   - 零值指纹（文件还没生成过 / 暂时读不到）**不更新** s.diskStamp ——
+//     否则"文件从无到有"这一次会被当成"没变"而漏掉；
+//   - 文件被删时保持内存现状，不把已有名单清成空 —— 宁可继续下发旧名单，
+//     也不要因为一次误删把所有客户端的放行配置打空。
+func (s *IntegrityStore) reloadIfChangedLocked() {
+	if s.policyPath == "" {
+		return
+	}
+	now := s.statPolicy()
+	if now == (fileStamp{}) || now == s.diskStamp {
+		return
+	}
+	oldRev := s.snapshot.Revision
+	s.loadLocked()
+	s.diskStamp = now
+	s.logInfo(fmt.Sprintf("[完整性策略] 检测到策略文件被外部改写，已热加载: rev=%d→%d 白名单=%d 黑名单=%d 放行模块=%d",
+		oldRev, s.snapshot.Revision, len(s.snapshot.WhiteList), len(s.snapshot.BlackList), len(s.snapshot.AllowedModules)))
+}
+
 // saveLocked 把当前快照落盘（调用方必须已持有写锁）。
 // 采用"写临时文件 -> 原子替换"策略，失败只记日志不回滚内存变更。
 func (s *IntegrityStore) saveLocked() {
@@ -1088,14 +1914,34 @@ func (s *IntegrityStore) saveLocked() {
 	}
 	if err := os.Rename(tmpPath, s.policyPath); err != nil {
 		s.logError(fmt.Sprintf("[完整性策略] 原子替换失败: %v", err))
+		return
 	}
+	// 这次改动是**本进程**写的：立刻同步指纹，免得下一次 Snapshot 把它误判成
+	// "外部改写"又重载一遍（结果虽然一样，但每次都白读一次文件、还多打一条日志）。
+	s.diskStamp = s.statPolicy()
 }
 
 // Snapshot 获取快照的深拷贝，避免调用方在锁外读取时与写操作产生数据竞争。
+//
+// ★ 每次都先看一眼策略文件有没有被**别的进程**（管理后台 / 人工上传）改写 ——
+//   改了就热加载再返回。`/api/launcher/policy` 走的就是这里，
+//   所以后台保存后玩家下一次拉到的就是新名单，不需要重启网关。
+//
+// 快路径只读锁 + 一次 stat；只有指纹真的变了才升级成写锁去重载。
 func (s *IntegrityStore) Snapshot() *models.IntegritySnapshot {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return cloneSnapshot(s.snapshot)
+	if s.policyPath != "" {
+		if now := s.statPolicy(); now != (fileStamp{}) && now != s.diskStamp {
+			s.mu.RUnlock()
+			s.mu.Lock()
+			s.reloadIfChangedLocked() // 内部二次核对，避免两个并发请求重复加载
+			s.mu.Unlock()
+			s.mu.RLock()
+		}
+	}
+	snap := cloneSnapshot(s.snapshot)
+	s.mu.RUnlock()
+	return snap
 }
 
 // cloneSnapshot 深拷贝一份快照（含所有切片内容）。
@@ -2072,7 +2918,40 @@ func (s *BonusService) Stop() {
 
 // runLoop 泡点主循环。cancel 由 Start 传入并独占持有，
 // 不读取 s.cancel 字段，避免与 Stop 的置 nil 产生数据竞争。
+//
+// G-16（2026-10-08，审查报告）：循环体里原来用 `time.After(...)` —— 每轮都新建一个
+// Timer，而 select 从 cancel 分支返回时那个 Timer **谁也不再持有**，要等它自己到点
+// 才被回收（配置非法那条是 60 秒）。改成全程复用同一个 Timer + Reset。
+//
+// ★ Reset 之前必须先 Stop 并把 channel 排空：Timer 到点后 channel 里可能还留着一个
+//   陈旧值，不排空的话下一次 select 会被这个假"到点"立刻唤醒（退化成空转）。
 func (s *BonusService) runLoop(cancel <-chan struct{}) {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	// wait 睡 d；返回 false 表示收到 cancel（调用方直接 return）。
+	wait := func(d time.Duration) bool {
+		if d < 0 {
+			d = 0
+		}
+		timer.Reset(d)
+		select {
+		case <-cancel:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+
 	for {
 		select {
 		case <-cancel:
@@ -2082,30 +2961,24 @@ func (s *BonusService) runLoop(cancel <-chan struct{}) {
 
 		cfg := s.loadConfig()
 		if cfg == nil || !cfg.Enabled {
-			select {
-			case <-cancel:
+			if !wait(5 * time.Second) {
 				return
-			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
 
 		if err := s.validateConfig(cfg); err != nil {
 			s.logger.Warn(fmt.Sprintf("泡点配置非法: %v", err))
-			select {
-			case <-cancel:
+			if !wait(60 * time.Second) {
 				return
-			case <-time.After(60 * time.Second):
 			}
 			continue
 		}
 
 		s.grantBonus(cfg)
 
-		select {
-		case <-cancel:
+		if !wait(time.Duration(cfg.IntervalSeconds) * time.Second) {
 			return
-		case <-time.After(time.Duration(cfg.IntervalSeconds) * time.Second):
 		}
 	}
 }
@@ -2209,7 +3082,17 @@ func (s *DeviceCredentialService) VerifyAndIssue(account *database.Account, prov
 
 	// 首次注册
 	if account.DeviceSecret == "" {
-		newSecret := security.GenerateDeviceSecret()
+		// G-15：拿不到随机源就**拒发**，绝不能把全零密钥写进库（那等于所有账号共用一把钥匙）。
+		newSecret, err := security.GenerateDeviceSecret()
+		if err != nil {
+			s.logger.Error(fmt.Sprintf("生成设备密钥失败: %s, err=%v", account.MId, err))
+			return &DeviceResult{
+				Secret:          "",
+				Changed:         false,
+				DeniedErrorCode: models.Err.DatabaseError,
+				DeniedMessage:   "服务器内部错误，请稍后重试",
+			}
+		}
 		history := []string{formatDeviceEntry(clientIP)}
 		s.updateDevice(account.MId, newSecret, history)
 		s.logger.Info(fmt.Sprintf("首次设备注册: %s, IP: %s", account.MId, clientIP))
@@ -2255,7 +3138,17 @@ func (s *DeviceCredentialService) VerifyAndIssue(account *database.Account, prov
 	}
 
 	// 签发新密钥
-	newSecret := security.GenerateDeviceSecret()
+	// G-15：同首次注册 —— 随机源失败就拒发，不落一个全零密钥。
+	newSecret, err := security.GenerateDeviceSecret()
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("换发设备密钥失败: %s, err=%v", account.MId, err))
+		return &DeviceResult{
+			Secret:          "",
+			Changed:         false,
+			DeniedErrorCode: models.Err.DatabaseError,
+			DeniedMessage:   "服务器内部错误，请稍后重试",
+		}
+	}
 	historyList := parseHistory(account.DeviceHistory)
 	historyList = append([]string{formatDeviceEntry(clientIP)}, historyList...)
 
@@ -2467,6 +3360,11 @@ func (s *ServerManager) TailLog(key string, lines int) *LogResult {
 // 只用 Pvf.FilePath）才 mkdir。
 //
 // 返回的 error 会直接展示在后台弹窗里，所以要把候选列表带上，别只说"找不到"。
+// ResolvePvfPath 解析服务端 PVF 的实际路径（导出给 admin 端点做路径一致性守卫）。
+func (s *ServerManager) ResolvePvfPath() (string, error) {
+	return s.resolvePvfPath()
+}
+
 func (s *ServerManager) resolvePvfPath() (string, error) {
 	var tried []string
 	considered := func(p string) bool {
@@ -2520,7 +3418,21 @@ func (s *ServerManager) resolvePvfPath() (string, error) {
 		strings.Join(tried, "、"))
 }
 
-// ReplacePvf 替换服务端 PVF。
+// ReplacePvf 替换**服务端使用的** PVF（明文，DfoServer 读的那份）。
+//
+// ★★ 与 PvfService.ReplacePvf 的分工（2026-09-30 方案调整）：
+//
+//	ServerManager.ReplacePvf（本函数）→ 服务端文件夹，给 DfoServer 用。
+//	    **不**登记客户端校验指纹、**不**生成增量包、**不**写版本历史、**不**通知网关。
+//	PvfService.ReplacePvf            → 网关侧保存的「客户端基准」（将来是加密版）。
+//	    客户端的校验指纹 / 增量更新 / 版本历史全部围绕它。
+//
+// 两条路径必须指向**不同文件**（调用方负责守卫）。若同一个文件，这个函数会把
+// 客户端的 `.bak` 覆盖成新版自己，导致 rebuildDelta 产出 from==to 的自差分，
+// 全体旧版客户端进不去 —— 2026-09-30 线上事故的完整成因。
+//
+// 备份写在本文件自己的 `<path>.bak`（服务端目录内），与网关侧的
+// `<Pvf.FilePath>.bak` 是两个文件，互不影响。
 func (s *ServerManager) ReplacePvf(src io.Reader) *PvfResult {
 	path, err := s.resolvePvfPath()
 	if err != nil {
@@ -2544,7 +3456,42 @@ func (s *ServerManager) ReplacePvf(src io.Reader) *PvfResult {
 		return &PvfResult{Ok: false, Error: err.Error()}
 	}
 
-	return &PvfResult{Ok: true, Error: ""}
+	// 落盘后回读指纹 —— 让后台能确认「服务端那份现在是哪个版本」，
+	// 也便于与服务端的 .bak 对拍（回滚时要用）。
+	res := &PvfResult{Ok: true, Path: path, Algo: security.FileFingerprintAlgo}
+	if hash, err := security.ComputeFileFingerprintPath(path); err == nil {
+		res.Hash = hash
+	}
+	if stats, err := utils.GetFileStats(path); err == nil {
+		res.Size = stats.Size
+		res.ModifiedUtc = stats.ModifiedUtc
+	}
+	s.logger.Info(fmt.Sprintf("服务端 PVF 已替换: %s (%s, %d 字节)",
+		path, shortHash(res.Hash), res.Size))
+	return res
+}
+
+// ServerPvfInfo 读服务端 PVF 的当前落盘信息（只读，不写盘）。
+//
+// 用于后台展示「服务端那份现在是什么」—— 它与客户端校验指纹（Pvf.FilePath）
+// 是两件事，页面必须分别显示，否则运维会误以为改一个另一个也跟着变。
+func (s *ServerManager) ServerPvfInfo() (*PvfResult, error) {
+	path, err := s.resolvePvfPath()
+	if err != nil {
+		return nil, err
+	}
+	res := &PvfResult{Ok: true, Path: path, Algo: security.FileFingerprintAlgo}
+	if !utils.FileExists(path) {
+		return res, nil
+	}
+	if hash, err := security.ComputeFileFingerprintPath(path); err == nil {
+		res.Hash = hash
+	}
+	if stats, err := utils.GetFileStats(path); err == nil {
+		res.Size = stats.Size
+		res.ModifiedUtc = stats.ModifiedUtc
+	}
+	return res, nil
 }
 
 // Backup 备份数据库与 PVF 到 BackupDir。
@@ -2873,6 +3820,12 @@ type LogResult struct {
 type PvfResult struct {
 	Ok    bool
 	Error string
+	// 以下为替换成功后的实际落盘信息，供后台核对「服务端那份到底是什么」。
+	Path        string
+	Hash        string
+	Algo        string
+	Size        int64
+	ModifiedUtc string
 }
 
 // BackupResult 备份结果。

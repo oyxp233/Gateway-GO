@@ -15,6 +15,7 @@ import (
 	"s4a21-gateway/pkg/logger"
 	"s4a21-gateway/pkg/models"
 	"s4a21-gateway/pkg/ratelimiter"
+	"s4a21-gateway/pkg/safego"
 )
 
 const (
@@ -35,6 +36,17 @@ type Server struct {
 	wg          sync.WaitGroup
 	activeConns int
 	activeMu    sync.Mutex
+	// conns 是当前活跃连接集合（已做 TLS 包装的那份）。
+	//
+	// G-7（2026-10-04 审查）：ReadFrame 走 io.ReadFull 是**裸阻塞读**，
+	// close(shutdown) 唤不醒它 —— 原先 Stop() 只关监听 + wg.Wait()，
+	// 于是要等满 TcpIdleTimeoutSeconds（默认 600s），远超 systemd 的
+	// TimeoutStopUSec ⇒ 每次发版都被 SIGKILL。Stop() 里主动关连接即可。
+	//
+	// 之所以不用 proxy 那套「1 秒切片轮询」：那边轮询的是单次 Read，
+	// 而这里是长度前缀帧 —— 切片会让 ReadFrame 读半个帧后超时，
+	// 重试就从 body 中间开始读，**帧错位**。所以只能靠"关连接"来唤醒。
+	conns map[net.Conn]struct{}
 }
 
 // CommandHandler 处理 TCP 命令的接口。
@@ -53,6 +65,7 @@ func NewServer(cfg *config.GatewayConfig, handler CommandHandler, logger *logger
 		maxConns:    cfg.Gateway.TcpMaxConnections,
 		idleTimeout: cfg.Gateway.TcpIdleTimeoutSeconds,
 		shutdown:    make(chan struct{}),
+		conns:       make(map[net.Conn]struct{}),
 	}
 }
 
@@ -140,8 +153,12 @@ func (s *Server) acceptLoop() {
 		s.wg.Add(1)
 		s.activeMu.Lock()
 		s.activeConns++
+		s.conns[conn] = struct{}{}
 		s.activeMu.Unlock()
-		go s.handleClient(conn)
+		// G-1（2026-10-04 审查）：这里是**裸 goroutine**，panic 会直接打挂整个网关进程
+		// ⇒ 全体在线玩家瞬间掉线。net/http 的 handler 有标准库自带的兜底，这里没有，
+		// 必须显式 recover（只有这一处和 proxy 的两处 accept 循环需要）。
+		safego.Go(s.logger, "auth.handleClient", func() { s.handleClient(conn) })
 	}
 }
 
@@ -154,9 +171,13 @@ func (s *Server) handleClient(conn net.Conn) {
 	// 于是 getActiveConns() 读到的是"刚 accept、handler goroutine 还没跑起来"的瞬时数（通常≈0），
 	// acceptLoop 里那条 `getActiveConns() >= maxConns` 的上限判断因此**永远不成立**：
 	// Gateway.TcpMaxConnections 形同虚设，一个简单的 TCP flood 就能把 fd 打穿。
+	// G-7：同时把连接从活跃集合里摘掉。摘除必须和 -- 一样 defer 到函数返回，
+	// 否则 Stop() 会拿到一个已经不在读的连接去 Close（无害），但更要紧的是
+	// **漏摘**会让 conns 无限增长（连接对象被 map 强引用，GC 收不掉）。
 	defer func() {
 		s.activeMu.Lock()
 		s.activeConns--
+		delete(s.conns, conn)
 		s.activeMu.Unlock()
 	}()
 
@@ -240,12 +261,47 @@ func (s *Server) handleClient(conn net.Conn) {
 }
 
 // Stop 优雅关闭服务器。
+//
+// G-7（2026-10-04 审查）：handleClient 里的 ReadFrame 是 io.ReadFull 裸阻塞读，
+// close(s.shutdown) 唤不醒它 ⇒ 原先这里要等满 TcpIdleTimeoutSeconds
+// （默认 600s）才等到 wg.Wait() 返回，远超 systemd 的 TimeoutStopUSec
+// ⇒ **每次发版都被 SIGKILL**（网关整体重启 = 全体掉线）。
+//
+// 处置：关完监听就主动 Close 全部活跃连接 —— 阻塞中的 ReadFrame 立刻返回
+// net.ErrClosed，handleClient 走到 return、wg 归零。多给 3 秒兜底，超时就放弃等待
+// （剩下的连接已经在关的路上，进程退出会由内核回收，绝不再拖满 600s）。
 func (s *Server) Stop() {
 	close(s.shutdown)
 	if s.listener != nil {
 		s.listener.Close()
 	}
-	s.wg.Wait()
+
+	// 快照后逐个关闭：不要在持锁状态下 Close（Close 可能触发对端 RST 与
+	// 后续 defer 里的 delete，虽然不冲突，但缩短持锁区总是更好）。
+	s.activeMu.Lock()
+	pending := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		pending = append(pending, c)
+	}
+	s.activeMu.Unlock()
+
+	for _, c := range pending {
+		c.Close()
+	}
+	if n := len(pending); n > 0 {
+		s.logger.Info(fmt.Sprintf("认证服务关闭：已主动断开 %d 个活跃连接", n))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		s.logger.Warn("认证服务关闭：等待连接收尾超过 3 秒，不再阻塞进程退出")
+	}
 }
 
 // ReadFrame 读取一个大端序长度前缀的 JSON 帧。

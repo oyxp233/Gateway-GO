@@ -458,62 +458,17 @@ func (s *Server) handleAdminPluginMetaSave(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// handleAdminPluginMetaDraft 按目录里的 *.dll 生成一份元数据**草稿**并保存。
+// ★ 2026-09-30 移除 handleAdminPluginMetaDraft（按目录生成清单草稿）。
 //
-// 用途：首次部署时不想手写 12 条。草稿刻意全部标成"非核心 + 默认关闭"——
-// 自动推导绝不能让某个插件意外变成恒部署。运维必须自己把核心插件改对，
-// 否则登录器会因加载链不完整起不来（那是显式的、可诊断的失败，不是静默错配）。
-func (s *Server) handleAdminPluginMetaDraft(w http.ResponseWriter, r *http.Request) {
-	if !s.checkAdmin(w, r) {
-		return
-	}
-	if s.plugins == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-			"ok": false, "message": "插件下发未初始化",
-		})
-		return
-	}
-
-	dir := s.plugins.Dir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"ok": false, "message": "插件目录不可读：" + err.Error(),
-		})
-		return
-	}
-
-	metas := degradedMetas(entries)
-	if len(metas) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"ok": false, "message": "插件目录里没有任何 .dll，无法生成草稿",
-		})
-		return
-	}
-
-	doc := pluginMetaDoc{Version: 1, Plugins: metas}
-	raw, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"ok": false, "message": "序列化失败：" + err.Error(),
-		})
-		return
-	}
-	raw = append(raw, '\n')
-	if err := atomicWriteFile(filepath.Join(dir, pluginMetaFileName), raw, 0o644); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"ok": false, "message": "写入失败：" + err.Error(),
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true,
-		"message": fmt.Sprintf("已生成 %s 草稿（%d 条，全部按非核心/默认关闭）。"+
-			"请把加载链核心插件改成 is_core=true，并确认加载顺序 —— 顺序错了插件不会加载。",
-			pluginMetaFileName, len(metas)),
-	})
-}
+// 移除原因（安南报的真实误操作）：它按目录里的 *.dll 重新推导一份清单并**整体覆盖**
+// plugins.json，且每条都写成"非核心 + 默认关闭"。后台点错一次，就要手工把 12 条的
+// 顺序与核心标记全部重排回来 —— 而顺序错了插件根本不加载，登录器加载链也会断。
+//
+// 首次部署的清单以仓库里的 plugins/plugins.json 为准（受版本控制、可 review、可回滚），
+// 不再由后台从目录结构反推。
+//
+// ★ degradedMetas 本身**保留**：launcher_plugins.go 在"缺 plugins.json / 清单非法"时
+//   仍用它给登录器推一份仅供参考的降级清单 —— 那是运行期兜底，与这个后台按钮无关。
 
 // atomicWriteFile 原子写：同目录临时文件 → fsync → rename。
 //

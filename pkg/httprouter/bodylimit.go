@@ -40,6 +40,7 @@ var uploadPaths = map[string]bool{
 	"/api/admin/upload-pvf":       true, // 客户端校验：上传网关侧 PVF
 	"/api/admin/server/pvf":       true, // 服务端管理：替换游戏服务端 PVF
 	"/api/admin/integrity/upload": true, // 客户端校验：白/黑名单文件批量上传
+	"/api/admin/launcher/upload":  true, // 登录器版本：上传新 exe（约 128 MiB，2026-10-01）
 }
 
 // uploadBodyLimitFor 返回该路径适用的请求体上限：白名单用 maxUploadBodyBytes，其余用 fallback。

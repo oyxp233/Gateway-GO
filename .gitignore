@@ -2,6 +2,7 @@
 bin/
 dist/
 dist-linux/
+dist-linux-*/
 *.exe
 *.bak-*
 
@@ -27,6 +28,10 @@ appsettings.override.json
 plugins/*
 !plugins/plugins.json
 !plugins/README.md
+
+# ── 本地临时脚本（UI 联调残留）────────────────────────────────────
+_tmp_*.js
+_ui_check.js
 
 # ── 说明 ────────────────────────────────────────────────────────
 # wwwroot/ 必须入库：后台单页 index.html 是网关交付物的一部分

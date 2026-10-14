@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"s4a21-gateway/pkg/config"
+	"s4a21-gateway/pkg/logger"
 )
 
 // ────────────────────────────────────────────────────────────────────────
@@ -40,7 +41,16 @@ func newTestServerManager(t *testing.T) (*ServerManager, string, string) {
 	cfg.Server.WorkDir = workDir
 	cfg.Server.PvfPath = "" // 线上没配这一项
 	cfg.Pvf.FilePath = ""   // 清掉默认的相对路径 ./Data/Pvf/Script.pvf
-	return &ServerManager{config: cfg}, workDir, pvfPath
+
+	// ReplacePvf 落盘后会回读指纹并打日志（2026-09-30 双角色分离批）——
+	// 夹具不配 logger 会 nil panic（2026-10-01 全量回归抓到）。
+	lg, err := logger.NewConsoleLogger(filepath.Join(dir, "logs"), logger.Error)
+	if err != nil {
+		t.Fatalf("建 logger 失败: %v", err)
+	}
+	t.Cleanup(func() { lg.Close() })
+
+	return &ServerManager{config: cfg, logger: lg}, workDir, pvfPath
 }
 
 // oldBrokenPath 复现修复前的拼接结果 —— 用它断言"旧路径确实不存在"，

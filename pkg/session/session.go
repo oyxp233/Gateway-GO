@@ -89,6 +89,67 @@ func (sm *SessionManager) FindSessionByAccount(account string) (*models.Session,
 	return best, best != nil
 }
 
+// FindStaleSessionForReconnect 找出该账号「可判定为掉线重连」的旧会话。
+//
+// 背景（2026-10-10 生产 18:30 卡顿掉线复盘）：客户端掉线后玩家重开登录器登录，
+// 旧会话还没到 TimeoutSeconds 就被判定"已在线"，登录器弹窗等玩家点确认 ——
+// 玩家不在电脑前就一直进不去，几秒的网络抖动被放大成几十秒掉线。
+//
+// 判据（两条必须**同时**成立，缺一不可）：
+//  1. 旧会话心跳已停滞超过 staleSeconds（客户端进程确实死了，不是"卡了一下"）；
+//  2. 新登录来自**同一端**：同 IP，或同 device_secret（两边都为空时不算）。
+//     这一条把"异地顶号"挡在外面 —— 那种情况仍然走 1023 弹窗由玩家自己确认，
+//     顶号保护不受影响。
+//
+// staleSeconds <= 0 表示功能关闭，恒返回 false（退回原有的一律弹窗行为）。
+//
+// 返回的是**会话副本**：调用方只读，避免把内部对象暴露出去被无锁并发写。
+func (sm *SessionManager) FindStaleSessionForReconnect(
+	account, ip, deviceSecret string, staleSeconds int) (models.Session, bool) {
+	if account == "" || staleSeconds <= 0 {
+		return models.Session{}, false
+	}
+
+	now := time.Now().Unix()
+	cutoff := now - int64(staleSeconds)
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var stale *models.Session
+	for _, s := range sm.sessions {
+		if s.Account != account || s.LastHeartbeat >= cutoff {
+			continue
+		}
+		if !sameClientEndpoint(s.ClientIP, s.DeviceSecret, ip, deviceSecret) {
+			continue
+		}
+		// 同 FindSessionByAccount：同秒多会话时用 token 字典序兜底，保证归属确定。
+		if stale == nil || s.CreatedAt < stale.CreatedAt ||
+			(s.CreatedAt == stale.CreatedAt && s.Token < stale.Token) {
+			stale = s
+		}
+	}
+	if stale == nil {
+		return models.Session{}, false
+	}
+	return *stale, true
+}
+
+// sameClientEndpoint 判断两次登录是否来自"同一端"。
+//
+// device_secret 两边都为空时不算命中 —— 老客户端/新机器还没领到 secret 时
+// 两边都是空串，拿空串判等会让"任意机器"都算同一端，直接把顶号保护打穿。
+func sameClientEndpoint(oldIP, oldSecret, newIP, newSecret string) bool {
+	if newIP != "" && oldIP == newIP {
+		return true
+	}
+	if oldSecret != "" && newSecret != "" && oldSecret == newSecret {
+		return true
+	}
+	return false
+}
+
 // FindSessionByMId 按 m_id 查找会话（游戏连接的**精确归属**用）。
 //
 // 客户端 launch_args 第 4 段就是该账号的 m_id，游戏协议首包（登录包）里带的也是它
@@ -262,14 +323,25 @@ func (sm *SessionManager) RemoveSession(token string) {
 	closeConns(conns)
 }
 
-// GetAllSessions 获取所有会话列表。
-func (sm *SessionManager) GetAllSessions() []*models.Session {
+// GetAllSessions 获取所有会话的**快照**（值拷贝）。
+//
+// G-9（2026-10-04 审查）：原先返回会话对象**裸指针**，调用方（backends.List）在锁外
+// 读 Account/ClientIP/LastHeartbeat/BonusGranted，而 UpdateHeartbeat / CollectBonusAwards
+// 同时在写同一批字段 —— 真实数据竞争（go test -race 可复现），32 位平台的 int64 还会撕裂。
+// 现在在 RLock 内逐个值拷贝，调用方拿到的是脱离共享状态的副本。
+//
+// 注意：ProxyConnections / GameProxyConnections 是 map（引用类型），值拷贝共享其底层。
+// 快照的用途是**只读展示**，调用方不得经由它们改动状态；要踢连接请走 Kick* 系列。
+func (sm *SessionManager) GetAllSessions() []models.Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	result := make([]*models.Session, 0, len(sm.sessions))
+	result := make([]models.Session, 0, len(sm.sessions))
 	for _, s := range sm.sessions {
-		result = append(result, s)
+		if s == nil {
+			continue
+		}
+		result = append(result, *s)
 	}
 	return result
 }
@@ -645,12 +717,25 @@ func (sm *SessionManager) KickNonAdminAccounts(adminAccounts []string) int {
 	return len(toRemove)
 }
 
-// CleanExpiredSessions 清理超时会话。
+// ExpiredSessionInfo 一次超时清理里被清掉的会话明细（运维判据用）。
+type ExpiredSessionInfo struct {
+	Account   string
+	MId       string
+	ClientIP  string
+	StaleSecs int64 // 心跳停滞秒数（相对清理时刻）
+	// GameConns 清理瞬间挂着的 Game 频道连接数。> 0 说明玩家当时是真的在游戏里
+	// （不是在登录器界面），被清掉 = 实打实的一次掉线，值得单独看一眼。
+	GameConns int
+	// ProxyConns 挂着的 Channel 代理连接数。
+	ProxyConns int
+}
+
+// CleanExpiredSessionsWithDetails 同 CleanExpiredSessions，但额外返回被清会话的明细。
 //
-// 同 KickAccount：被清掉的会话挂着的代理连接要一并断开。
-// 不关的话，玩家客户端崩溃后代理 goroutine 还在双向 copy，
-// 只能等游戏侧 idle 超时（默认 1800s）才回收，资源回收凭空推迟半小时。
-func (sm *SessionManager) CleanExpiredSessions(timeoutSeconds int) int {
+// 起因（2026-10-10 复盘）：原来只有一行「清理超时会话: N」，出事后回答不了
+// "清的是谁、心跳停了多久、当时有没有在游戏里" —— 只能靠翻 400MB 的 game log 反推。
+// 主循环据此逐条打点，下次可直接判"是清错了还是真掉线"。
+func (sm *SessionManager) CleanExpiredSessionsWithDetails(timeoutSeconds int) (int, []ExpiredSessionInfo) {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 60
 	}
@@ -660,10 +745,19 @@ func (sm *SessionManager) CleanExpiredSessions(timeoutSeconds int) int {
 	sm.mu.Lock()
 	var toRemove []string
 	var removed []*models.Session
+	var details []ExpiredSessionInfo
 	for token, s := range sm.sessions {
 		if s.LastHeartbeat < cutoff {
 			toRemove = append(toRemove, token)
 			removed = append(removed, s)
+			details = append(details, ExpiredSessionInfo{
+				Account:    s.Account,
+				MId:        s.MId,
+				ClientIP:   s.ClientIP,
+				StaleSecs:  now - s.LastHeartbeat,
+				GameConns:  len(s.GameProxyConnections),
+				ProxyConns: len(s.ProxyConnections),
+			})
 		}
 	}
 	for _, token := range toRemove {
@@ -685,7 +779,19 @@ func (sm *SessionManager) CleanExpiredSessions(timeoutSeconds int) int {
 	}
 	closeConns(conns)
 
-	return len(toRemove)
+	return len(toRemove), details
+}
+
+// CleanExpiredSessions 清理超时会话。
+//
+// 同 KickAccount：被清掉的会话挂着的代理连接要一并断开。
+// 不关的话，玩家客户端崩溃后代理 goroutine 还在双向 copy，
+// 只能等游戏侧 idle 超时（默认 1800s）才回收，资源回收凭空推迟半小时。
+//
+// 需要明细（账号 / 心跳停滞 / 当时是否在游戏内）时改用 CleanExpiredSessionsWithDetails。
+func (sm *SessionManager) CleanExpiredSessions(timeoutSeconds int) int {
+	n, _ := sm.CleanExpiredSessionsWithDetails(timeoutSeconds)
+	return n
 }
 
 // BonusAward 一轮泡点计费的结算结果。

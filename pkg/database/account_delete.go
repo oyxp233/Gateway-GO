@@ -34,6 +34,7 @@ type AccountDeletePreview struct {
 	Banned         bool   `json:"banned"`          // 是否在封禁表里
 	BonusLogs      int64  `json:"bonus_logs"`      // 注册奖励流水行数
 	AntiCheatRows  int64  `json:"anticheat_rows"`  // 反作弊检测行数
+	RegisterRows   int64  `json:"register_rows"`   // 注册流水（register_logs）行数
 	GameConfigured bool   `json:"game_configured"` // 游戏库是否已配置
 	GameAccount    bool   `json:"game_account"`    // 游戏库 accounts 是否有该账号
 	GameRoles      int    `json:"game_roles"`      // 游戏库 characters 存活角色数
@@ -82,6 +83,10 @@ func (db *Database) PreviewAccountDelete(name string) (*AccountDeletePreview, er
 	p.DeviceHistory = db.countRows("SELECT COUNT(*) FROM device_history WHERE m_id = ?", acc.MId)
 	p.BonusLogs = db.countRows("SELECT COUNT(*) FROM register_bonus_logs WHERE account = ?", name)
 	p.AntiCheatRows = db.countRows("SELECT COUNT(*) FROM anticheat_detections WHERE account = ?", name)
+	// 注册流水：既是审计信息，也是**注册限额的计数依据**（COUNT BY ip / machine_id）。
+	// 删号时默认保留它，所以删号**不会**返还该 IP / 机器码的当日配额（防刷语义上是对的）；
+	// 打开 purgeLogs 才连它一起清 —— 那是管理员显式的"重置这个 IP/机器的配额"动作。
+	p.RegisterRows = db.countRows("SELECT COUNT(*) FROM register_logs WHERE account = ?", name)
 	p.Banned = db.countRows("SELECT COUNT(*) FROM banned_accounts WHERE name = ?", name) > 0
 
 	p.GameConfigured = db.GameConfigured()
@@ -98,9 +103,16 @@ func (db *Database) PreviewAccountDelete(name string) (*AccountDeletePreview, er
 
 // DeleteAccount 永久删除账号（网关库 + 游戏库）。
 //
-// purgeLogs 为 true 时一并清掉 register_bonus_logs / anticheat_detections 里
-// 与该账号相关的流水；默认 false —— 审计流水属于"证据"，删账号不该顺手抹掉，
+// purgeLogs 为 true 时一并清掉 register_bonus_logs / anticheat_detections /
+// register_logs 里与该账号相关的流水；默认 false —— 审计流水属于"证据"，删账号不该顺手抹掉，
 // 只是接口会把它保留的行数回报给管理员。
+//
+// ★ 注意 register_logs 的双重身份（2026-10-13 接入）：
+//   - 作为**审计**：它记录了"哪个 IP / 哪台机器在什么时候注册了谁"；
+//   - 作为**注册限额的计数依据**：`CountRegistrationsByIPSince` / `CountRegistrationsByMachine`
+//     都直接 COUNT 这张表。所以清掉它 = **返还该 IP / 机器码的当日配额**。
+// 默认保留 ⇒ 删号不能用来刷配额（否则"注册→删→再注册"就能绕过限额）；
+// 需要重置配额（例如误伤了共用出口 IP 的正常玩家）时，由管理员显式打开 purgeLogs。
 //
 // 执行顺序（两库无法共用事务，故按"先动非权威库、后动权威库"排）：
 //  1. 预演 + 角色数校验 —— 有角色直接拒绝，一个字节都不写；
@@ -155,6 +167,10 @@ func (db *Database) DeleteAccount(name string, purgeLogs bool) (*AccountDeletePr
 		}
 		if _, err := tx.Exec("DELETE FROM anticheat_detections WHERE account = ?", preview.Account); err != nil {
 			return nil, fmt.Errorf("清理反作弊记录失败: %w", err)
+		}
+		// 一并清注册流水 ⇒ 该 IP / 机器码的当日配额随之释放（见函数头注释）。
+		if _, err := tx.Exec("DELETE FROM register_logs WHERE account = ?", preview.Account); err != nil {
+			return nil, fmt.Errorf("清理注册流水失败: %w", err)
 		}
 		preview.PurgedLogs = true
 	}

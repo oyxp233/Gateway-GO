@@ -74,10 +74,17 @@ func GenerateToken() (string, error) {
 }
 
 // GenerateDeviceSecret 生成设备密钥，返回 hex 字符串。
-func GenerateDeviceSecret() string {
+//
+// G-15（2026-10-08，审查报告）：原先忽略 rand.Read 的错误 —— 一旦它失败，
+// buf 保持**全零** ⇒ 所有账号拿到同一个设备密钥，设备绑定静默失效
+// （而且没有任何日志，看起来一切正常）。改成返回 error，由调用方拒绝签发：
+// 宁可让这次登录失败，也不能让"设备绑定"变成摆设。
+func GenerateDeviceSecret() (string, error) {
 	buf := make([]byte, 32)
-	rand.Read(buf)
-	return hex.EncodeToString(buf)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate device secret: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // CeraToBytes 将点券数量编码为 4 字节大端序字节数组。

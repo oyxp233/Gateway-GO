@@ -99,6 +99,14 @@ func seedAccount(t *testing.T, db *Database, name string) string {
 		VALUES ('test-rule', ?, 1, 1)`, name); err != nil {
 		t.Fatalf("插入反作弊记录失败: %v", err)
 	}
+	// 注册流水（register_logs）：它比其他两类多一层身份 —— 还是**注册限额的计数依据**。
+	// 插两条（同账号、不同 IP / 机器码），方便断言"默认保留 / purgeLogs 才清 / 清了就释放配额"。
+	if err := db.InsertRegistrationLog(name, mId, "127.0.0.1", "AA:BB:CC:DD:EE:01", NowUnix()); err != nil {
+		t.Fatalf("插入注册流水失败: %v", err)
+	}
+	if err := db.InsertRegistrationLog(name, mId, "127.0.0.2", "AA:BB:CC:DD:EE:02", NowUnix()); err != nil {
+		t.Fatalf("插入注册流水失败: %v", err)
+	}
 	return mId
 }
 
@@ -235,6 +243,13 @@ func TestDeleteAccount_RemovesBothSidesAndKeepsAuditByDefault(t *testing.T) {
 	if n := gatewayCount(t, db, "SELECT COUNT(*) FROM anticheat_detections WHERE account='tester'"); n != 1 {
 		t.Errorf("默认应保留反作弊记录，实际 %d", n)
 	}
+	// 注册流水同样默认保留 —— 所以删号**不返还**该 IP/机器码的当日配额（防刷）
+	if n := gatewayCount(t, db, "SELECT COUNT(*) FROM register_logs WHERE account='tester'"); n != 2 {
+		t.Errorf("默认应保留注册流水，实际 %d", n)
+	}
+	if p.RegisterRows != 2 {
+		t.Errorf("预演应统计到 2 条注册流水，实际 %d", p.RegisterRows)
+	}
 
 	// 幂等性：再删一次应报"不存在"，而不是静默成功
 	if _, err := db.DeleteAccount("tester", false); !errors.Is(err, ErrAccountDeleteNotFound) {
@@ -255,6 +270,44 @@ func TestDeleteAccount_PurgeLogs(t *testing.T) {
 	}
 	if n := gatewayCount(t, db, "SELECT COUNT(*) FROM anticheat_detections WHERE account='tester'"); n != 0 {
 		t.Errorf("要求清流水后仍有 %d 条反作弊记录", n)
+	}
+	if n := gatewayCount(t, db, "SELECT COUNT(*) FROM register_logs WHERE account='tester'"); n != 0 {
+		t.Errorf("要求清流水后仍有 %d 条注册流水", n)
+	}
+}
+
+// ★ purgeLogs 之所以要和另外两类流水分开说：**它是唯一有"配额副作用"的一类**。
+//
+// register_logs 同时是注册限额（同 IP 每日 N 个 / 同机器码累计 M 个）的计数依据：
+//   - 默认保留 ⇒ 删号不能用来刷配额（"注册→删→再注册"绕不过限额）；
+//   - purgeLogs ⇒ 该账号的流水被清 ⇒ **该 IP / 机器码的配额随之回落**，
+//     这正是"管理员误伤了共用出口 IP 的正常玩家、要手动放行"的处置手段。
+func TestDeleteAccount_PurgeLogsReleasesRegisterQuota(t *testing.T) {
+	db := newDeleteTestDB(t)
+
+	seedAccount(t, db, "tester")
+	if n, err := db.CountRegistrationsByIPSince("127.0.0.1", 0); err != nil || n != 1 {
+		t.Fatalf("前置：127.0.0.1 应有 1 条注册流水，实际 %d (err=%v)", n, err)
+	}
+
+	// 默认删号：流水留着 ⇒ 配额不动
+	if _, err := db.DeleteAccount("tester", false); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if n, _ := db.CountRegistrationsByIPSince("127.0.0.1", 0); n != 1 {
+		t.Errorf("默认保留注册流水 ⇒ 配额不应释放，实际 %d", n)
+	}
+
+	// purgeLogs 删号：流水一并清 ⇒ 配额释放
+	seedAccount(t, db, "tester2")
+	if n, _ := db.CountRegistrationsByIPSince("127.0.0.1", 0); n != 2 {
+		t.Fatalf("前置：清过一次后应累计 2 条，实际 %d", n)
+	}
+	if _, err := db.DeleteAccount("tester2", true); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if n, _ := db.CountRegistrationsByIPSince("127.0.0.1", 0); n != 1 {
+		t.Errorf("purgeLogs 后配额应回落，实际 %d", n)
 	}
 }
 
@@ -281,6 +334,9 @@ func TestDeleteAccount_RefusesWhenCharactersExist(t *testing.T) {
 	}
 	if n := gatewayCount(t, db, "SELECT COUNT(*) FROM register_bonus_logs WHERE account='tester'"); n != 1 {
 		t.Errorf("拒绝删除后流水不应被清理，实际 %d", n)
+	}
+	if n := gatewayCount(t, db, "SELECT COUNT(*) FROM register_logs WHERE account='tester'"); n != 2 {
+		t.Errorf("拒绝删除后注册流水不应被清理，实际 %d", n)
 	}
 	// 游戏库行挂在 m_id 上（不是账号名）
 	if n := gameCount(t, db, "SELECT COUNT(*) FROM accounts WHERE m_id=?", accountMId("tester")); n != 1 {

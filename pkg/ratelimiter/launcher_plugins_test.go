@@ -24,6 +24,12 @@ func TestPathGroupLauncherPlugins(t *testing.T) {
 		{"/api/launcher/plugin", "", "前缀边界：不是 /plugins 就不该命中"},
 		{"/api/launcher/pluginsXYZ", "", "前缀边界：/pluginsXYZ 不是 /plugins 的子路径"},
 		{"/api/launcher/plugins/file", GroupLauncherBinary, "裸目录路径也归下载桶"},
+		// PVF 增量包（2026-09-30）：与插件下载同桶 —— 两者都是启动阶段的一次性大文件，
+		// 且都与 policy 同前缀（/api/launcher/p...），别被误归进 launcher 桶。
+		{"/api/launcher/pvf/delta", GroupLauncherBinary, "PVF 增量包必须归下载桶"},
+		{"/api/launcher/pvf/delta/x", GroupLauncherBinary, "子路径同样归下载桶"},
+		{"/api/launcher/pvf", "", "前缀边界：裸 /pvf 不是下载路径"},
+		{"/api/launcher/pvfXYZ", "", "前缀边界：/pvfXYZ 不是 /pvf 的子路径"},
 	}
 	for _, c := range cases {
 		if got := PathGroup(c.path); got != c.want {

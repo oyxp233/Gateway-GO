@@ -365,6 +365,82 @@ func (db *Database) GetCurrencyTripleByMId(mId string) (cera, token, happy int64
 	return cera, token, happy, true
 }
 
+// CurrencyTriple 账号三币种余额（游戏库 accounts 表）。
+type CurrencyTriple struct {
+	Cera           int64
+	TokenCera      int64
+	HappyTokenCera int64
+}
+
+// GetCurrencyTriplesByMIds 批量取多个 m_id 的三币种余额（返回 m_id → 余额）。
+//
+// G-11（2026-10-04 审查）：AccountService.ListAccounts 原先在分页循环里逐行调
+// GetCurrencyTripleByMId ⇒ 翻一页（最多 500 行）就是 **500 次跨库查询**，
+// SQLite 单写者模型下会拖慢同机写入与心跳。这里照 QQNumbersByAccounts 的同一套路
+// 做 IN 分批批取（单条 SQL）。
+//
+// 语义与逐行版一致：不在返回 map 里 = 游戏库没有该 m_id 的行，调用方自行回退网关库镜像。
+// 查询出错时返回**已取到的部分**（并只记日志由调用方决定），不让账号列表整个失败 ——
+// 三币种是附加展示。
+func (db *Database) GetCurrencyTriplesByMIds(mIds []string) map[string]CurrencyTriple {
+	out := make(map[string]CurrencyTriple)
+	if !db.GameConfigured() || len(mIds) == 0 {
+		return out
+	}
+	// 去重 + 去空：IN 列表越短越快，也避免重复参数白占位。
+	seen := make(map[string]struct{}, len(mIds))
+	uniq := make([]string, 0, len(mIds))
+	for _, id := range mIds {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return out
+	}
+
+	const chunk = 500
+	for start := 0; start < len(uniq); start += chunk {
+		end := start + chunk
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		part := uniq[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(part)), ",")
+		args := make([]any, len(part))
+		for i, id := range part {
+			args[i] = id
+		}
+
+		rows, err := db.gameDB.Query(
+			"SELECT m_id, cera, token_cera, happy_token_cera FROM accounts WHERE m_id IN ("+placeholders+")",
+			args...)
+		if err != nil {
+			return out
+		}
+		for rows.Next() {
+			var id string
+			var t CurrencyTriple
+			if err := rows.Scan(&id, &t.Cera, &t.TokenCera, &t.HappyTokenCera); err != nil {
+				rows.Close()
+				return out
+			}
+			out[id] = t
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return out
+		}
+		rows.Close()
+	}
+	return out
+}
+
 // GetRolesByAccount 获取账号的角色列表。
 // 游戏库 characters 表：character_id, account_id, name, job, level, exp
 //
@@ -674,6 +750,45 @@ func (db *Database) GetCurrentRolesByMIds(mIds []string) (map[string]OnlineRoleC
 		}
 	}
 	return out, nil
+}
+
+// CurrentRoleName 按账号名解析「当前在玩的角色名」。
+//
+// 两步：账号名 → m_id（网关库）→ 当前角色（游戏库，characters.updated_at 最新的一条）。
+// 与「在线角色」接口（GetCurrentRolesByMIds）同一口径，只是把那条链封成一次调用，
+// 供外挂检测上报落库时补角色名 —— 上报只在有检测结果时才发，频率低，不必加缓存。
+//
+// 为什么角色名不在客户端取（2026-10-02 实测结论，别再试一遍）：
+//   - 参考/偏移.txt 里没有角色名偏移，只有账号基址 0x399A7C8 / 角色等级 0x3A3D4E4 /
+//     角色基质 0x3A5B348，而账号基址读出来是乱码 ⇒ 静态结构里的账号/角色名是**加密存放**的；
+//   - 明文只出现在堆上的 UI / 名字字典缓冲里（如 0x2929xxxx 那张 [id][len][GBK名][...] 表），
+//     但**全地址空间没有任何 4 字节对齐的指针指向它们** ⇒ 拿不到稳定偏移；
+//   - 客户端 VMProtect 加壳，也不能静态读 exe 反推。
+//
+// 所以角色名一律由服务端解析，不依赖客户端。
+//
+// 查不到时返回空串。**不要回退成账号名**：后台「角色」列需要靠「空」识别「未知」，
+// 把账号名填进去会让这一列失去区分能力，还会掩盖「解析失败」这个事实。
+func (db *Database) CurrentRoleName(account string) string {
+	if db == nil || strings.TrimSpace(account) == "" || !db.GameConfigured() {
+		return ""
+	}
+	mIds, err := db.GetMIdsByNames([]string{account})
+	if err != nil || len(mIds) == 0 {
+		return ""
+	}
+	mId := mIds[account]
+	if mId == "" {
+		return ""
+	}
+	roles, err := db.GetCurrentRolesByMIds([]string{mId})
+	if err != nil {
+		return ""
+	}
+	if c, ok := roles[mId]; ok {
+		return strings.TrimSpace(c.Name)
+	}
+	return ""
 }
 
 // ResolveMIdByCharacterID 反查角色所属账号的 m_id。

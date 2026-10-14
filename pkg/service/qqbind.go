@@ -14,6 +14,7 @@ import (
 	"s4a21-gateway/pkg/logger"
 	"s4a21-gateway/pkg/models"
 	"s4a21-gateway/pkg/notify"
+	"s4a21-gateway/pkg/security"
 )
 
 // ────────────────────────────────────────────────────────────────────────
@@ -418,7 +419,11 @@ func (s *QQBindService) Bind(account, qqNumber, code, clientIP string) (int, str
 		return models.Err.VerifyCodeAttemptsExceed, "验证码错误次数过多，请重新获取"
 	}
 
-	if database.HashVerifyCode(qqNumber, database.PurposeQQBind, code) != hash {
+	// G-17（2026-10-08，审查报告）：改成恒定时间比较。
+	// 上面已经有次数上限（maxVerifyCodeAttempts）兜着，单点风险低；但同一份代码里
+	// 别处都用 security.ConstantTimeEquals，唯独这里用 `!=` 属口径不统一 ——
+	// 哪天有人把次数上限调大或挪走，这条就变成真的时序泄漏了。
+	if !security.ConstantTimeEquals(database.HashVerifyCode(qqNumber, database.PurposeQQBind, code), hash) {
 		if err := s.db.BumpVerifyCodeAttempts(vc.ID); err != nil && s.logger != nil {
 			s.logger.Warn(fmt.Sprintf("累加验证码错误次数失败: id=%d err=%v", vc.ID, err))
 		}

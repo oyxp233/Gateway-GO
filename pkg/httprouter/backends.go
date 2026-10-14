@@ -144,6 +144,20 @@ type LauncherView struct {
 	UpdateNotice string `json:"update_notice"`
 }
 
+// RegisterLimitView 注册限额的当前状态（2026-10-13）。
+//
+// 权威值同样在**网关进程内存里**：判定发生在 TCP 侧的注册命令处理路径上。
+// 双进程模式下 admin 进程只能经 /internal/runtime-config 读写它。
+//
+// json tag 同时被内部 API 与远端后端复用，改这里等于改协议。
+// 用指针表示"该项不改"（与 SetLauncher 同一约定），所以读出来的是值、
+// 下发的是指针。
+type RegisterLimitView struct {
+	Enabled     bool `json:"enabled"`
+	PerIPPerDay int  `json:"per_ip_per_day"`
+	PerMachine  int  `json:"per_machine"`
+}
+
 // RuntimeConfigBackend 抽象网关进程内存里的可变配置。
 type RuntimeConfigBackend interface {
 	Launcher() (LauncherView, error)
@@ -153,6 +167,10 @@ type RuntimeConfigBackend interface {
 	Maintenance() (MaintenanceView, error)
 	// SetMaintenance 更新维护模式；开启时踢掉非管理员会话并返回被踢数量。
 	SetMaintenance(enabled *bool, message *string, admins []string) (kicked int, err error)
+
+	RegisterLimit() (RegisterLimitView, error)
+	// SetRegisterLimit 更新注册限额（nil 表示该字段不动），返回是否有变更。
+	SetRegisterLimit(enabled *bool, perIPPerDay, perMachine *int) (changed bool, err error)
 }
 
 // ============================================================================
@@ -320,10 +338,12 @@ func (b *localRuntimeConfigBackend) Launcher() (LauncherView, error) {
 	if b.cfg == nil {
 		return LauncherView{}, fmt.Errorf("配置未加载")
 	}
+	// G-5：读运行时可变段一律走快照（锁内拷贝），别直接摸 b.cfg.Launcher.*。
+	snap := b.cfg.LauncherSnapshot()
 	return LauncherView{
-		MinVersion:   b.cfg.Launcher.MinVersion,
-		DownloadURL:  b.cfg.Launcher.DownloadUrl,
-		UpdateNotice: b.cfg.Launcher.UpdateNotice,
+		MinVersion:   snap.MinVersion,
+		DownloadURL:  snap.DownloadUrl,
+		UpdateNotice: snap.UpdateNotice,
 	}, nil
 }
 
@@ -336,15 +356,12 @@ func (b *localRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateN
 	launcherUpdates := make(map[string]interface{})
 	if minVersion != nil {
 		launcherUpdates["MinVersion"] = *minVersion
-		b.cfg.Launcher.MinVersion = *minVersion
 	}
 	if downloadURL != nil {
 		launcherUpdates["DownloadUrl"] = *downloadURL
-		b.cfg.Launcher.DownloadUrl = *downloadURL
 	}
 	if updateNotice != nil {
 		launcherUpdates["UpdateNotice"] = *updateNotice
-		b.cfg.Launcher.UpdateNotice = *updateNotice
 	}
 	if len(launcherUpdates) == 0 {
 		return false, nil
@@ -356,6 +373,11 @@ func (b *localRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateN
 			return false, err
 		}
 	}
+	// G-5（2026-10-04 审查）：原先这里直接改 b.cfg.Launcher.*，与认证侧（版本门禁）
+	// 和 HTTP 侧（policy/notice）的并发读构成数据竞争。改走锁内原语。
+	// 顺序也调整为「先落盘、成功后再更新内存」—— 落盘失败时不留下"内存已改、
+	// 重启还原"的不一致状态。
+	b.cfg.SetLauncherRuntime(minVersion, downloadURL, updateNotice)
 	return true, nil
 }
 
@@ -363,10 +385,12 @@ func (b *localRuntimeConfigBackend) Maintenance() (MaintenanceView, error) {
 	if b.cfg == nil {
 		return MaintenanceView{}, fmt.Errorf("配置未加载")
 	}
+	// G-5：快照读取（AdminAccounts 已做切片拷贝，可安全遍历）。
+	snap := b.cfg.MaintenanceSnapshot()
 	return MaintenanceView{
-		Enabled:       b.cfg.Maintenance.Enabled,
-		Message:       b.cfg.Maintenance.Message,
-		AdminAccounts: b.cfg.Maintenance.AdminAccounts,
+		Enabled:       snap.Enabled,
+		Message:       snap.Message,
+		AdminAccounts: snap.AdminAccounts,
 	}, nil
 }
 
@@ -374,22 +398,75 @@ func (b *localRuntimeConfigBackend) SetMaintenance(enabled *bool, message *strin
 	if b.cfg == nil {
 		return 0, fmt.Errorf("配置未加载")
 	}
-	if enabled != nil {
-		b.cfg.Maintenance.Enabled = *enabled
-	}
-	if message != nil {
-		b.cfg.Maintenance.Message = *message
-	}
-	if admins != nil {
-		b.cfg.Maintenance.AdminAccounts = admins
-	}
+	// G-5（2026-10-04 审查）：原先直接改 b.cfg.Maintenance.*，且紧接着
+	// `if b.cfg.Maintenance.Enabled` 是**未加锁读同一批字段**。这里改为
+	// 锁内写入 + 锁后快照判定，踢人用的是与判定一致的那份值。
+	b.cfg.SetMaintenanceRuntime(enabled, message, admins)
+	snap := b.cfg.MaintenanceSnapshot()
 
 	// 开启维护模式时踢掉非管理员会话
-	if b.cfg.Maintenance.Enabled && b.sessions != nil {
-		kicked, _ := b.sessions.KickNonAdmin(b.cfg.Maintenance.AdminAccounts)
+	if snap.Enabled && b.sessions != nil {
+		kicked, _ := b.sessions.KickNonAdmin(snap.AdminAccounts)
 		return kicked, nil
 	}
 	return 0, nil
+}
+
+func (b *localRuntimeConfigBackend) RegisterLimit() (RegisterLimitView, error) {
+	if b.cfg == nil {
+		return RegisterLimitView{}, fmt.Errorf("配置未加载")
+	}
+	// 与 Launcher 同款：读运行时可变段一律走快照（锁内拷贝）。
+	snap := b.cfg.RegisterLimitSnapshot()
+	return RegisterLimitView{
+		Enabled:     snap.Enabled,
+		PerIPPerDay: snap.PerIPPerDay,
+		PerMachine:  snap.PerMachine,
+	}, nil
+}
+
+func (b *localRuntimeConfigBackend) SetRegisterLimit(enabled *bool, perIPPerDay, perMachine *int) (bool, error) {
+	if b.cfg == nil {
+		return false, fmt.Errorf("配置未加载")
+	}
+	if enabled == nil && perIPPerDay == nil && perMachine == nil {
+		return false, nil
+	}
+
+	// 值域校验放在落盘**之前**：负数或荒谬的大数一旦写进 override 文件，
+	// 下次启动会被原样读回，重启也修不好，只能手改文件。
+	// 0 是合法值（= 该维度不限制），负数是笔误，超过 10000 显然不是本意。
+	for _, v := range []struct {
+		name string
+		p    *int
+	}{{"PerIPPerDay", perIPPerDay}, {"PerMachine", perMachine}} {
+		if v.p == nil {
+			continue
+		}
+		if *v.p < 0 || *v.p > 10000 {
+			return false, fmt.Errorf("%s 取值必须在 0~10000 之间（0 = 不限制该维度）", v.name)
+		}
+	}
+
+	// 与 SetLauncher 同序：先落盘 override，成功后再改内存 ——
+	// 落盘失败时不留下"内存已改、重启还原"的不一致。
+	limitUpdates := make(map[string]interface{})
+	if enabled != nil {
+		limitUpdates["Enabled"] = *enabled
+	}
+	if perIPPerDay != nil {
+		limitUpdates["PerIPPerDay"] = *perIPPerDay
+	}
+	if perMachine != nil {
+		limitUpdates["PerMachine"] = *perMachine
+	}
+	if b.editor != nil {
+		if err := b.editor.SaveOverride(map[string]interface{}{"RegisterLimit": limitUpdates}); err != nil {
+			return false, err
+		}
+	}
+	b.cfg.SetRegisterLimitRuntime(enabled, perIPPerDay, perMachine)
+	return true, nil
 }
 
 // ============================================================================
@@ -460,4 +537,10 @@ func (b *unavailableRuntimeConfigBackend) Maintenance() (MaintenanceView, error)
 }
 func (b *unavailableRuntimeConfigBackend) SetMaintenance(*bool, *string, []string) (int, error) {
 	return 0, fmt.Errorf("运行时配置不可用：%s", b.reason)
+}
+func (b *unavailableRuntimeConfigBackend) RegisterLimit() (RegisterLimitView, error) {
+	return RegisterLimitView{}, fmt.Errorf("运行时配置不可用：%s", b.reason)
+}
+func (b *unavailableRuntimeConfigBackend) SetRegisterLimit(*bool, *int, *int) (bool, error) {
+	return false, fmt.Errorf("运行时配置不可用：%s", b.reason)
 }

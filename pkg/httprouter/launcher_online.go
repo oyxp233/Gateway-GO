@@ -28,13 +28,15 @@ const launcherOnlineCacheTTL = 5 * time.Second
 // 配置源是网关进程内存里的 config.Launcher.UpdateNotice（管理后台「客户端配置」页维护），
 // 改完立刻生效，不需要重启网关，也不需要重启登录器。
 func (s *Server) handleLauncherNotice(w http.ResponseWriter, r *http.Request) {
-	notice := strings.TrimSpace(s.config.Launcher.UpdateNotice)
+	// G-5（2026-10-04 审查）：Launcher 段由管理后台在运行中改写，读走快照。
+	lz := s.config.LauncherSnapshot()
+	notice := strings.TrimSpace(lz.UpdateNotice)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":            true,
 		"update_notice": notice,
 		// 一并带上版本策略，登录器可以只发一次请求拿到全部展示所需信息
-		"min_version":  s.config.Launcher.MinVersion,
-		"download_url": s.config.Launcher.DownloadUrl,
+		"min_version":  lz.MinVersion,
+		"download_url": lz.DownloadUrl,
 		"server_time":  time.Now().UTC().Unix(),
 	})
 }

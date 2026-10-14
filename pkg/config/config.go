@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // OverrideFileName 是热更新配置文件的名称，优先于 appsettings.json。
@@ -61,9 +62,102 @@ type GatewayConfig struct {
 	Tls            TlsSection            `json:"Tls"`
 	Heartbeat      HeartbeatSection      `json:"Heartbeat"`
 	Device         DeviceSection         `json:"Device"`
+	RegisterLimit  RegisterLimitSection  `json:"RegisterLimit"`
 	Server         ServerSection         `json:"Server"`
 	GatewayControl GatewayControlSection `json:"GatewayControl"`
 	Maintenance    MaintenanceSection    `json:"Maintenance"`
+
+// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit）——
+// 这几段会被管理后台在运行中改写（httprouter 的 runtimeConfigBackend），
+// 而认证侧（auth 的版本门禁、注册限额判定）与 HTTP 侧（policy/notice/update 端点）在并发读。
+	//
+	// G-5（2026-10-04 审查）：原先全程无锁 —— 管理员开维护模式的同时有玩家登录，
+	// 可能读到**撕裂的切片头**（Maintenance.AdminAccounts）而崩溃，或读到半改的门禁值。
+	// 只对这几个字段加锁；其余字段是启动时定型、之后只读，不进锁。
+	//
+	// 注意：本结构体因此**不可按值拷贝**（vet copylocks）。全仓均以 *GatewayConfig 传递。
+	runtimeMu sync.RWMutex
+}
+
+// LauncherSnapshot 返回 Launcher 段的运行时快照（并发安全）。
+func (c *GatewayConfig) LauncherSnapshot() LauncherSection {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	return c.Launcher
+}
+
+// MaintenanceSnapshot 返回 Maintenance 段的运行时快照（并发安全）。
+//
+// AdminAccounts 额外做一次切片拷贝：它会被后台整体替换（SetMaintenanceRuntime），
+// 直接返回共享底层会让调用方在遍历时读到被替换后的元素 —— 正是 G-5 说的"撕裂"。
+func (c *GatewayConfig) MaintenanceSnapshot() MaintenanceSection {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	out := c.Maintenance
+	if c.Maintenance.AdminAccounts != nil {
+		out.AdminAccounts = append([]string(nil), c.Maintenance.AdminAccounts...)
+	}
+	return out
+}
+
+// SetLauncherRuntime 在锁内更新 Launcher 段的运行时可变字段（传 nil = 不改该项）。
+func (c *GatewayConfig) SetLauncherRuntime(minVersion, downloadURL, updateNotice *string) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if minVersion != nil {
+		c.Launcher.MinVersion = *minVersion
+	}
+	if downloadURL != nil {
+		c.Launcher.DownloadUrl = *downloadURL
+	}
+	if updateNotice != nil {
+		c.Launcher.UpdateNotice = *updateNotice
+	}
+}
+
+// SetMaintenanceRuntime 在锁内更新 Maintenance 段的运行时可变字段（传 nil = 不改该项）。
+// admins 落库时做一次拷贝：调用方可能复用该切片。
+func (c *GatewayConfig) SetMaintenanceRuntime(enabled *bool, message *string, admins []string) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if enabled != nil {
+		c.Maintenance.Enabled = *enabled
+	}
+	if message != nil {
+		c.Maintenance.Message = *message
+	}
+	if admins != nil {
+		c.Maintenance.AdminAccounts = append([]string(nil), admins...)
+	}
+}
+
+// RegisterLimitSnapshot 返回注册限额段的运行时快照（并发安全）。
+//
+// 注册是 TCP 侧高频路径（每次登录器点「注册」都会读一次），必须走快照而不是
+// 直接摸 c.RegisterLimit.* —— 管理员在后台改限额的同时有玩家注册，无锁读会
+// 读到半改的值（-race 下直接报数据竞争）。
+func (c *GatewayConfig) RegisterLimitSnapshot() RegisterLimitSection {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	return c.RegisterLimit
+}
+
+// SetRegisterLimitRuntime 在锁内更新注册限额段的运行时可变字段（传 nil = 不改该项）。
+//
+// 顺序约定与 SetLauncher 一致：由调用方**先落盘 override、成功后再调本函数**，
+// 避免落盘失败时留下"内存已改、重启还原"的不一致。
+func (c *GatewayConfig) SetRegisterLimitRuntime(enabled *bool, perIPPerDay, perMachine *int) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if enabled != nil {
+		c.RegisterLimit.Enabled = *enabled
+	}
+	if perIPPerDay != nil {
+		c.RegisterLimit.PerIPPerDay = *perIPPerDay
+	}
+	if perMachine != nil {
+		c.RegisterLimit.PerMachine = *perMachine
+	}
 }
 
 type GatewaySection struct {
@@ -113,7 +207,27 @@ type GameServerSection struct {
 	FirstReadTimeoutSeconds      int      `json:"FirstReadTimeoutSeconds"`
 	IdleTimeoutSeconds           int      `json:"IdleTimeoutSeconds"`
 	BackendConnectTimeoutSeconds int      `json:"BackendConnectTimeoutSeconds"`
-	LaunchArgsFormat             string   `json:"LaunchArgsFormat"`
+
+	// TcpKeepAliveSeconds 是 Game/Channel 代理两端 TCP 连接的保活探测周期（秒）。
+	// 0 或负数 = 不开 SO_KEEPALIVE（保持历史行为）。
+	//
+	// ★ 为什么必须有：IdleTimeoutSeconds 只看「有没有应用层数据」，
+	// 而客户端被强杀 / 崩溃 / 断网时 TCP 不会收到 FIN —— 那条半开连接会
+	// 一直占着 MaxConnectionsPerIP 的槽位，直到 IdleTimeoutSeconds（默认 1800s
+	// = 30 分钟）用尽才释放。实测症状：玩家关掉游戏后重开，仍然被
+	// 「单 IP 并发已达上限」拒之门外（2026-10-13 新机双开测试）。
+	//
+	// keepalive 是**传输层**探活：只要对端主机还在、网络还通就会回 ACK，
+	// 所以纯挂机（不发游戏包）的玩家不会被误踢 —— 这正是它比「直接调小
+	// IdleTimeoutSeconds」安全的地方。探测失败后 socket 被置错，
+	// copyWithTimeout 的读会返回错误 ⇒ 连接关闭 ⇒ 槽位立刻释放。
+	//
+	// 实际判死耗时 = TcpKeepAliveSeconds × (1 + net.ipv4.tcp_keepalive_probes)。
+	// Go 的 SetKeepAlivePeriod 会同时设置 TCP_KEEPIDLE 与 TCP_KEEPINTVL，
+	// 探测次数仍取系统默认（通常 9）。部署脚本把该值调到 3 ⇒ 60s 时约 4 分钟。
+	TcpKeepAliveSeconds int `json:"TcpKeepAliveSeconds"`
+
+	LaunchArgsFormat string `json:"LaunchArgsFormat"`
 
 	// ProxyProtocol 控制是否在转发任何客户端字节**之前**，先向后端写一行
 	// PROXY protocol v1 头：
@@ -134,7 +248,38 @@ type GameServerSection struct {
 }
 
 type PvfSection struct {
+	// FilePath 是**客户端基准 PVF** 的路径 —— 网关侧保存的那份，客户端校验与
+	// 增量更新全部以它为准（`/api/pvf/info` 的指纹、`/api/launcher/policy` 下发
+	// 的 hash、增量包、版本历史）。
+	//
+	// ★★ 它**不是**服务端 DfoServer 读的那份。服务端 PVF 由 Server.PvfPath /
+	// Server.WorkDir 推导（见 ServerManager.resolvePvfPath），两者必须是**不同文件**：
+	//   · 客户端基准（本字段）：将来可换成加密版，随整包/增量发给玩家
+	//   · 服务端 PVF（Server 段）：始终明文，只在本机使用
+	// 两者指向同一文件时，「替换服务端 PVF」会覆盖客户端的增量基线 .bak，
+	// 生成「新版→新版」的自差分，导致旧版客户端全部进不去
+	//（2026-09-30 线上事故；handleAdminServerPvf 已加硬守卫拒绝该配置下的写入）。
 	FilePath string `json:"FilePath"`
+
+	// DeltaDir 是 PVF 增量包目录，相对网关运行目录（默认 "./pvf_delta"）。
+	//
+	// 上传新 PVF 时自动生成「上一版 → 当前版」的 delta 放在这里，
+	// 由 /api/launcher/pvf/delta 下发给登录器做增量更新。
+	// 固定增量只保留最新一份（current.delta）；「更老版本 → 当前版」的
+	// 按需增量按 from_<HASH>.delta 缓存在同一目录，上传新版时全部作废清除。
+	DeltaDir string `json:"DeltaDir"`
+
+	// HistoryDir 是 PVF 历史版本目录（默认 "./pvf_history"）。
+	//
+	// 内容寻址存储：每个出现过的版本一份 <大写SHA-256>.pvf + index.json 元数据
+	//（显示名 / 上传时间 / 原文件名）。两处用途：
+	//  1. 管理后台「版本历史」表 + 回退功能（回退走完整 ReplacePvf 链路）
+	//  2. /api/launcher/pvf/delta?from=<hash> 按需生成「任意历史版 → 当前版」增量
+	HistoryDir string `json:"HistoryDir"`
+
+	// HistoryKeep 是历史保留版数上限（默认 20，约 1.5 GB）。超出删最老；
+	// 当前版与 .bak（固定 delta 基线）永不删。0 取默认。
+	HistoryKeep int `json:"HistoryKeep"`
 }
 
 type LauncherSection struct {
@@ -175,6 +320,41 @@ type LauncherSection struct {
 	// 用 *bool 而不是 bool：现网 appsettings.json 里没有这个键，
 	// 用 bool 会把"没配"读成 false，等于把功能默认关掉。
 	PluginEnabled *bool `json:"PluginEnabled"`
+
+	// UpdateDir 是登录器更新分发目录，相对网关运行目录（默认 "./launcher_update"）。
+	//
+	// 布局（2026-10-01 自更新）：
+	//
+	//	launcher_update/current.exe            当前版本全量（按需 delta 的 to 源）
+	//	launcher_update/history/<HASH>.exe     历史版本（内容寻址）
+	//	launcher_update/history/index.json     版本记录（version/name/filename）
+	//	launcher_update/delta/from_<HASH>.delta 按需增量缓存（换版即清）
+	//
+	// 与插件目录同模式：纯文件系统、无网关内存态，gateway(8080 下发) 与
+	// admin(8443 上传) 两个进程共用同一目录，不需要 backends 抽象。
+	UpdateDir string `json:"UpdateDir"`
+
+	// UpdateKeep 是登录器历史保留版数上限（默认 4）。
+	//
+	// ★ 与 PVF 的 HistoryKeep=20 不同量级：登录器一版约 134 MB，20 版 = 2.7 GB，
+	// 会把磁盘吃穿。4 版 ≈ 540 MB，覆盖「当前 + 最近三版」—— 比最老历史还老的
+	// 客户端自动回退全量下载，功能不丢，只是慢一次。
+	UpdateKeep int `json:"UpdateKeep"`
+
+	// UpdateEnabled 是登录器自更新总开关。**缺省（nil）视为开。**
+	//
+	// 置 false 时 /api/launcher/update 仍返回 200，但带 enabled=false，
+	// 登录器据此跳过全部检查逻辑 —— 自更新出问题时的**一键回滚开关**，
+	// 改 appsettings.json + 重启即可，不动任何已分发文件。
+	UpdateEnabled *bool `json:"UpdateEnabled"`
+}
+
+// LauncherUpdateEnabled 返回登录器自更新总开关的生效值（缺省视为开）。
+func (c *GatewayConfig) LauncherUpdateEnabled() bool {
+	if c.Launcher.UpdateEnabled == nil {
+		return true
+	}
+	return *c.Launcher.UpdateEnabled
 }
 
 // LauncherPluginEnabled 返回插件下发总开关的生效值（缺省视为开）。
@@ -214,6 +394,21 @@ type TokenSection struct {
 type HeartbeatSection struct {
 	TimeoutSeconds       int `json:"TimeoutSeconds"`
 	CheckIntervalSeconds int `json:"CheckIntervalSeconds"`
+	// StaleForceSeconds 掉线重连自动放行阈值（2026-10-10）。
+	//
+	// 玩家掉线后重开登录器登录，旧会话往往还没到 TimeoutSeconds，于是撞 1023
+	// 被弹窗拦住 —— 人不在电脑前就一直进不去。这里给一个**更短的**判据：
+	// 旧会话心跳已停滞超过本值，且新登录来自**同一台机器**（同 IP 或同
+	// device_secret）⇒ 判定为掉线重连，直接踢旧会话放行，不再弹窗。
+	//
+	// 语义边界（改动前务必读）：
+	//  - 必须**同时**满足"心跳停滞"与"同端"，缺一不可。只满足前者而 IP/设备
+	//    不同 = 异地顶号，仍然走 1023 弹窗，顶号保护不受影响。
+	//  - 取值必须 **小于 TimeoutSeconds**（否则会话早被清理轮清掉了，这条
+	//    逻辑永远跑不到），又必须 **大于登录器心跳周期**（161/216 上都是
+	//    30 秒）才不会把"丢了一次心跳的活人"误判成僵尸。
+	//  - **0 或负数 = 关闭**，退回原来的"一律弹窗"行为。
+	StaleForceSeconds int `json:"StaleForceSeconds"`
 }
 
 type DeviceSection struct {
@@ -223,6 +418,39 @@ type DeviceSection struct {
 	EnforceBinding          bool   `json:"EnforceBinding"`
 	AlertWebhook            string `json:"AlertWebhook"`
 }
+
+// RegisterLimitSection 是注册限额（反批量注册）配置段（2026-10-13）。
+//
+// 目的：挡掉"一个人用脚本批量刷号"这类行为，不追求不可绕过 —— 客户端上报的
+// 机器码一律可伪造，这里定位是**提高成本**而不是绝对封死。
+//
+// 三条判据各自独立、命中即拒：
+//   - PerIPPerDay：同一来源 IP 每个自然日最多注册几个（0 = 不限制这一维）。
+//   - PerMachine：同一机器码累计最多注册几个（0 = 不限制这一维）。
+//   - Enabled：总开关，false 时两条判据都不生效（一键回滚用）。
+//
+// 语义边界（改动前务必读）：
+//   - 「当日」按**网关进程所在时区**的零点切分（与 QQ 绑定验证码日额度同一口径，
+//     见 service.startOfToday），不是 UTC —— 否则限流会在北京时间早上 8 点重置。
+//   - 机器码**缺失**（老登录器不带该字段）时只按 IP 判，**不参与机器计数**。
+//     绝不能把缺失值当成同一个空机器码去计数，那会让所有老登录器共用一个配额，
+//     全服瞬间注册不了。
+//   - 只统计**本次上线之后**的注册流水（register_logs）。存量账号没有历史 IP/机器码，
+//     不回溯，也不占配额。
+type RegisterLimitSection struct {
+	Enabled     bool `json:"Enabled"`
+	PerIPPerDay int  `json:"PerIPPerDay"`
+	PerMachine  int  `json:"PerMachine"`
+}
+
+// DefaultPerIPPerDay / DefaultPerMachine 是注册限额的默认值。
+//
+// 抽成常量而不是只写在 DefaultConfig 里：service 层判定时要在"配置里写了 0 /
+// 没写"之间给出一致口径，散落的字面量迟早对不上。
+const (
+	DefaultPerIPPerDay = 2
+	DefaultPerMachine  = 5
+)
 
 type TlsSection struct {
 	Enabled      bool   `json:"Enabled"`
@@ -236,6 +464,9 @@ type ServerSection struct {
 	Unit                   string `json:"Unit"`
 	WorkDir                string `json:"WorkDir"`
 	PvfPath                string `json:"PvfPath"`
+	// ★ PvfPath 是**服务端使用的** PVF（明文，DfoServer 读的那份），与
+	// Pvf.FilePath（网关侧的客户端基准）是两件事，必须指向不同文件。
+	// 留空时按 WorkDir 推导（见 ServerManager.resolvePvfPath）。
 	LogPath                string `json:"LogPath"`
 	AuctionBotDataDir      string `json:"AuctionBotDataDir"`
 	BackupDir              string `json:"BackupDir"`
@@ -324,12 +555,22 @@ func DefaultConfig() *GatewayConfig {
 			FirstReadTimeoutSeconds:      30,
 			IdleTimeoutSeconds:           1800,
 			BackendConnectTimeoutSeconds: 10,
+			TcpKeepAliveSeconds:          60,
 			LaunchArgsFormat:             DefaultLaunchArgsFormat,
 			// 缺省关：服务端先具备识别能力后再显式改成 "v1"。
 			ProxyProtocol: "off",
 		},
 		Pvf: PvfSection{
+			// 客户端基准（网关侧保存），相对网关运行目录 ⇒ 默认 /opt/gateway/Data/Pvf/Script.pvf。
+			// ★ 服务端那份在 Server.WorkDir 下（默认识别不到就由运维配 Server.PvfPath），
+			//   两者必须不同文件 —— 见 PvfSection.FilePath 的注释。
 			FilePath: "./Data/Pvf/Script.pvf",
+			// 相对网关运行目录。/opt/gateway/s4a21-gateway 的 CWD 是 /opt/gateway，
+			// 所以默认目录是 /opt/gateway/pvf_delta（与 ./plugins 同级）。
+			DeltaDir: "./pvf_delta",
+			// 历史版本目录与保留数，同上按网关运行目录解析。
+			HistoryDir: "./pvf_history",
+			HistoryKeep: 20,
 		},
 		Launcher: LauncherSection{
 			MinVersion:  "2.0.0",
@@ -337,6 +578,10 @@ func DefaultConfig() *GatewayConfig {
 			// 相对网关运行目录。/opt/gateway/s4a21-gateway 的 CWD 是 /opt/gateway，
 			// 所以默认目录是 /opt/gateway/plugins。
 			PluginDir: "./plugins",
+			// 登录器更新分发目录，与 ./plugins 同级。HistoryKeep=4 的磁盘理由
+			// 见 LauncherSection.UpdateKeep 注释（每版约 134 MB）。
+			UpdateDir:  "./launcher_update",
+			UpdateKeep: 4,
 		},
 		// SMTP 默认关。开启需要同时满足：Enabled=true + Host + Username + 授权码
 		// （授权码走环境变量 S4A21_SMTP_PASS）。默认关是刻意的 ——
@@ -370,6 +615,8 @@ func DefaultConfig() *GatewayConfig {
 		Heartbeat: HeartbeatSection{
 			TimeoutSeconds:       60,
 			CheckIntervalSeconds: 30,
+			// 35 秒：> 登录器心跳周期 30s（容忍丢一次心跳）、< 会话超时 60s。
+			StaleForceSeconds: 35,
 		},
 		Device: DeviceSection{
 			MaxHistory:              10,
@@ -377,6 +624,11 @@ func DefaultConfig() *GatewayConfig {
 			RotationCooldownMinutes: 10,
 			EnforceBinding:          false,
 			AlertWebhook:            "",
+		},
+		RegisterLimit: RegisterLimitSection{
+			Enabled:     true,
+			PerIPPerDay: DefaultPerIPPerDay,
+			PerMachine:  DefaultPerMachine,
 		},
 		Tls: TlsSection{
 			Enabled:      false,

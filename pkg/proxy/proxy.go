@@ -19,6 +19,7 @@ import (
 
 	"s4a21-gateway/pkg/config"
 	"s4a21-gateway/pkg/logger"
+	"s4a21-gateway/pkg/safego"
 	"s4a21-gateway/pkg/security"
 	"s4a21-gateway/pkg/session"
 )
@@ -125,6 +126,11 @@ type ProxyServer struct {
 	firstReadTimeout   time.Duration
 	idleTimeout        time.Duration
 	backendConnTimeout time.Duration
+	// keepAlivePeriod 是代理两端 TCP 的 SO_KEEPALIVE 探测周期；<=0 表示不开。
+	// 它是**发现死连接**的唯一手段 —— 见 TcpKeepAliveSeconds 的注释：
+	// 客户端被强杀时不会有 FIN，半开连接只能靠它暴露，否则会一直占着
+	// MaxConnectionsPerIP 的槽位直到 IdleTimeoutSeconds 用尽。
+	keepAlivePeriod time.Duration
 }
 
 // NewProxyServer 创建代理服务器。
@@ -155,6 +161,12 @@ func NewProxyServer(
 		backendConnTimeout = 0
 	}
 
+	// <=0 视为「不开保活」，保持历史行为（缺省关）。
+	keepAlivePeriod := time.Duration(cfg.GameServer.TcpKeepAliveSeconds) * time.Second
+	if cfg.GameServer.TcpKeepAliveSeconds <= 0 {
+		keepAlivePeriod = 0
+	}
+
 	// 初始化端口集合
 	gamePorts := make(map[int]struct{})
 	for port := range gamePortMap {
@@ -177,6 +189,7 @@ func NewProxyServer(
 		firstReadTimeout:   firstReadTimeout,
 		idleTimeout:        idleTimeout,
 		backendConnTimeout: backendConnTimeout,
+		keepAlivePeriod:    keepAlivePeriod,
 	}
 	srv.ports.Store(initialView)
 	return srv
@@ -496,7 +509,9 @@ func (p *ProxyServer) acceptChannelLoop(listener net.Listener, cts chan struct{}
 		}
 
 		p.wg.Add(1)
-		go p.handleChannelClient(conn)
+		// G-1（2026-10-04 审查）：裸 goroutine，panic 会打挂整个网关进程（= 全体掉线）。
+		// 见 pkg/safego 的说明。
+		safego.Go(p.logger, "proxy.handleChannelClient", func() { p.handleChannelClient(conn) })
 	}
 }
 
@@ -524,7 +539,10 @@ func (p *ProxyServer) acceptGameLoop(listener net.Listener, publicPort, backendP
 		}
 
 		p.wg.Add(1)
-		go p.handleGameClient(conn, publicPort, backendPort)
+		// G-1（2026-10-04 审查）：同 acceptChannelLoop —— 游戏端口代理 goroutine 也裸跑。
+		safego.Go(p.logger, "proxy.handleGameClient", func() {
+			p.handleGameClient(conn, publicPort, backendPort)
+		})
 	}
 }
 
@@ -577,6 +595,9 @@ func (p *ProxyServer) handleChannelClient(client net.Conn) {
 	// 先发送首包到后端
 	setNoDelay(backend, true)
 	setNoDelay(client, true)
+	// 客户端侧保活：强杀/崩溃/断网不会有 FIN，靠它让半开连接尽快被判死，
+	// 从而释放 MaxConnectionsPerIP 的槽位（而非死等 IdleTimeoutSeconds）。
+	setKeepAlive(client, p.keepAlivePeriod)
 	if p.proxyProtocolEnabled() {
 		if err := p.writeProxyHeader(
 			backend, client, p.config.Gateway.ProxyPort); err != nil {
@@ -654,6 +675,7 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 
 	setNoDelay(client, true)
 	setNoDelay(backend, true)
+	setKeepAlive(client, p.keepAlivePeriod)
 
 	// PROXY protocol：必须在转发客户端首包**之前**写入。服务端会把它读掉，
 	// 当作会话的真实远端地址 —— PK 场的 UDP 绑定校验、组队/副本下发给
@@ -871,11 +893,20 @@ func (p *ProxyServer) processChannelData(pending []byte, dst net.Conn) []byte {
 // connectBackendTo 连接到游戏后端的指定端口。
 func (p *ProxyServer) connectBackendTo(port int) (net.Conn, error) {
 	addr := net.JoinHostPort(p.config.GameServer.BackendHost, strconv.Itoa(port))
+	var conn net.Conn
+	var err error
 	if p.backendConnTimeout > 0 {
 		dialer := net.Dialer{Timeout: p.backendConnTimeout}
-		return dialer.Dial("tcp", addr)
+		conn, err = dialer.Dial("tcp", addr)
+	} else {
+		conn, err = net.Dial("tcp", addr)
 	}
-	return net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	// 后端侧同样开保活：服务端进程卡死/重启时，这条连接不会被无限期挂着。
+	setKeepAlive(conn, p.keepAlivePeriod)
+	return conn, nil
 }
 
 // connectBackend 连接到游戏后端 Channel 端口。
@@ -1044,6 +1075,35 @@ func setNoDelay(conn net.Conn, enabled bool) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(enabled)
 	}
+}
+
+// setKeepAlive 开启 TCP 保活探测，period > 0 时生效。
+//
+// ★ 它解决的是「半开连接永久占槽」：客户端被强杀 / 崩溃 / 拔网线时 TCP
+// 不会发 FIN，网关侧的连接会一直挂在那里，直到 IdleTimeoutSeconds（默认 1800s）
+// 用尽才释放 MaxConnectionsPerIP 的槽位 —— 玩家关掉游戏后重开仍被拒。
+// 开了保活后，死连接会在「探测周期 × 探测次数」内被内核判死，
+// 后续读立即返回错误 ⇒ 连接关闭 ⇒ 槽位马上释放。
+//
+// ★ 为什么不用「调小 IdleTimeoutSeconds」代替：那个超时看的是**有没有应用
+// 层数据**，纯挂机（站着不动、不发包）的玩家会被误踢；而 keepalive 是传输层
+// 探活，对端主机还在就会回 ACK，挂机玩家不受影响。
+//
+// 非 TCP 连接（测试里的 net.Pipe 等）静默跳过，不影响调用方。
+func setKeepAlive(conn net.Conn, period time.Duration) {
+	if period <= 0 {
+		return
+	}
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if err := tcpConn.SetKeepAlive(true); err != nil {
+		return
+	}
+	// 同时设置 TCP_KEEPIDLE 与 TCP_KEEPINTVL；探测次数取系统
+	// net.ipv4.tcp_keepalive_probes（部署脚本把它调到 3）。
+	_ = tcpConn.SetKeepAlivePeriod(period)
 }
 
 // getFd 已删除（2026-09-23）：会话登记改为直接持有 net.Conn，

@@ -193,6 +193,37 @@ func TestGetMIdsByNames(t *testing.T) {
 	}
 }
 
+// TestCurrentRoleName 按账号名解析「当前角色名」——外挂检测上报落库时补角色名走的就是它。
+//
+// 三条必须钉死的口径：
+//  1. 账号名 → m_id 这一步走**网关库**（游戏库角色是按 m_id 关联的），跨库不能一条 SQL 搞定；
+//  2. 取的是 updated_at 最新**且未删除**的角色，与在线角色接口同口径；
+//  3. 查不到时返回**空串**，绝不能回退成账号名 —— 后台「角色」列要靠「空」识别「未知」，
+//     填账号名会同时毁掉这一列的区分能力、并掩盖「解析失败」这个事实。
+func TestCurrentRoleName(t *testing.T) {
+	db := newOnlineTestDB(t)
+
+	if err := db.InsertAccount(&Account{
+		MId: "10038", Name: "msp", PwdHash: "h", Salt: "",
+		CreatedAt: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("插入网关账号失败: %v", err)
+	}
+
+	// 10038 名下有两个存活角色：500「兔兔」(updated_at 最新)、501「毒奶」(较早)，
+	// 外加 502「猫猫拳打你」已删除且 updated_at 全场最新。
+	if got := db.CurrentRoleName("msp"); got != "兔兔" {
+		t.Errorf("msp 的当前角色应为 兔兔（updated_at 最新的存活角色），实得 %q", got)
+	}
+
+	// 账号不存在 / 无角色 / 空输入：一律空串
+	for _, in := range []string{"2030", "99999", "查无此人", "", "   "} {
+		if got := db.CurrentRoleName(in); got != "" {
+			t.Errorf("输入 %q 应得空串（不得回退成账号名），实得 %q", in, got)
+		}
+	}
+}
+
 // TestListAccountsOrderedByCreatedAt 账号列表按注册时间正序（老账号在前），
 // 且必须把 created_at 带出来给前端显示。
 func TestListAccountsOrderedByCreatedAt(t *testing.T) {

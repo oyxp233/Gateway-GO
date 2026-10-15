@@ -32,10 +32,13 @@ type Server struct {
 	cert        *tls.Certificate
 	maxConns    int
 	idleTimeout int
-	shutdown    chan struct{}
-	wg          sync.WaitGroup
-	activeConns int
-	activeMu    sync.Mutex
+	// handshakeTimeout 是 TLS 握手专属超时（秒），独立于 idleTimeout。
+	// 取值见 resolveHandshakeTimeout；背景见 config.GatewaySection 的注释与 G-8 测试。
+	handshakeTimeout int
+	shutdown         chan struct{}
+	wg               sync.WaitGroup
+	activeConns      int
+	activeMu         sync.Mutex
 	// conns 是当前活跃连接集合（已做 TLS 包装的那份）。
 	//
 	// G-7（2026-10-04 审查）：ReadFrame 走 io.ReadFull 是**裸阻塞读**，
@@ -57,15 +60,16 @@ type CommandHandler interface {
 // NewServer 创建 TCP 认证服务器。
 func NewServer(cfg *config.GatewayConfig, handler CommandHandler, logger *logger.ConsoleLogger, cert *tls.Certificate) *Server {
 	return &Server{
-		config:      cfg,
-		handler:     handler,
-		logger:      logger,
-		rateLimiter: ratelimiter.NewRateLimiter(cfg.RateLimit.Enabled, cfg.RateLimit.RequestsPerMinute),
-		cert:        cert,
-		maxConns:    cfg.Gateway.TcpMaxConnections,
-		idleTimeout: cfg.Gateway.TcpIdleTimeoutSeconds,
-		shutdown:    make(chan struct{}),
-		conns:       make(map[net.Conn]struct{}),
+		config:           cfg,
+		handler:          handler,
+		logger:           logger,
+		rateLimiter:      ratelimiter.NewRateLimiter(cfg.RateLimit.Enabled, cfg.RateLimit.RequestsPerMinute),
+		cert:             cert,
+		maxConns:         cfg.Gateway.TcpMaxConnections,
+		idleTimeout:      cfg.Gateway.TcpIdleTimeoutSeconds,
+		handshakeTimeout: resolveHandshakeTimeout(cfg.Gateway.TcpHandshakeTimeoutSeconds),
+		shutdown:         make(chan struct{}),
+		conns:            make(map[net.Conn]struct{}),
 	}
 }
 
@@ -121,45 +125,71 @@ func (s *Server) acceptLoop() {
 			return
 		}
 
-		// TLS 握手（启用时）
-		if s.cert != nil {
-			tlsConn := tls.Server(conn, &tls.Config{
-				Certificates: []tls.Certificate{*s.cert},
-				MinVersion:   tls.VersionTLS12,
-			})
-			idle := time.Duration(s.idleTimeout) * time.Second
-			if idle > 0 {
-				tlsConn.SetDeadline(time.Now().Add(idle))
-			}
-			if err := tlsConn.Handshake(); err != nil {
-				s.logger.Warn(fmt.Sprintf("TLS 握手失败: %s: %v", GetRemoteIP(conn), err))
-				conn.Close()
-				continue
-			}
-			if idle > 0 {
-				tlsConn.SetDeadline(time.Time{})
-			}
-			conn = tlsConn
-		}
-
-		// 连接数上限检查
-		if s.maxConns > 0 && s.getActiveConns() >= s.maxConns {
-			remoteIP := GetRemoteIP(conn)
-			s.logger.Warn(fmt.Sprintf("认证连接数已达上限 %d，拒绝来自 %s 的新连接", s.maxConns, remoteIP))
-			conn.Close()
-			continue
-		}
-
+		// G-8（2026-10-15，正式服2 故障定型）：握手与后续处理全部移到
+		// per-connection goroutine。同步握手时，一个"连上但不发 ClientHello"的
+		// 连接能把 acceptLoop 卡住整个 TcpIdleTimeoutSeconds（线上 600s）——
+		// 期间新玩家 TCP 连得上（内核 backlog 照常接纳）却永远等不到 ServerHello，
+		// 登录器 20s 超时后批量报 L4002。回归见 server_handshake_test.go。
 		s.wg.Add(1)
-		s.activeMu.Lock()
-		s.activeConns++
-		s.conns[conn] = struct{}{}
-		s.activeMu.Unlock()
-		// G-1（2026-10-04 审查）：这里是**裸 goroutine**，panic 会直接打挂整个网关进程
-		// ⇒ 全体在线玩家瞬间掉线。net/http 的 handler 有标准库自带的兜底，这里没有，
-		// 必须显式 recover（只有这一处和 proxy 的两处 accept 循环需要）。
-		safego.Go(s.logger, "auth.handleClient", func() { s.handleClient(conn) })
+		safego.Go(s.logger, "auth.handleNewConn", func() { s.handleNewConn(conn) })
 	}
+}
+
+// DefaultTcpHandshakeTimeoutSeconds 是 TLS 握手超时的默认值（秒）。
+// 10s 足够覆盖跨网段的 TCP + TLS 握手；到期即失败，绝不像 idle 超时那样
+// 让一个沉默连接堵住整条 acceptLoop。
+const DefaultTcpHandshakeTimeoutSeconds = 10
+
+// resolveHandshakeTimeout 归一化握手超时：配置值 >0 时采用，否则用默认值。
+func resolveHandshakeTimeout(cfgValue int) int {
+	if cfgValue > 0 {
+		return cfgValue
+	}
+	return DefaultTcpHandshakeTimeoutSeconds
+}
+
+// handleNewConn 在独立 goroutine 里完成 TLS 握手、连接数上限检查，
+// 然后把连接交给 handleClient。单个慢/沉默连接只会占用自己的 goroutine，
+// 不再拖累 acceptLoop 与后续所有连接。
+func (s *Server) handleNewConn(conn net.Conn) {
+	defer s.wg.Done()
+
+	// TLS 握手（启用时）
+	if s.cert != nil {
+		tlsConn := tls.Server(conn, &tls.Config{
+			Certificates: []tls.Certificate{*s.cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+		hs := time.Duration(s.handshakeTimeout) * time.Second
+		if hs > 0 {
+			tlsConn.SetDeadline(time.Now().Add(hs))
+		}
+		if err := tlsConn.Handshake(); err != nil {
+			s.logger.Warn(fmt.Sprintf("TLS 握手失败: %s: %v", GetRemoteIP(conn), err))
+			conn.Close()
+			return
+		}
+		if hs > 0 {
+			tlsConn.SetDeadline(time.Time{})
+		}
+		conn = tlsConn
+	}
+
+	// 连接数上限检查
+	if s.maxConns > 0 && s.getActiveConns() >= s.maxConns {
+		remoteIP := GetRemoteIP(conn)
+		s.logger.Warn(fmt.Sprintf("认证连接数已达上限 %d，拒绝来自 %s 的新连接", s.maxConns, remoteIP))
+		conn.Close()
+		return
+	}
+
+	s.wg.Add(1)
+	s.activeMu.Lock()
+	s.activeConns++
+	s.conns[conn] = struct{}{}
+	s.activeMu.Unlock()
+	// G-1（2026-10-04 审查）：panic 兜底由 acceptLoop 里的 safego.Go 提供。
+	s.handleClient(conn)
 }
 
 func (s *Server) handleClient(conn net.Conn) {

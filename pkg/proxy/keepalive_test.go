@@ -42,7 +42,7 @@ func TestKeepAlivePeriodFromConfig(t *testing.T) {
 			cfg := config.DefaultConfig()
 			cfg.GameServer.TcpKeepAliveSeconds = tc.secs
 
-			srv := NewProxyServer(cfg, nil, nil, nil)
+			srv := NewProxyServer(cfg, nil, nil, nil, nil)
 			if got := srv.keepAlivePeriod; got != tc.want {
 				t.Fatalf("keepAlivePeriod = %v,  want %v (配置 %d 秒)", got, tc.want, tc.secs)
 			}

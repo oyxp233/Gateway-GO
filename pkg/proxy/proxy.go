@@ -19,6 +19,7 @@ import (
 
 	"s4a21-gateway/pkg/config"
 	"s4a21-gateway/pkg/logger"
+	"s4a21-gateway/pkg/models"
 	"s4a21-gateway/pkg/safego"
 	"s4a21-gateway/pkg/security"
 	"s4a21-gateway/pkg/session"
@@ -103,6 +104,21 @@ type ReloadResult struct {
 	Active map[int]int      `json:"active,omitempty"`
 }
 
+// GameCredentialVerifier 是游戏口首包凭证校验器（方案 D）。
+//
+// 由 service 层实现（AccountService.VerifyAccountCredential），proxy 包
+// 不直接依赖 database —— 密码判定全网关只有一个入口
+// （service.verifyAccountPassword，含迁移账号的「空 salt 直比 MD5」分支），
+// 游戏口必须复用它。
+//
+// 返回值三态：
+//   - (true, nil)  凭证匹配；
+//   - (false, nil) 确定不匹配（含网关库无此 m_id 的账号）；
+//   - (false, err) 无法验证（库故障等）—— 调用方必须回退旧行为，不得据此拒人。
+type GameCredentialVerifier interface {
+	VerifyAccountCredential(mId, pwdField string) (bool, error)
+}
+
 // ProxyServer 管理 Channel/Game 代理端口。
 type ProxyServer struct {
 	config             *config.GatewayConfig
@@ -126,6 +142,9 @@ type ProxyServer struct {
 	firstReadTimeout   time.Duration
 	idleTimeout        time.Duration
 	backendConnTimeout time.Duration
+	// gameAuth 是游戏口凭证校验器（方案 D）。nil = 口令路径不可用
+	// （仅 token 路径生效；生产环境由 cmd/gateway 注入 AccountService）。
+	gameAuth GameCredentialVerifier
 	// keepAlivePeriod 是代理两端 TCP 的 SO_KEEPALIVE 探测周期；<=0 表示不开。
 	// 它是**发现死连接**的唯一手段 —— 见 TcpKeepAliveSeconds 的注释：
 	// 客户端被强杀时不会有 FIN，半开连接只能靠它暴露，否则会一直占着
@@ -134,11 +153,15 @@ type ProxyServer struct {
 }
 
 // NewProxyServer 创建代理服务器。
+//
+// gameAuth 是游戏口首包凭证校验器（方案 D），传 nil 时口令路径不可用
+// （仅 token 路径生效，且任何"无法验证"都回退旧行为，不会据此拒人）。
 func NewProxyServer(
 	cfg *config.GatewayConfig,
 	sm *session.SessionManager,
 	logger *logger.ConsoleLogger,
 	portConfig *PortConfigStore,
+	gameAuth GameCredentialVerifier,
 ) *ProxyServer {
 	gamePortMap := cfg.GamePortMapResolved()
 
@@ -190,6 +213,7 @@ func NewProxyServer(
 		idleTimeout:        idleTimeout,
 		backendConnTimeout: backendConnTimeout,
 		keepAlivePeriod:    keepAlivePeriod,
+		gameAuth:           gameAuth,
 	}
 	srv.ports.Store(initialView)
 	return srv
@@ -635,21 +659,55 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 
 	remoteIP := GetRemoteIP(client)
 
-	// IP 白名单检查
-	if !p.sessionManager.IsIPAllowed(remoteIP) {
-		p.logger.Warn(fmt.Sprintf("拒绝非白名单 IP 的 Game 连接: %s -> %d", remoteIP, publicPort))
+	// 首包：尽量读齐一个完整帧。
+	//
+	// 为什么不再是"读一次就转发"（旧行为）：登录包被 TCP 分包切碎时只读到
+	// 前半段，m_id 解析必然失败（归属退化成按 IP）；方案 D 要拿首包做准入
+	// 判定，更必须按 header 里的 length 字段循环读齐。读不齐（超时/对端
+	// 沉默/帧长非法）时把已读字节交还后续逻辑，回退旧行为——不新增任何
+	// "杀连接"路径。
+	firstBuf, frameComplete := p.readFirstGamePacket(client, publicPort)
+	if len(firstBuf) == 0 {
+		// 与旧行为一致：首包窗口内一个字节都没收到 ⇒ 关闭代理连接
+		// （readFirstGamePacket 内部已打过日志）。
 		return
 	}
 
-	// 单 IP 并发上限
-	if !p.sessionManager.TryAcquireGameSlot(remoteIP, p.config.GameServer.MaxConnectionsPerIP) {
-		p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（单 IP 并发已达上限 %d）",
-			remoteIP, publicPort, p.config.GameServer.MaxConnectionsPerIP))
+	// 准入判定（方案 D：首包 m_id + 凭证；不满足则回退 IP 白名单或拒绝）
+	adm := p.admitGameClient(remoteIP, firstBuf, frameComplete)
+	if !adm.allowed {
+		if adm.reason == reasonIPNotAllowed {
+			// 保持旧日志措辞不变（监控/排障脚本按这行 grep）
+			p.logger.Warn(fmt.Sprintf("拒绝非白名单 IP 的 Game 连接: %s -> %d", remoteIP, publicPort))
+		} else {
+			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（%s）", remoteIP, publicPort, adm.reason))
+		}
 		return
 	}
-	// ★ 槽位 defer 必须紧跟 Acquire 注册：会话归属要等首包才定，后面还有若干
-	// return 路径（首包读取失败等），任何一条漏掉都会让该 IP 的并发额度被永久占住。
-	defer p.sessionManager.ReleaseGameSlot(remoteIP)
+
+	// 并发槽位，两个维度分开计：
+	//   · 凭证准入按 **m_id** 计——加速器/网吧/NAT 共享出口的多个玩家不再
+	//     互相挤占（正式服2 事件二：同一出口 IP 半天 49 次连接全被拒），
+	//     一个账号最多 MaxConnectionsPerIP 条游戏连接；
+	//   · 回退白名单的按 IP 计——与旧行为完全一致。
+	//
+	// ★ 槽位 defer 必须紧跟 Acquire 注册：后面还有若干 return 路径
+	// （后端连接失败等），任何一条漏掉都会让该维度额度被永久占住。
+	if adm.authed {
+		if !p.sessionManager.TryAcquireGameSlotByMId(adm.mId, p.config.GameServer.MaxConnectionsPerIP) {
+			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（账号 %s 并发已达上限 %d）",
+				remoteIP, publicPort, adm.mId, p.config.GameServer.MaxConnectionsPerIP))
+			return
+		}
+		defer p.sessionManager.ReleaseGameSlotByMId(adm.mId)
+	} else {
+		if !p.sessionManager.TryAcquireGameSlot(remoteIP, p.config.GameServer.MaxConnectionsPerIP) {
+			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（单 IP 并发已达上限 %d）",
+				remoteIP, publicPort, p.config.GameServer.MaxConnectionsPerIP))
+			return
+		}
+		defer p.sessionManager.ReleaseGameSlot(remoteIP)
+	}
 
 	// 该公网端口的在线连接计数：关闭端口时用来告知管理员"还有几人在线、不会断开"
 	p.mu.Lock()
@@ -665,7 +723,9 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		p.mu.Unlock()
 	}()
 
-	// 后端连接先于首包建立（连到该公网端口映射的后端游戏端口，而非 Channel 端口）
+	// 后端连接在**准入通过之后**建立。旧代码先连后端再读首包，扫描器
+	// 也能消耗后端连接；方案 D 把准入前移到连后端之前。
+	// 连到该公网端口映射的后端游戏端口，而非 Channel 端口。
 	backend, err := p.connectBackendTo(backendPort)
 	if err != nil {
 		p.logger.Warn(fmt.Sprintf("连接游戏后端 %d 失败: %v", backendPort, err))
@@ -695,14 +755,13 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		close(downlinkDone)
 	}()
 
-	// 等待客户端首包（= 游戏登录包，里面带 m_id）
-	firstBuf := make([]byte, copyBufferSize)
-	firstRead, readErr := p.readWithTimeout(client, firstBuf, p.firstReadTimeout, fmt.Sprintf("Game %d 首包", publicPort))
-	if readErr != nil || firstRead <= 0 {
-		return
-	}
-
-	// ★★ 会话归属：**优先按首包里的 m_id 精确匹配**，匹配不到才回退按 IP。
+	// ★★ 会话归属。
+	//
+	// 凭证准入时用准入阶段锁定的会话——含"确定无归属"这一种：口令/token
+	// 正确但会话已过期（心跳超时/被踢）的玩家照常放行，只是不记泡点，
+	// 也避免错记到同 IP 的别人头上。
+	//
+	// 回退路径完全走旧逻辑：**优先按首包里的 m_id 精确匹配**，匹配不到才按 IP。
 	//
 	// 为什么必须这样：客户端 launch_args 第 4 段就是它自己的 m_id，登录包原样带上来。
 	// 只按 IP 挑「心跳最新」的会话，在**同一公网 IP 多开**时（一台机器开两个客户端，
@@ -712,10 +771,24 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 	//
 	// 解析失败（首包被分包切碎 / 不是登录包 / m_id 含非 ASCII）时**完全回退旧行为**，
 	// 所以对既有玩家零退化。
-	mId, hasMId := parseGameLoginMId(firstBuf[:firstRead])
-	sessionObj, found := p.sessionManager.FindSessionByMId(mId)
-	if !hasMId || !found {
-		sessionObj, _ = p.sessionManager.TryGetSessionForGameProxy(remoteIP)
+	var sessionObj *models.Session
+	route := "ip"
+	if adm.sessionDecided {
+		sessionObj = adm.session
+		if sessionObj != nil {
+			route = "m_id"
+		} else {
+			route = "none"
+		}
+	} else {
+		mId, hasMId := parseGameLoginMId(firstBuf)
+		var found bool
+		sessionObj, found = p.sessionManager.FindSessionByMId(mId)
+		if !hasMId || !found {
+			sessionObj, _ = p.sessionManager.TryGetSessionForGameProxy(remoteIP)
+		} else {
+			route = "m_id"
+		}
 	}
 
 	// ★ 这条 Game 代理连接同时是**泡点计时的唯一依据**：只要会话上挂着
@@ -726,23 +799,21 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 	defer p.sessionManager.RemoveGameProxyConnection(sessionObj, client)
 
 	// 首包转发到后端（始终原样转发，解析只是旁路观察）
-	backend.Write(firstBuf[:firstRead])
+	backend.Write(firstBuf)
 
-	// sessionObj 可能为 nil（会话在 IP 白名单检查之后、这里之前被清理/踢掉）。
+	// sessionObj 可能为 nil（凭证准入但会话已过期 / 归属前被清理）。
 	// 旧代码直接解引用 sessionObj.Account 打日志，一旦命中就是空指针 panic，
 	// 会把整个网关进程打挂 —— 这里做空值兜底，只影响日志展示。
 	joined := "<无归属会话>"
 	if sessionObj != nil {
 		joined = sessionObj.Account
 	}
-	// 归属来源要打出来：双开同 IP 时「按 m_id 命中」与「回退按 IP」的后果完全不同，
-	// 排查「在线/泡点记到别人头上」时这一列就是第一手证据。
-	route := "ip"
-	if hasMId && found {
-		route = "m_id"
-	}
-	p.logger.Info(fmt.Sprintf("Game 连接已建立: %s (%s) -> %d [归属=%s]",
-		joined, remoteIP, backendPort, route))
+	// 归属来源 + 准入方式都要打出来：双开同 IP 时「按 m_id 命中」与「回退按 IP」
+	// 的后果完全不同，排查「在线/泡点记到别人头上」时这一列就是第一手证据；
+	// 准入方式则是方案 D 观察期的核心判据——真实客户端首包到底发 token 还是口令，
+	// 全看这一列（不含任何凭证内容，只记形态）。
+	p.logger.Info(fmt.Sprintf("Game 连接已建立: %s (%s) -> %d [归属=%s][准入=%s]",
+		joined, remoteIP, backendPort, route, adm.cred))
 
 	// 上行：客户端 -> 后端
 	p.copyWithTimeout(client, backend, fmt.Sprintf("Game %d 上行", publicPort))
@@ -776,6 +847,289 @@ func parseGameLoginMId(buf []byte) (string, bool) {
 		return "", false
 	}
 	return string(body[4 : 4+n]), true
+}
+
+// 游戏口准入（方案 D）的拒绝原因。reasonIPNotAllowed 刻意保持旧日志措辞，
+// 监控/排障脚本按原句 grep，不能改。
+const (
+	reasonIPNotAllowed = "IP 不在已登录玩家白名单"
+	reasonCredMismatch = "首包凭证与账号不匹配（疑似冒充）"
+)
+
+// gameAdmission 描述一次游戏口准入判定结果。
+type gameAdmission struct {
+	allowed bool
+	// authed = 凭首包凭证（token/口令）准入。决定并发槽位按 m_id 计。
+	authed bool
+	// mId 是准入依据的账号 m_id（authed 时非空）。
+	mId string
+	// session / sessionDecided：凭证准入时锁定归属会话。
+	// sessionDecided=true 时 session 为 nil = "确定无归属"——凭证正确但
+	// 会话已过期的玩家照常放行，只是不记泡点，也避免错记到同 IP 的别人头上。
+	session        *models.Session
+	sessionDecided bool
+	// cred 是准入方式（日志用）：token / pwd / ""（回退白名单）。
+	// 只记形态不记内容——观察期靠它确认真实客户端首包凭证形态。
+	cred string
+	// reason 是拒绝原因（allowed=false 时非空）。
+	reason string
+}
+
+// admitGameClient 判定一次游戏口连接是否放行（方案 D 核心）。
+//
+// 背景：后端游戏登录**不校验密码**（LoginHandler 只 GetByMid、陌生 m_id
+// 自动建号后直接绑定进选角），频道口后端零鉴权 ⇒ 游戏口准入是账号安全
+// 唯一闸门。旧形态只有「IP 白名单」一道，带来两个问题：
+//  1. 加速器/跨网段玩家登录 IP ≠ 游戏出口 IP 时被误伤（正式服2 事件二实盘：
+//     单账号单日 49 次连接全打频道口/游戏口、全被拒）；
+//  2. 已登录用户可伪造首包 m_id 冒充任意账号（网关旧代码不校验首包与
+//     来源 IP 的一致性，后端又不验密码）。
+//
+// 判定矩阵（cfg = GameServer.GamePortAuth）：
+//
+//	| 首包          | 会话(m_id) | 凭证              | require_credential | 结果            |
+//	|---------------|-----------|-------------------|--------------------|-----------------|
+//	| 解析失败      | -         | -                 | 任意               | 回退 IP 白名单  |
+//	| 登录包        | 有        | token 命中        | 任意               | 放行（任意 IP） |
+//	| 登录包        | 有        | 口令匹配          | 任意               | 放行（任意 IP） |
+//	| 登录包        | 有        | 不符 / 库故障     | false              | 回退 IP 白名单  |
+//	| 登录包        | 有        | 不符              | true               | 拒绝（堵冒充）  |
+//	| 登录包        | 无        | 口令匹配          | 任意               | 放行（无归属）  |
+//	| 登录包        | 无        | 不符 / 库故障     | false              | 回退 IP 白名单  |
+//	| 登录包        | 无        | 不符              | true               | 拒绝           |
+//	| 开关关闭      | -         | -                 | 任意               | 回退 IP 白名单  |
+//
+// "回退 IP 白名单" = 与旧行为完全一致（IsIPAllowed + 按 m_id/IP 归属），
+// 所以 RequireCredential=false（缺省）时本方案**不新增任何拒绝路径**，
+// 可以在生产上先观察，再收紧。
+func (p *ProxyServer) admitGameClient(remoteIP string, firstBuf []byte, frameComplete bool) gameAdmission {
+	cfg := p.config.GameServer.GamePortAuth
+	if !cfg.Enabled || !frameComplete {
+		return p.fallbackWhitelist(remoteIP)
+	}
+
+	mId, pwd, ok := parseGameLoginPacket(firstBuf)
+	if !ok {
+		// 首包不是标准登录包（分包未齐/非登录帧/非数字 m_id）——
+		// 完全回退旧行为，既有玩家零退化。
+		return p.fallbackWhitelist(remoteIP)
+	}
+	return p.admitByCredential(remoteIP, mId, pwd, cfg)
+}
+
+// admitByCredential 首包凭证准入（方案 D）。
+//
+// 凭证有两种实证形态（161 游戏库 password_hash 实证 + launch_args 模板）：
+//  1. **会话 token**（当前客户端）：launch_args 第 5 段就是 {token}，
+//     游戏库 81 个"只在游戏库建档"的账号，其 password_hash 全是 64 位 hex
+//     —— 与服务端 Create(mId, passwordHash) 原样入库合起来看，客户端首包
+//     密码字段的当前形态就是 token。token 每次登录重新生成、不可枚举，
+//     且与来源 IP 无关——加速器玩家的登录 IP 与游戏出口 IP 本就不是一个。
+//  2. **账号口令 MD5**（老客户端）：与 8000 登录同一判定入口
+//     （verifyAccountPassword，含迁移账号的空 salt 直比分支）。
+//
+// 任一命中即放行（任意来源 IP）；都不命中且 RequireCredential=true 时拒绝
+// —— 这正是"已登录用户伪造首包冒充任意账号"的堵法。
+func (p *ProxyServer) admitByCredential(remoteIP, mId, pwd string, cfg config.GamePortAuthSection) gameAdmission {
+	// 凭证一：会话 token（恒定时间比较；token 长度 64，pwd 形态不符时
+	// ConstantTimeCompare 直接按长度不等返回 false）。
+	if s, ok := p.sessionManager.FindSessionByMIdAndToken(mId, pwd); ok {
+		return gameAdmission{
+			allowed: true, authed: true, mId: mId,
+			session: s, sessionDecided: true, cred: "token",
+		}
+	}
+
+	// 凭证二：账号口令。库故障时**不许**因网关自身故障拒人——
+	// 告警 + 回退旧行为（与今天完全一致）。
+	matched, err := p.verifyAccountCredential(mId, pwd)
+	if err != nil {
+		p.logger.Warn(fmt.Sprintf("Game 凭证校验失败（网关库故障），回退白名单: m_id=%s err=%v", mId, err))
+		return p.fallbackWhitelist(remoteIP)
+	}
+
+	if s, ok := p.sessionManager.FindSessionByMId(mId); ok {
+		if matched {
+			return gameAdmission{
+				allowed: true, authed: true, mId: mId,
+				session: s, sessionDecided: true, cred: "pwd",
+			}
+		}
+	} else if matched {
+		// 会话已过期（心跳超时/被踢）但口令正确：放行，不归属任何会话。
+		return gameAdmission{
+			allowed: true, authed: true, mId: mId,
+			session: nil, sessionDecided: true, cred: "pwd",
+		}
+	}
+
+	// 凭证不符。注意 p.gameAuth == nil（校验器没接上）时永远走回退——
+	// "无法验证"与"验证不通过"必须区别对待，前者不能拒人。
+	if cfg.RequireCredential && p.gameAuth != nil {
+		return gameAdmission{allowed: false, reason: reasonCredMismatch}
+	}
+	return p.fallbackWhitelist(remoteIP)
+}
+
+// fallbackWhitelist 回退旧行为：IP 白名单是唯一闸门。
+// 归属不锁定（sessionDecided=false），由调用方按旧逻辑确定。
+func (p *ProxyServer) fallbackWhitelist(remoteIP string) gameAdmission {
+	if p.sessionManager.IsIPAllowed(remoteIP) {
+		return gameAdmission{allowed: true}
+	}
+	return gameAdmission{allowed: false, reason: reasonIPNotAllowed}
+}
+
+// verifyAccountCredential 走注入的校验器；未注入（nil）时返回 (false, nil)
+// —— 无法验证，调用方据此回退，不会误拒。
+func (p *ProxyServer) verifyAccountCredential(mId, pwd string) (bool, error) {
+	if p.gameAuth == nil {
+		return false, nil
+	}
+	return p.gameAuth.VerifyAccountCredential(mId, pwd)
+}
+
+// maxFirstGamePacket 是首包读齐循环的缓冲上限（与服务端 MaxPacketLength 一致）。
+// 登录包本身只有几十字节；length 超过它说明不是合法帧长，继续等也不会有
+// 完整帧——按"解析失败"处理，避免无限缓冲。
+const maxFirstGamePacket = maxFrameSize
+
+// firstFrameComplete 判断已读字节里是否已包含完整首帧。
+// sane=false 表示 length 字段非法（等不出完整帧，应按解析失败处理）。
+//
+// length 字段口径（服务端 FlexiblePacketProcessor）：**含 14 字节头**的
+// 整帧长度（packetLength < headerSize 会被服务端直接判非法断开）。
+func firstFrameComplete(buf []byte) (complete bool, sane bool) {
+	if len(buf) < gamePacketHeaderSize {
+		return false, true
+	}
+	total := int(binary.LittleEndian.Uint32(buf[3:7]))
+	if total < gamePacketHeaderSize || total > maxFirstGamePacket {
+		return false, false
+	}
+	return len(buf) >= total, true
+}
+
+// readFirstGamePacket 读客户端首包，尽量读齐一个完整帧。
+//
+// 与旧行为（readWithTimeout 读一次）的差异只在"没读齐"时：旧代码把读到
+// 的残缺字节直接转发、按 IP 归属；本函数按 header 的 length 循环读齐，
+// 读不齐（超时/对端沉默/帧长非法）时同样返回已读字节 + complete=false，
+// 由调用方回退旧行为——不新增任何"杀连接"路径。
+//
+// 超时是**绝对期限**（进入前一次性 SetReadDeadline）：防止对端慢滴
+// （每次只吐一片）把连接无限期持有。未配首包超时（<=0）时保持旧语义——
+// 只读一次，读到什么算什么。
+func (p *ProxyServer) readFirstGamePacket(client net.Conn, publicPort int) ([]byte, bool) {
+	buf := make([]byte, 0, copyBufferSize)
+	tmp := make([]byte, copyBufferSize)
+
+	if p.firstReadTimeout > 0 {
+		client.SetReadDeadline(time.Now().Add(p.firstReadTimeout))
+		defer client.SetReadDeadline(time.Time{})
+	}
+
+	for {
+		n, err := client.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			done, sane := firstFrameComplete(buf)
+			if done {
+				return buf, true
+			}
+			if !sane {
+				return buf, false
+			}
+		}
+		if err != nil {
+			if len(buf) == 0 {
+				p.logger.Warn(fmt.Sprintf("Game %d 首包: %ds 内无任何数据，关闭代理连接",
+					publicPort, int(p.firstReadTimeout.Seconds())))
+			}
+			return buf, false
+		}
+		if p.firstReadTimeout <= 0 {
+			// 未配首包超时：旧语义——只读一次
+			return buf, false
+		}
+	}
+}
+
+// parseGameLoginPacket 从游戏连接首包里解析登录包的 (m_id, 口令字段)。
+//
+// 线上布局（与服务端 Network/Parsers/LoginRequestParser.cs 对齐）：
+//
+//	[GamePacketHeader 14B: cmd u8, type u16, length u32(含头), checksum u32, seq u16, extra u8]
+//	[i32 mIdLen][mId 字节][i32 pwdLen][pwd 字节]
+//
+// 与 parseGameLoginMId（归属用，宽松）的区别——本函数是**准入**依据，
+// 必须严格，四条全满足才认：
+//  1. 首帧完整（length 含头、缓冲区够长）；
+//  2. 正文恰好两个 DStr、无拖尾（非登录包直接判失败）；
+//  3. m_id 非空（服务端口径）；
+//  4. m_id 是网关分配的纯数字号（3~10 位，与 database.IsNumericMId 同口径）。
+//
+// 存量非数字 m_id（老网关"m_id 填账号名"口径）走不到凭证路径，自动落回退
+// 分支 = 旧行为，不受影响。口令字段两种实证形态见 admitByCredential 注释，
+// 本函数只负责原样取出（GBK 解码对纯 ASCII 的 MD5/token 与 ASCII 一致）。
+func parseGameLoginPacket(buf []byte) (string, string, bool) {
+	if len(buf) < gamePacketHeaderSize+8 {
+		return "", "", false
+	}
+	total := int(binary.LittleEndian.Uint32(buf[3:7]))
+	if total < gamePacketHeaderSize || total > maxFirstGamePacket || len(buf) < total {
+		return "", "", false
+	}
+
+	body := buf[gamePacketHeaderSize:total]
+	off := 0
+	mId, ok := readGameDStr(body, &off)
+	if !ok || mId == "" {
+		return "", "", false
+	}
+	pwd, ok := readGameDStr(body, &off)
+	if !ok {
+		return "", "", false
+	}
+	if off != len(body) {
+		// 正文不是恰好两个 DStr ⇒ 不是登录包
+		return "", "", false
+	}
+	if !isNumericMIdStrict(mId) {
+		return "", "", false
+	}
+	return mId, pwd, true
+}
+
+// readGameDStr 读一个 [i32 len][bytes] 字段，口径与服务端 TryReadDStr 一致：
+// len 允许 0（服务端只要求 mId 非空），上限 256。
+func readGameDStr(body []byte, off *int) (string, bool) {
+	if *off+4 > len(body) {
+		return "", false
+	}
+	n := int(binary.LittleEndian.Uint32(body[*off : *off+4]))
+	*off += 4
+	if n < 0 || n > 256 || *off+n > len(body) {
+		return "", false
+	}
+	s := string(body[*off : *off+n])
+	*off += n
+	return s, true
+}
+
+// isNumericMIdStrict 判断是否为网关分配的纯数字 m_id。
+// 口径与 database.IsNumericMId（3~10 位数字）一致——那里是权威定义，
+// 这里为避免 proxy → database 依赖复制一份；改动时两边同步。
+func isNumericMIdStrict(mId string) bool {
+	if len(mId) < 3 || len(mId) > 10 {
+		return false
+	}
+	for i := 0; i < len(mId); i++ {
+		if mId[i] < '0' || mId[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // copyWithTimeout 双向透传，带空闲超时。

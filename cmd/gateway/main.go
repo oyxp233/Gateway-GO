@@ -174,7 +174,10 @@ func main() {
 	}, proxy.BuildBootstrapPortConfig(cfg))
 	portConfig.StartWatching()
 
-	proxyServer = proxy.NewProxyServer(cfg, sessionMgr, log, portConfig)
+	// 游戏口准入（方案 D）的凭证校验器：复用 AccountService 的密码判定入口
+	// （含迁移账号的空 salt 直比 MD5 分支）。nil 时口令路径不可用，
+	// 仅 token 路径生效，且任何"无法验证"都回退旧行为、不会据此拒人。
+	proxyServer = proxy.NewProxyServer(cfg, sessionMgr, log, portConfig, accountSvc)
 	proxyServer.Start()
 
 	// HTTP 服务器

@@ -17,18 +17,23 @@ type SessionManager struct {
 	sessions  map[string]*models.Session     // token -> session
 	ipIndex   map[string]map[string]struct{} // ip -> {token, ...}
 	gameSlots map[string]int                 // ip -> 已占用的 Game 连接数
-	onFirst   func()
-	onLast    func()
+	// gameSlotsByMId 是方案 D 的按账号槽位：m_id -> 已占用的 Game 连接数。
+	// 与 gameSlots（按 IP）并立——凭证准入的连接按 m_id 计，
+	// 回退白名单的连接仍按 IP 计，两个维度互不占用。
+	gameSlotsByMId map[string]int
+	onFirst        func()
+	onLast         func()
 }
 
 // NewSessionManager 创建会话管理器。
 func NewSessionManager(onFirstSession func(), onLastSessionRemoved func()) *SessionManager {
 	return &SessionManager{
-		sessions:  make(map[string]*models.Session),
-		ipIndex:   make(map[string]map[string]struct{}),
-		gameSlots: make(map[string]int),
-		onFirst:   onFirstSession,
-		onLast:    onLastSessionRemoved,
+		sessions:       make(map[string]*models.Session),
+		ipIndex:        make(map[string]map[string]struct{}),
+		gameSlots:      make(map[string]int),
+		gameSlotsByMId: make(map[string]int),
+		onFirst:        onFirstSession,
+		onLast:         onLastSessionRemoved,
 	}
 }
 
@@ -177,6 +182,41 @@ func (sm *SessionManager) FindSessionByMId(mId string) (*models.Session, bool) {
 		// 会让 map 的随机遍历顺序决定结果 —— 归属必须确定，用 token 字典序兜底。
 		if best == nil || s.CreatedAt < best.CreatedAt ||
 			(s.CreatedAt == best.CreatedAt && s.Token < best.Token) {
+			best = s
+		}
+	}
+	return best, best != nil
+}
+
+// FindSessionByMIdAndToken 按 m_id + token **同时**匹配查找会话。
+//
+// 方案 D 的凭证校验用：游戏口首包密码字段的当前形态是客户端上报的会话 token
+// （64 位 hex，来自 launch_args 第 5 段）。token 是**每次登录重新生成**的
+// 随机值，匹配上即证明「首包确实来自该账号本次登录签发的那个客户端」——
+// 与来源 IP 无关（加速器/跨网段玩家的登录 IP 与游戏出口 IP 本就不是一个），
+// 也不可能被枚举（2^256）。
+//
+// 为什么不能只用 FindSessionByMId + 比 token：同一 m_id 异常态下可能存在
+// 多个会话（stale reconnect 结转等），只挑一个比会把持另一个 token 的
+// 正常客户端判成「凭证不符」。
+func (sm *SessionManager) FindSessionByMIdAndToken(mId, token string) (*models.Session, bool) {
+	if mId == "" || token == "" {
+		return nil, false
+	}
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var best *models.Session
+	for _, s := range sm.sessions {
+		if s.MId != mId {
+			continue
+		}
+		// 恒定时间比较，与 verifyAccountPassword 的口径一致
+		if !security.ConstantTimeEquals(s.Token, token) {
+			continue
+		}
+		if best == nil || s.CreatedAt < best.CreatedAt {
 			best = s
 		}
 	}
@@ -486,6 +526,62 @@ func (sm *SessionManager) GameSlotCount(ip string) int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.gameSlots[ip]
+}
+
+// TryAcquireGameSlotByMId 尝试获取**账号维度**的 Game 连接槽位（方案 D）。
+//
+// 为什么需要这个维度：按 IP 计槽位时，加速器/网吧/NAT 共享出口的多个玩家
+// 会互相挤占（正式服2 事件二：同一出口 IP 半天 49 次连接全被拒）。
+// 凭证准入（首包 m_id + token/口令）的连接改按 m_id 计，一个账号最多
+// maxPerMId 条游戏连接，与同出口的其他玩家再无关系。
+//
+// 检查与预留是同一次原子操作，语义与 TryAcquireGameSlot 一致；
+// 未准入（回退白名单）的连接仍走 IP 维度，两个维度分开计数。
+func (sm *SessionManager) TryAcquireGameSlotByMId(mId string, maxPerMId int) bool {
+	if maxPerMId <= 0 {
+		return true
+	}
+	if mId == "" {
+		return false
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.gameSlotsByMId[mId] >= maxPerMId {
+		return false
+	}
+	sm.gameSlotsByMId[mId]++
+	return true
+}
+
+// ReleaseGameSlotByMId 释放账号维度的 Game 连接槽位。
+// 必须与成功的 TryAcquireGameSlotByMId 配对调用（用 defer 保证）。
+func (sm *SessionManager) ReleaseGameSlotByMId(mId string) {
+	if mId == "" {
+		return
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	n, ok := sm.gameSlotsByMId[mId]
+	if !ok {
+		return
+	}
+	if n <= 1 {
+		// 归零时直接删键，避免 map 无限增长
+		delete(sm.gameSlotsByMId, mId)
+		return
+	}
+	sm.gameSlotsByMId[mId] = n - 1
+}
+
+// GameSlotCountByMId 返回指定账号当前占用的 Game 连接数（用于状态查询与测试）。
+func (sm *SessionManager) GameSlotCountByMId(mId string) int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.gameSlotsByMId[mId]
 }
 
 // AddProxyConnection 向会话添加代理连接。

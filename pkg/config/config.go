@@ -67,10 +67,10 @@ type GatewayConfig struct {
 	GatewayControl GatewayControlSection `json:"GatewayControl"`
 	Maintenance    MaintenanceSection    `json:"Maintenance"`
 
-// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit / Heartbeat）——
-// 这几段会被管理后台在运行中改写（httprouter 的 runtimeConfigBackend），
-// 而认证侧（auth 的版本门禁、注册限额判定）、HTTP 侧（policy/notice/update 端点）
-// 与清理协程（cmd/gateway 的巡检 ticker 读 Heartbeat.TimeoutSeconds）在并发读。
+	// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit / Heartbeat）——
+	// 这几段会被管理后台在运行中改写（httprouter 的 runtimeConfigBackend），
+	// 而认证侧（auth 的版本门禁、注册限额判定）、HTTP 侧（policy/notice/update 端点）
+	// 与清理协程（cmd/gateway 的巡检 ticker 读 Heartbeat.TimeoutSeconds）在并发读。
 	//
 	// G-5（2026-10-04 审查）：原先全程无锁 —— 管理员开维护模式的同时有玩家登录，
 	// 可能读到**撕裂的切片头**（Maintenance.AdminAccounts）而崩溃，或读到半改的门禁值。
@@ -200,7 +200,15 @@ type GatewaySection struct {
 	AdminHttpListenAddress string `json:"AdminHttpListenAddress"`
 	DisableAdminHttp       bool   `json:"DisableAdminHttp"`
 	TcpIdleTimeoutSeconds  int    `json:"TcpIdleTimeoutSeconds"`
-	TcpMaxConnections      int    `json:"TcpMaxConnections"`
+	// TcpHandshakeTimeoutSeconds 是 TLS 握手专属超时（秒），默认 10。
+	//
+	// 为什么必须独立于 TcpIdleTimeoutSeconds：握手复用 idle 超时时，
+	// 一个"连上但不发 ClientHello"的连接能把 acceptLoop 卡住整个 idle 时长
+	// （线上 600s）。期间新玩家 TCP 连得上（内核 backlog 照常接纳），
+	// 却永远等不到 ServerHello —— 登录器 20s 超时后报 L4002，批量掉登录。
+	// 2026-10-15 正式服2（193）实测：一晚三次，每次一批玩家同秒 EO F 潮。
+	TcpHandshakeTimeoutSeconds int `json:"TcpHandshakeTimeoutSeconds"`
+	TcpMaxConnections          int `json:"TcpMaxConnections"`
 
 	// InternalPort / InternalListenAddress 是"进程分离"用的内部 API 地址。
 	// ⚠️ 只应绑 loopback —— 它能让调用者读在线名单、踢人、重载端口表。
@@ -275,6 +283,33 @@ type GameServerSection struct {
 	// 结果是所有玩家立刻掉线。必须先在服务端具备识别能力（缺省已开，
 	// 见 GameNetworkConfig.ProxyProtocolEnabled），再在这里打开。
 	ProxyProtocol string `json:"ProxyProtocol"`
+
+	// GamePortAuth 游戏口准入控制（方案 D：首包 m_id + 凭证认证）。
+	//
+	// 背景：后端游戏登录**不校验密码**（LoginHandler 只 GetByMid、陌生 m_id
+	// 自动建号），频道口后端零鉴权 ⇒ 游戏口准入是账号安全唯一闸门。
+	// 旧形态只有「IP 白名单」一道，带来两个问题：
+	//  1. 加速器/跨网段玩家登录 IP ≠ 游戏出口 IP 时被误伤（正式服2 事件二实盘）；
+	//  2. 已登录用户可伪造首包 m_id 冒充任意账号（网关不校验首包与来源 IP 的
+	//     一致性，后端又不验密码）。
+	// 方案 D 用首包凭证同时解决两者，详见 pkg/proxy 的 admitGameClient。
+	GamePortAuth GamePortAuthSection `json:"GamePortAuth"`
+}
+
+// GamePortAuthSection 是游戏口准入（方案 D）的配置段。
+type GamePortAuthSection struct {
+	// Enabled 总开关。false = 完全回到旧行为：IP 白名单先行，
+	// 首包只用于会话归属（双开同 IP 精确归属那一套）。
+	Enabled bool `json:"Enabled"`
+
+	// RequireCredential 决定「首包凭证不匹配」时的处置：
+	//   false（缺省）= 回退 IP 白名单 —— 与旧行为一致的零新拒绝路径，
+	//     用于观察期：先确认真实客户端首包凭证形态，再收紧；
+	//   true = 一律拒绝 —— 堵住「已登录用户伪造首包冒充任意账号」。
+	//
+	// ★ 收紧前必须确认客户端首包密码字段的形态（网关日志会打 准入=token/pwd），
+	//   否则会把正常玩家当冒充者拒掉。
+	RequireCredential bool `json:"RequireCredential"`
 }
 
 type PvfSection struct {
@@ -390,8 +425,8 @@ func (c *GatewayConfig) LauncherUpdateEnabled() bool {
 // LauncherPluginEnabled 返回插件下发总开关的生效值（缺省视为开）。
 //
 // 收敛成一处方法而不是各处判 nil：这个值有 3 个调用点
-//（清单 handler、管理后台、自检），两处口径不一致就会出现
-//「后台显示关闭、登录器照旧下载」这类静默错位。
+// （清单 handler、管理后台、自检），两处口径不一致就会出现
+// 「后台显示关闭、登录器照旧下载」这类静默错位。
 func (c *GatewayConfig) LauncherPluginEnabled() bool {
 	if c.Launcher.PluginEnabled == nil {
 		return true
@@ -491,9 +526,9 @@ type TlsSection struct {
 }
 
 type ServerSection struct {
-	Unit                   string `json:"Unit"`
-	WorkDir                string `json:"WorkDir"`
-	PvfPath                string `json:"PvfPath"`
+	Unit    string `json:"Unit"`
+	WorkDir string `json:"WorkDir"`
+	PvfPath string `json:"PvfPath"`
 	// ★ PvfPath 是**服务端使用的** PVF（明文，DfoServer 读的那份），与
 	// Pvf.FilePath（网关侧的客户端基准）是两件事，必须指向不同文件。
 	// 留空时按 WorkDir 推导（见 ServerManager.resolvePvfPath）。
@@ -554,18 +589,19 @@ const DefaultLaunchArgsFormat = "9?{ip}?{port}?{m_id}?{token}?1?0?6?0?2?1???0?0?
 func DefaultConfig() *GatewayConfig {
 	return &GatewayConfig{
 		Gateway: GatewaySection{
-			TcpPort:                8000,
-			HttpPort:               8080,
-			ProxyPort:              8001,
-			ListenAddress:          "0.0.0.0",
-			HttpListenAddress:      "",
-			AdminHttpPort:          0,
-			AdminHttpListenAddress: "127.0.0.1",
-			TcpIdleTimeoutSeconds:  600,
-			TcpMaxConnections:      512,
-			InternalPort:           18080,
-			InternalListenAddress:  "127.0.0.1",
-			ServeAdminInProcess:    false,
+			TcpPort:                    8000,
+			HttpPort:                   8080,
+			ProxyPort:                  8001,
+			ListenAddress:              "0.0.0.0",
+			HttpListenAddress:          "",
+			AdminHttpPort:              0,
+			AdminHttpListenAddress:     "127.0.0.1",
+			TcpIdleTimeoutSeconds:      600,
+			TcpHandshakeTimeoutSeconds: 10,
+			TcpMaxConnections:          512,
+			InternalPort:               18080,
+			InternalListenAddress:      "127.0.0.1",
+			ServeAdminInProcess:        false,
 		},
 		Database: DatabaseSection{
 			Path:               "./Data/gateway.db",
@@ -586,10 +622,16 @@ func DefaultConfig() *GatewayConfig {
 			IdleTimeoutSeconds:           1800,
 			BackendConnectTimeoutSeconds: 10,
 			TcpKeepAliveSeconds:          60,
-			LaunchArgsFormat:             DefaultLaunchArgsFormat,
-			// 缺省关：服务端先具备识别能力后再显式改成 "v1"。
-			ProxyProtocol: "off",
+		LaunchArgsFormat:             DefaultLaunchArgsFormat,
+		// 缺省关：服务端先具备识别能力后再显式改成 "v1"。
+		ProxyProtocol: "off",
+		// 方案 D 缺省开启、观察模式（凭证不符回退白名单，不新增拒绝路径）。
+		// 确认真实客户端凭证形态后，再把 RequireCredential 置 true 收紧。
+		GamePortAuth: GamePortAuthSection{
+			Enabled:           true,
+			RequireCredential: false,
 		},
+	},
 		Pvf: PvfSection{
 			// 客户端基准（网关侧保存），相对网关运行目录 ⇒ 默认 /opt/gateway/Data/Pvf/Script.pvf。
 			// ★ 服务端那份在 Server.WorkDir 下（默认识别不到就由运维配 Server.PvfPath），
@@ -599,7 +641,7 @@ func DefaultConfig() *GatewayConfig {
 			// 所以默认目录是 /opt/gateway/pvf_delta（与 ./plugins 同级）。
 			DeltaDir: "./pvf_delta",
 			// 历史版本目录与保留数，同上按网关运行目录解析。
-			HistoryDir: "./pvf_history",
+			HistoryDir:  "./pvf_history",
 			HistoryKeep: 20,
 		},
 		Launcher: LauncherSection{

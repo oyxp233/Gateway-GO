@@ -65,7 +65,7 @@ func newTestProxy(t *testing.T, store *PortConfigStore, sm *session.SessionManag
 			IdleTimeoutSeconds:      30,
 		},
 	}
-	return NewProxyServer(cfg, sm, log, store)
+	return NewProxyServer(cfg, sm, log, store, nil)
 }
 
 // wireStore 把端口表的 onChange 接到代理服务器上（模拟 main.go 的接线）。
@@ -234,6 +234,12 @@ func TestReloadPorts_ExistingConnectionSurvivesClose(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// 方案 D 起「连后端」前移到首包准入之后：先写首包再等后端 Accept
+	// （完整非登录帧 ⇒ 回退白名单放行，同 shutdown_wakeup_test.go 的说明）
+	if _, err := conn.Write(nonLoginFirstPacket()); err != nil {
+		t.Fatalf("发送首包失败: %v", err)
+	}
+
 	// 代理应已连上假后端，说明这条连接确实进入了转发链路
 	_ = backend.(*net.TCPListener).SetDeadline(time.Now().Add(3 * time.Second))
 	backendConn, err := backend.Accept()
@@ -242,13 +248,9 @@ func TestReloadPorts_ExistingConnectionSurvivesClose(t *testing.T) {
 	}
 	defer backendConn.Close()
 
-	// 打一个首包，让代理完成首包握手
-	if _, err := conn.Write([]byte{0xAA}); err != nil {
-		t.Fatalf("发送首包失败: %v", err)
-	}
-	first := make([]byte, 4)
+	first := make([]byte, 64)
 	_ = backendConn.(*net.TCPConn).SetReadDeadline(time.Now().Add(3 * time.Second))
-	if n, err := backendConn.Read(first); err != nil || n != 1 || first[0] != 0xAA {
+	if n, err := backendConn.Read(first); err != nil || first[0] != 0xAA {
 		t.Fatalf("首包未透传到后端: n=%d err=%v", n, err)
 	}
 

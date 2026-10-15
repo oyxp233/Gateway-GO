@@ -902,6 +902,30 @@ func verifyAccountPassword(inputMd5 string, account *database.Account) bool {
 	return security.ConstantTimeEquals(computed, account.PwdHash)
 }
 
+// VerifyAccountCredential 校验游戏口首包凭证是否对应该账号口令。
+//
+// 实现 pkg/proxy.GameCredentialVerifier —— 游戏口准入（方案 D）的
+// 「账号口令」凭证路径用。之所以放在 service 层：verifyAccountPassword
+// 是全网关唯一的密码判定入口（含迁移账号的「空 salt 直比 MD5」分支），
+// 游戏口必须复用它，不能在 proxy 包里再实现一遍。
+//
+// 返回值的三种含义：
+//   - (true, nil)：口令匹配（含 salt 为空的迁移账号的 MD5 直比分支）；
+//   - (false, nil)：**确定**不匹配，或网关库没有这个 m_id 的账号
+//     （m_id 全部由网关分配，没有账号即说明这不是登录器链路产物）；
+//   - (false, err)：网关库读取失败 —— 调用方必须按「无法验证」处理
+//     （回退旧行为 + 告警），绝不能因网关自身故障拒掉正常玩家。
+func (s *AccountService) VerifyAccountCredential(mId, pwdField string) (bool, error) {
+	acct, err := s.db.GetAccountByMId(strings.TrimSpace(mId))
+	if err != nil {
+		return false, err
+	}
+	if acct == nil {
+		return false, nil
+	}
+	return verifyAccountPassword(pwdField, acct), nil
+}
+
 func derefInt(p *int, def int) int {
 	if p != nil {
 		return *p

@@ -7,6 +7,11 @@ import (
 
 // buildGameLoginFirstPacket 构造一条游戏连接首包：
 // GamePacketHeader(14B, Pack=1) + i32(mIdLen) + mId + i32(pwdLen) + pwd。
+//
+// ★ length 字段是**含 14 字节头**的整帧长度（服务端 FlexiblePacketProcessor
+// 判 packetLength < headerSize 即非法）。2026-10-15 修正：此前写成"只含 body"，
+// 那种包到服务端只会落 "Login body unparseable" 分支 —— 归属解析不读这个字段
+// 所以测试一直是绿的，但任何人拿它构造"能过服务端"的包都会得到假结果。
 func buildGameLoginFirstPacket(mId string) []byte {
 	var l [4]byte
 	body := make([]byte, 0, 4+len(mId)+4+8)
@@ -20,7 +25,7 @@ func buildGameLoginFirstPacket(mId string) []byte {
 	buf := make([]byte, gamePacketHeaderSize, gamePacketHeaderSize+len(body))
 	buf[0] = 0x01                                             // cmd
 	binary.LittleEndian.PutUint16(buf[1:], 0x1234)            // type
-	binary.LittleEndian.PutUint32(buf[3:], uint32(len(body))) // length
+	binary.LittleEndian.PutUint32(buf[3:], uint32(gamePacketHeaderSize+len(body))) // length（含头）
 	binary.LittleEndian.PutUint16(buf[11:], 1)                // seq
 	buf[13] = 0                                               // extra
 	return append(buf, body...)

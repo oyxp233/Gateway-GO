@@ -150,6 +150,13 @@ func TestStopClosesConnectionPromptly(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// 方案 D 起「连后端」前移到首包准入之后：必须先写首包，代理才会连后端。
+	// 首帧用"完整但非登录"的 14 字节帧——立即读齐、不进首包超时等待；
+	// 非登录包 ⇒ 回退 IP 白名单（127.0.0.1 上建有会话）⇒ 放行，与旧行为等价。
+	if _, err := conn.Write(nonLoginFirstPacket()); err != nil {
+		t.Fatalf("发送首包失败: %v", err)
+	}
+
 	_ = backend.(*net.TCPListener).SetDeadline(time.Now().Add(3 * time.Second))
 	backendConn, err := backend.Accept()
 	if err != nil {
@@ -157,13 +164,9 @@ func TestStopClosesConnectionPromptly(t *testing.T) {
 	}
 	defer backendConn.Close()
 
-	// 打首包完成握手，让代理真正进入 copyWithTimeout 的转发循环
-	if _, err := conn.Write([]byte{0xAA}); err != nil {
-		t.Fatalf("发送首包失败: %v", err)
-	}
-	first := make([]byte, 4)
+	first := make([]byte, 64)
 	_ = backendConn.(*net.TCPConn).SetReadDeadline(time.Now().Add(3 * time.Second))
-	if n, err := backendConn.Read(first); err != nil || n != 1 || first[0] != 0xAA {
+	if n, err := backendConn.Read(first); err != nil || first[0] != 0xAA {
 		t.Fatalf("首包未透传到后端: n=%d err=%v", n, err)
 	}
 

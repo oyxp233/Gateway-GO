@@ -242,7 +242,12 @@ func main() {
 				// 明细打点（2026-10-10）：以前只有「清理超时会话: N」，出事后
 				// 回答不了"清的是谁、心跳停了多久、当时在不在游戏里"。
 				// 这里逐条打账号 / 停滞秒数 / 游戏连接数，便于回看是不是误清。
-				cleaned, details := sessionMgr.CleanExpiredSessionsWithDetails(cfg.Heartbeat.TimeoutSeconds)
+				//
+				// ★ 超时值走运行时快照（2026-10-14）：原先直接读 cfg.Heartbeat.TimeoutSeconds，
+				// 而管理员现在能在后台**热改**它（runtimeConfigBackend.SetHeartbeat 在锁内写）。
+				// 继续裸读就是数据竞争（-race 会报），且可能读到半改的值。
+				// 走快照还有个好处：改完**下一个 tick 就生效**，不必重启网关（= 不踢人）。
+				cleaned, details := sessionMgr.CleanExpiredSessionsWithDetails(cfg.HeartbeatSnapshot().TimeoutSeconds)
 				if cleaned > 0 {
 					log.Info(fmt.Sprintf("清理超时会话: %d", cleaned))
 				}

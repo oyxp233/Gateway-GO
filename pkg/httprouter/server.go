@@ -600,6 +600,11 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/register-limit", s.handleAdminRegisterLimitPost).Methods("POST")
 	r.HandleFunc("/api/admin/register-logs", s.handleAdminRegisterLogs).Methods("GET")
 
+	// 心跳超时（2026-10-14）：会话超时清理由网关进程执行，权威值在网关内存里，
+	// admin 进程必须经运行时配置后端转发（同 register-limit 的理由）。
+	r.HandleFunc("/api/admin/heartbeat", s.handleAdminHeartbeatGet).Methods("GET")
+	r.HandleFunc("/api/admin/heartbeat", s.handleAdminHeartbeatPost).Methods("POST")
+
 	// 外挂检测查询
 	r.HandleFunc("/api/admin/anticheat/detections", s.handleAdminAntiCheatDetections).Methods("GET")
 	r.HandleFunc("/api/admin/anticheat/players", s.handleAdminAntiCheatPlayers).Methods("GET")
@@ -755,6 +760,7 @@ type internalRuntimeConfig struct {
 	Launcher      LauncherView      `json:"launcher"`
 	Maintenance   MaintenanceView   `json:"maintenance"`
 	RegisterLimit RegisterLimitView `json:"register_limit"`
+	Heartbeat     HeartbeatView     `json:"heartbeat"`
 	Online        int               `json:"online"`
 }
 
@@ -779,6 +785,12 @@ func (s *Server) buildInternalRuntimeConfig() (internalRuntimeConfig, error) {
 	}
 	out.RegisterLimit = rv
 
+	hv, err := s.runtime.Heartbeat()
+	if err != nil {
+		return out, err
+	}
+	out.Heartbeat = hv
+
 	online, _ := s.sessions.Count()
 	out.Online = online
 	return out, nil
@@ -795,6 +807,7 @@ func (s *Server) handleInternalRuntimeConfigGet(w http.ResponseWriter, r *http.R
 		"launcher":       out.Launcher,
 		"maintenance":    out.Maintenance,
 		"register_limit": out.RegisterLimit,
+		"heartbeat":      out.Heartbeat,
 		"online":         out.Online,
 	})
 }
@@ -816,6 +829,9 @@ func (s *Server) handleInternalRuntimeConfigSet(w http.ResponseWriter, r *http.R
 			PerIPPerDay *int  `json:"per_ip_per_day"`
 			PerMachine  *int  `json:"per_machine"`
 		} `json:"register_limit"`
+		Heartbeat *struct {
+			TimeoutSeconds *int `json:"timeout_seconds"`
+		} `json:"heartbeat"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "bad json"})
@@ -835,6 +851,15 @@ func (s *Server) handleInternalRuntimeConfigSet(w http.ResponseWriter, r *http.R
 	if body.RegisterLimit != nil {
 		c, err := s.runtime.SetRegisterLimit(body.RegisterLimit.Enabled,
 			body.RegisterLimit.PerIPPerDay, body.RegisterLimit.PerMachine)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		changed = changed || c
+	}
+
+	if body.Heartbeat != nil {
+		c, err := s.runtime.SetHeartbeat(body.Heartbeat.TimeoutSeconds)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
 			return
@@ -2773,6 +2798,62 @@ func (s *Server) handleAdminRegisterLimitPost(w http.ResponseWriter, r *http.Req
 		s.logger.Error(fmt.Sprintf("[Admin] 注册限额配置更新失败: %v", err))
 		// 值域错误是**用户输入问题**，回 400 并原样透出原因，让后台能提示到具体字段；
 		// 其它错误（落盘失败等）才是 500。
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "取值必须在") {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]interface{}{"ok": false, "message": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "changed": changed})
+}
+
+// ==================== 心跳超时（2026-10-14）====================
+//
+// 会话超时清理由**网关进程**的巡检协程执行（每 CheckIntervalSeconds 读一次
+// TimeoutSeconds），所以权威值只在网关内存里。admin 进程必须经运行时配置后端转发，
+// 改自己的副本会出现「后台显示已改、掉线照旧」的静默失效。
+//
+// 为什么会有这个开关：超时与登录器心跳周期（30s）必须配套。TimeoutSeconds=60 时
+// 只容忍丢 1 拍，一旦玩家侧链路整段不通、或客户端把心跳停掉，玩家就会在"游戏里"
+// 被清会话。做成热改之后调这个值**不需要重启网关**（重启 = 全体掉线）。
+
+func (s *Server) handleAdminHeartbeatGet(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	hv, err := s.runtime.Heartbeat()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":              true,
+		"timeout_seconds": hv.TimeoutSeconds,
+		"override_file":   config.OverrideFileName,
+	})
+}
+
+func (s *Server) handleAdminHeartbeatPost(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	var body struct {
+		TimeoutSeconds *int `json:"timeout_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "参数错误"})
+		return
+	}
+
+	changed, err := s.runtime.SetHeartbeat(body.TimeoutSeconds)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("[Admin] 心跳超时配置更新失败: %v", err))
+		// 值域错误是**用户输入问题**，回 400 并原样透出原因（同 register-limit）。
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "取值必须在") {
 			status = http.StatusBadRequest

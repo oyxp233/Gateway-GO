@@ -158,6 +158,22 @@ type RegisterLimitView struct {
 	PerMachine  int  `json:"per_machine"`
 }
 
+// HeartbeatView 心跳超时的当前状态（2026-10-14）。
+//
+// 权威值在**网关进程内存里**：会话超时清理由网关的巡检协程执行
+// （cmd/gateway 每 CheckIntervalSeconds 读一次 TimeoutSeconds）。双进程模式下
+// admin 进程只能经 /internal/runtime-config 读写它。
+//
+// 为什么必须做成运行时可变：超时是"和登录器心跳周期配套"的参数，定得太紧
+// （60s 对 30s 心跳 = 只容忍丢 1 拍）时误清会话表现为"玩家在游戏里被踢"，
+// 而改它原先必须重启网关（= 全体掉线）—— 于是"为修掉线而重启"本身就制造掉线。
+//
+// json tag 同时被内部 API 与远端后端复用，改这里等于改协议。
+// 用指针表示"该项不改"（与 SetLauncher 同一约定），所以读出来的是值、下发的是指针。
+type HeartbeatView struct {
+	TimeoutSeconds int `json:"timeout_seconds"`
+}
+
 // RuntimeConfigBackend 抽象网关进程内存里的可变配置。
 type RuntimeConfigBackend interface {
 	Launcher() (LauncherView, error)
@@ -171,6 +187,10 @@ type RuntimeConfigBackend interface {
 	RegisterLimit() (RegisterLimitView, error)
 	// SetRegisterLimit 更新注册限额（nil 表示该字段不动），返回是否有变更。
 	SetRegisterLimit(enabled *bool, perIPPerDay, perMachine *int) (changed bool, err error)
+
+	Heartbeat() (HeartbeatView, error)
+	// SetHeartbeat 更新心跳超时（nil 表示不动），返回是否有变更。
+	SetHeartbeat(timeoutSeconds *int) (changed bool, err error)
 }
 
 // ============================================================================
@@ -469,6 +489,49 @@ func (b *localRuntimeConfigBackend) SetRegisterLimit(enabled *bool, perIPPerDay,
 	return true, nil
 }
 
+func (b *localRuntimeConfigBackend) Heartbeat() (HeartbeatView, error) {
+	if b.cfg == nil {
+		return HeartbeatView{}, fmt.Errorf("配置未加载")
+	}
+	// 与 Launcher/RegisterLimit 同款：读运行时可变段一律走快照（锁内拷贝）。
+	snap := b.cfg.HeartbeatSnapshot()
+	return HeartbeatView{TimeoutSeconds: snap.TimeoutSeconds}, nil
+}
+
+func (b *localRuntimeConfigBackend) SetHeartbeat(timeoutSeconds *int) (bool, error) {
+	if b.cfg == nil {
+		return false, fmt.Errorf("配置未加载")
+	}
+	if timeoutSeconds == nil {
+		return false, nil
+	}
+
+	// ★★ 值域校验必须在落盘**之前**：离谱的值一旦写进 override 文件，
+	// 下次启动会被原样读回，重启也修不好，只能手改文件（同 SetRegisterLimit 的理由）。
+	//
+	// 下限 30 = 登录器心跳周期（161/193/216 上都是 30s）—— 小于它等于把
+	// "每个正常心跳之间"都判成超时，会把所有在线玩家清掉，是灾难级误配。
+	// 上限 3600 是"客户端崩溃后会话最多挂多久"的容忍度；再大只是更久地占着
+	// 单账号单令牌的坑，没有收益。
+	const minTimeout, maxTimeout = 30, 3600
+	if *timeoutSeconds < minTimeout || *timeoutSeconds > maxTimeout {
+		return false, fmt.Errorf("TimeoutSeconds 取值必须在 %d~%d 之间（须大于登录器心跳周期 30s）",
+			minTimeout, maxTimeout)
+	}
+
+	// 与 SetLauncher 同序：先落盘 override，成功后再改内存 ——
+	// 落盘失败时不留下"内存已改、重启还原"的不一致。
+	if b.editor != nil {
+		if err := b.editor.SaveOverride(map[string]interface{}{
+			"Heartbeat": map[string]interface{}{"TimeoutSeconds": *timeoutSeconds},
+		}); err != nil {
+			return false, err
+		}
+	}
+	b.cfg.SetHeartbeatRuntime(timeoutSeconds)
+	return true, nil
+}
+
 // ============================================================================
 // 空实现：用于"该能力在当前进程不可用"的场景（例如 admin 进程未配置内部地址）
 // ============================================================================
@@ -542,5 +605,11 @@ func (b *unavailableRuntimeConfigBackend) RegisterLimit() (RegisterLimitView, er
 	return RegisterLimitView{}, fmt.Errorf("运行时配置不可用：%s", b.reason)
 }
 func (b *unavailableRuntimeConfigBackend) SetRegisterLimit(*bool, *int, *int) (bool, error) {
+	return false, fmt.Errorf("运行时配置不可用：%s", b.reason)
+}
+func (b *unavailableRuntimeConfigBackend) Heartbeat() (HeartbeatView, error) {
+	return HeartbeatView{}, fmt.Errorf("运行时配置不可用：%s", b.reason)
+}
+func (b *unavailableRuntimeConfigBackend) SetHeartbeat(*int) (bool, error) {
 	return false, fmt.Errorf("运行时配置不可用：%s", b.reason)
 }

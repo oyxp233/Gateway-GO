@@ -285,6 +285,7 @@ type runtimeConfigResponse struct {
 	Launcher      httprouter.LauncherView      `json:"launcher"`
 	Maintenance   httprouter.MaintenanceView   `json:"maintenance"`
 	RegisterLimit httprouter.RegisterLimitView `json:"register_limit"`
+	Heartbeat     httprouter.HeartbeatView     `json:"heartbeat"`
 	Online        int                          `json:"online"`
 }
 
@@ -397,6 +398,30 @@ func (b *RemoteRuntimeConfigBackend) OnlineCount() (int, error) {
 		return 0, err
 	}
 	return resp.Online, nil
+}
+
+func (b *RemoteRuntimeConfigBackend) Heartbeat() (httprouter.HeartbeatView, error) {
+	resp, err := b.fetch()
+	if err != nil {
+		return httprouter.HeartbeatView{}, err
+	}
+	return resp.Heartbeat, nil
+}
+
+func (b *RemoteRuntimeConfigBackend) SetHeartbeat(timeoutSeconds *int) (bool, error) {
+	if timeoutSeconds == nil {
+		return false, nil
+	}
+	body := map[string]interface{}{
+		"heartbeat": map[string]interface{}{"timeout_seconds": *timeoutSeconds},
+	}
+	var resp struct {
+		Changed bool `json:"changed"`
+	}
+	if err := b.c.do(http.MethodPost, "/internal/runtime-config", body, &resp); err != nil {
+		return false, err
+	}
+	return resp.Changed, nil
 }
 
 // ============================================================================

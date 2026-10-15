@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>S4A21 Gateway - 管理后台</title>
     <style>
         /* ── 主题变量 ──────────────────────────────────────────────────
@@ -10,250 +13,673 @@
            加主题 = 再加一个 [data-theme="x"] 块，不用满文件找硬编码色。
            当前主题写在 <html data-theme="...">，由右上角切换器改，存 localStorage。 */
         :root, [data-theme="dark"] {
-            --bg: #1a1a2e;
-            --bg-panel: #16213e;
-            --bg-input: #1a1a2e;
-            --bg-pre: #0d1526;
-            --bg-th: #0f3460;
-            --bg-tab-active: #0f3460;
-            --border: #0f3460;
-            --text: #e0e0e0;
+            --bg: #0f1117;
+            --bg-panel: #1a1d29;
+            --bg-panel-2: #232633;
+            --bg-input: #0f1117;
+            --bg-pre: #0b0d14;
+            --bg-th: #1e2230;
+            --bg-tab-active: #232633;
+            --border: #2a2e3e;
+            --border-light: #1e2230;
+            --text: #e4e7ef;
             --text-muted: #8b93a7;
-            --accent: #00d4ff;
-            --accent-hover: #00b8d4;
-            --accent-fg: #1a1a2e;
-            --danger: #e94560;
-            --danger-hover: #c73e54;
-            --success: #4caf50;
-            --success-hover: #43a047;
-            --bg-success: #1b5e20;
-            --bg-danger: #b71c1c;
-            --bg-tag-off: #4a2020;
+            --text-dim: #5c6378;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --accent-fg: #ffffff;
+            --accent-soft: rgba(59,130,246,0.12);
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --danger-soft: rgba(239,68,68,0.12);
+            --success: #22c55e;
+            --success-hover: #16a34a;
+            --success-soft: rgba(34,197,94,0.12);
+            --bg-success: #15803d;
+            --bg-danger: #991b1b;
+            --bg-tag-off: #7f1d1d;
+            --sidebar-bg: #12141c;
+            --sidebar-w: 220px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.25);
         }
         [data-theme="light"] {
-            --bg: #f4f6fa;
+            --bg: #f0f2f5;
             --bg-panel: #ffffff;
+            --bg-panel-2: #f7f8fa;
             --bg-input: #ffffff;
             --bg-pre: #f0f2f5;
             --bg-th: #eef2f7;
-            --bg-tab-active: #e2e8f0;
-            --border: #d8dee9;
+            --bg-tab-active: #e8ecf2;
+            --border: #dde1e8;
+            --border-light: #e8ecf2;
             --text: #1f2329;
             --text-muted: #6b7280;
+            --text-dim: #9ca3af;
             --accent: #2563eb;
             --accent-hover: #1d4ed8;
             --accent-fg: #ffffff;
+            --accent-soft: rgba(37,99,235,0.08);
             --danger: #dc2626;
             --danger-hover: #b91c1c;
+            --danger-soft: rgba(220,38,38,0.08);
             --success: #16a34a;
             --success-hover: #15803d;
+            --success-soft: rgba(22,163,74,0.08);
             --bg-success: #15803d;
-            --bg-danger: #b91c1c;
-            --bg-tag-off: #b91c1c;
+            --bg-danger: #991b1b;
+            --bg-tag-off: #991b1b;
+            --sidebar-bg: #ffffff;
+            --sidebar-w: 220px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.08);
         }
         [data-theme="blue"] {
             --bg: #0b1e3d;
             --bg-panel: #12305c;
+            --bg-panel-2: #1a3d6e;
             --bg-input: #0b1e3d;
             --bg-pre: #08172e;
             --bg-th: #1e4c8a;
             --bg-tab-active: #1e4c8a;
             --border: #1e4c8a;
+            --border-light: #163a6a;
             --text: #e6f0ff;
             --text-muted: #8fb3dd;
+            --text-dim: #6a8fae;
             --accent: #4dabf7;
             --accent-hover: #339af0;
             --accent-fg: #06182f;
+            --accent-soft: rgba(77,171,247,0.12);
             --danger: #ff6b6b;
             --danger-hover: #f03e3e;
+            --danger-soft: rgba(255,107,107,0.12);
             --success: #51cf66;
             --success-hover: #40c057;
+            --success-soft: rgba(81,207,102,0.12);
             --bg-success: #1b7a35;
             --bg-danger: #a02020;
             --bg-tag-off: #a02020;
+            --sidebar-bg: #0e2548;
+            --sidebar-w: 220px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.3);
         }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
             background: var(--bg); color: var(--text);
-            /* 切主题时颜色渐变一下，避免整页闪白 */
             transition: background .15s ease, color .15s ease;
+            overflow-x: hidden;
         }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        h1 { color: var(--accent); margin-bottom: 20px; }
-        h3 { color: var(--accent); margin: 14px 0 8px; font-size: 15px; }
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .tab { padding: 10px 20px; background: var(--bg-panel); border: 1px solid var(--border); cursor: pointer; border-radius: 5px; }
-        .tab.active { background: var(--bg-tab-active); border-color: var(--accent); }
+
+        /* ── 布局：左侧边栏 + 右侧内容 ── */
+        .layout { display: flex; min-height: 100vh; }
+        .sidebar {
+            width: var(--sidebar-w);
+            background: var(--sidebar-bg);
+            border-right: 1px solid var(--border);
+            display: flex; flex-direction: column;
+            position: fixed; top: 0; left: 0; bottom: 0;
+            z-index: 50; overflow-y: auto;
+            transition: transform .25s ease;
+        }
+        .sidebar-header {
+            padding: 18px 16px 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        .sidebar-logo {
+            font-size: 15px; font-weight: 700; color: var(--accent);
+            letter-spacing: -0.3px; margin-bottom: 4px;
+        }
+        .sidebar-sub { font-size: 11px; color: var(--text-dim); }
+        .sidebar-nav { flex: 1; padding: 8px 0; overflow-y: auto; }
+        .sidebar-group { margin-bottom: 2px; }
+        .sidebar-group-title {
+            padding: 10px 16px 6px;
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 1px; color: var(--text-dim);
+            user-select: none; cursor: default;
+        }
+        .sidebar-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 9px 16px; cursor: pointer;
+            font-size: 13px; color: var(--text-muted);
+            border-left: 3px solid transparent;
+            transition: all .12s ease; user-select: none;
+        }
+        .sidebar-item:hover { background: var(--accent-soft); color: var(--text); }
+        .sidebar-item.active {
+            background: var(--accent-soft); color: var(--accent);
+            border-left-color: var(--accent); font-weight: 500;
+        }
+        .sidebar-item-icon {
+            width: 18px; height: 18px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 14px; opacity: 0.7;
+        }
+        .sidebar-item.active .sidebar-item-icon { opacity: 1; }
+        .sidebar-footer {
+            padding: 12px 16px;
+            border-top: 1px solid var(--border);
+            font-size: 11px; color: var(--text-dim);
+        }
+
+        .main-content {
+            flex: 1; margin-left: var(--sidebar-w);
+            padding: 24px 28px 60px;
+            min-height: 100vh;
+        }
+
+        /* ── 功能分页：同一时刻只显示一个页面 ── */
         .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        .card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 5px; padding: 20px; margin-bottom: 20px; }
-        .btn { padding: 8px 16px; background: var(--accent); color: var(--accent-fg); border: none; border-radius: 3px; cursor: pointer; margin-right: 10px; }
-        .btn:hover { background: var(--accent-hover); }
+        .tab-content.active { display: block; animation: pageIn .16s ease; }
+        @keyframes pageIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        .topbar {
+            position: fixed; top: 12px; right: 16px; z-index: 100;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .theme-switch {
+            display: flex; gap: 4px;
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 6px; padding: 3px;
+        }
+        .theme-btn {
+            padding: 4px 10px; font-size: 11px; background: transparent;
+            color: var(--text-muted); border: 1px solid transparent;
+            border-radius: 4px; cursor: pointer; transition: all .12s;
+        }
+        .theme-btn:hover { color: var(--text); border-color: var(--border); }
+        .theme-btn.active { background: var(--accent); color: var(--accent-fg); }
+
+        /* ── 通用元素 ── */
+        .page-header { margin-bottom: 20px; }
+        .page-title { font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+        .page-desc { font-size: 13px; color: var(--text-muted); }
+
+        .card {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 8px; padding: 20px; margin-bottom: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+        h3 { color: var(--accent); margin: 16px 0 10px; font-size: 14px; font-weight: 600; }
+        .card > h3:first-child { margin-top: 0; }
+
+        .btn {
+            padding: 7px 14px; background: var(--accent); color: var(--accent-fg);
+            border: none; border-radius: 5px; cursor: pointer;
+            font-size: 13px; font-weight: 500; transition: all .12s;
+            display: inline-flex; align-items: center; gap: 5px;
+        }
+        .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+        .btn:active { transform: translateY(0); }
         .btn-danger { background: var(--danger); color: #fff; }
         .btn-danger:hover { background: var(--danger-hover); }
         .btn-success { background: var(--success); color: #fff; }
         .btn-success:hover { background: var(--success-hover); }
-        .btn-sm { padding: 4px 10px; font-size: 12px; margin-right: 6px; }
-        .btn:disabled { opacity: .4; cursor: not-allowed; }
-        input, select, textarea { padding: 8px; background: var(--bg-input); border: 1px solid var(--border); color: var(--text); border-radius: 3px; margin-right: 10px; font-family: inherit; }
-        textarea { width: 100%; margin: 0; resize: vertical; }
-        label { margin-right: 6px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid var(--border); word-break: break-all; }
-        th { background: var(--bg-th); }
+        .btn-outline {
+            background: transparent; color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-outline:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+        .btn-sm { padding: 4px 10px; font-size: 12px; }
+        .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+        .btn:disabled:hover { transform: none; }
 
-        /* ==================== 插件清单表（2026-09-30 四轮改版） ====================
-           第一轮：11 列 → 9 列，table-layout:fixed + colgroup 钉列宽，去掉横向滚动条。
-           第二轮：9 列 → 6 列，把语义相邻的两项并进同一格。
-           第三轮（按安南给的表格样式再调）：INI 与 XUI 从「同格上下」拆成**两个独立列**，
-           并且都提到第 1 行，于是列结构是：
-             顺序 | Key/文件 | 显示名称/描述 | INI | XUI | 核心/启用 | 配置界面
-           第 1 行：Key、显示名称、INI、XUI、核心、配置界面
-           第 2 行：DLL、描述、启用、删除（INI / XUI 两列第 2 行留空）
-           ★ 每个格子里用「槽」摆上下两个控件：.plugin-r1 / .plugin-r2。
-             槽 1 固定高 26px —— 这是「文件框与描述框水平对齐」的关键，
-             各列槽 2 的起点因此完全一致；槽 2 只给 min-height（描述框要自动增高）。
-           第四轮（本轮）修描述框：
-             · 右端横跨 INI / XUI 两列（第 2 行那两格是空的）⇒ 描述框右端与 XUI 输入框对齐；
-               写长描述不再三行堆高，一行就放得下。
-             · box-sizing:border-box —— JS 的「高度 = scrollHeight + 2」在 content-box 下
-               会把 padding 白算一份，描述框比同行输入框高 6px（截图里凸出来的就是它）。
-             · 仍然是内容换行就自动增高（槽 2 顶对齐，所以只往下长、不会挤歪上面的行）。
-           核心插件与可选插件仍是两张表，核心那张在上。 */
-        .plugin-table {
-            table-layout: fixed;
-            /* INI / XUI 两列宽 —— 描述框跨列宽度的 calc 必须跟 colgroup 一致，
-               所以写在这里；将来改列宽只改这一处，描述框自动跟着走。 */
-            --plugin-ini-w: 104px;
-            --plugin-xui-w: 104px;
+        input, select, textarea {
+            padding: 8px 10px; background: var(--bg-input);
+            border: 1px solid var(--border); color: var(--text);
+            border-radius: 5px; margin-right: 8px; font-family: inherit; font-size: 13px;
+            transition: border-color .12s;
         }
-        .plugin-table th, .plugin-table td {
-            padding: 5px 7px; word-break: normal; vertical-align: top;
+        input:focus, select:focus, textarea:focus {
+            outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
         }
-        .plugin-table th { font-size: 12px; }
-        .plugin-table input, .plugin-table select {
-            padding: 3px 5px; margin-right: 0; font-size: 12px; width: 100%;
+        textarea { width: 100%; margin: 0; resize: vertical; }
+        label { margin-right: 6px; font-size: 13px; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border-light); word-break: break-word; font-size: 13px; }
+        th {
+            background: var(--bg-th); font-weight: 600; font-size: 12px;
+            text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted);
+            position: sticky; top: 0; z-index: 5;
         }
-        /* 槽：格子内的上下两行。槽 1 定高 → 跨列对齐才有保证；槽 2 只给下限高度 */
-        .plugin-table .plugin-r1,
-        .plugin-table .plugin-r2 { display: flex; gap: 4px; }
-        /* 槽 1：定高 + 垂直居中 —— 各列第 1 行的控件都在 26px 里居中，中心线自然齐平 */
+        tbody tr:hover { background: var(--accent-soft); }
+
+        /* ── 仪表盘 ── */
+        .dashboard-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 14px; margin-bottom: 20px;
+        }
+        .dash-card {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 8px; padding: 18px;
+            transition: transform .12s, box-shadow .12s;
+        }
+        .dash-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+        .dash-card-label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .dash-card-value { font-size: 26px; font-weight: 700; color: var(--text); line-height: 1.2; }
+        .dash-card-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+        .dash-card-icon {
+            width: 36px; height: 36px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 18px; margin-bottom: 10px;
+        }
+        .dash-card-icon.accent { background: var(--accent-soft); color: var(--accent); }
+        .dash-card-icon.success { background: var(--success-soft); color: var(--success); }
+        .dash-card-icon.danger { background: var(--danger-soft); color: var(--danger); }
+        .dash-card-icon.warn { background: rgba(245,158,11,0.12); color: #f59e0b; }
+
+        .dash-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+        @media (max-width: 900px) { .dash-row { grid-template-columns: 1fr; } }
+
+        .status-list { list-style: none; }
+        .status-list li {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 0; border-bottom: 1px solid var(--border-light);
+        }
+        .status-list li:last-child { border-bottom: none; }
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            display: inline-block; margin-right: 8px;
+        }
+        .status-dot.ok { background: var(--success); box-shadow: 0 0 6px var(--success); }
+        .status-dot.err { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+        .status-dot.warn { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+        .status-dot.off { background: var(--text-dim); }
+
+        /* ── Toast 通知 ── */
+        .toast-container {
+            /* 放右下角：右上角是密钥输入框所在，弹窗会挡住没法输入 */
+            position: fixed; bottom: 20px; right: 20px; z-index: 9999;
+            display: flex; flex-direction: column; gap: 8px;
+            max-height: 60vh; overflow: hidden;
+            pointer-events: none;
+        }
+        .toast {
+            min-width: 280px; max-width: 420px;
+            padding: 12px 16px; border-radius: 8px;
+            background: var(--bg-panel); border: 1px solid var(--border);
+            box-shadow: var(--shadow); color: var(--text); font-size: 13px;
+            display: flex; align-items: flex-start; gap: 10px;
+            pointer-events: all;
+            animation: toastIn .25s ease;
+        }
+        .toast.removing { animation: toastOut .2s ease forwards; }
+        @keyframes toastIn { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes toastOut { to { opacity: 0; transform: translateX(40px); } }
+        .toast-icon { font-size: 18px; flex-shrink: 0; line-height: 1.3; }
+        .toast.success .toast-icon { color: var(--success); }
+        .toast.error .toast-icon { color: var(--danger); }
+        .toast.info .toast-icon { color: var(--accent); }
+        .toast-body { flex: 1; line-height: 1.5; }
+        .toast-title { font-weight: 600; margin-bottom: 2px; }
+
+        /* ── Modal 确认框 ── */
+        .modal-overlay {
+            position: fixed; inset: 0; z-index: 9000;
+            background: rgba(0,0,0,0.5); backdrop-filter: blur(4px);
+            display: flex; align-items: center; justify-content: center;
+            animation: fadeIn .15s ease;
+        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .modal-box {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 12px; padding: 24px; max-width: 480px; width: 90%;
+            box-shadow: var(--shadow);
+            animation: modalIn .2s ease;
+        }
+        @keyframes modalIn { from { opacity: 0; transform: scale(0.95) translateY(10px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+        .modal-title { font-size: 16px; font-weight: 600; margin-bottom: 10px; }
+        .modal-body { font-size: 14px; color: var(--text-muted); line-height: 1.6; margin-bottom: 20px; white-space: pre-line; }
+        .modal-body.danger-text { color: var(--danger); }
+        .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+        .modal-danger-bar {
+            height: 3px; background: var(--danger);
+            border-radius: 3px; margin: -24px -24px 20px;
+        }
+        .modal-danger-bar.warn { background: #f59e0b; }
+
+        /* ── Loading 骨架屏 ── */
+        .skeleton { position: relative; overflow: hidden; }
+        .skeleton::after {
+            content: ''; position: absolute; inset: 0;
+            background: linear-gradient(90deg, transparent, var(--border-light), transparent);
+            animation: shimmer 1.2s infinite;
+        }
+        @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+        .skeleton-row { height: 40px; margin: 8px 0; border-radius: 4px; background: var(--border-light); }
+        .skeleton-block { height: 120px; border-radius: 8px; background: var(--border-light); }
+        .skeleton-inline { display: inline-block; width: 80px; height: 16px; border-radius: 3px; background: var(--border-light); vertical-align: middle; }
+
+
+        /* Workflow overlay specific */
+        #workflowOverlay { font-size: 14px; }
+        #workflowOverlay .workflow-step { cursor: pointer; }
+        #workflowOverlay .workflow-step:hover { border-color: var(--accent); }
+
+        /* ── 工具类 ── */
+        .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+        .row input, .row select { margin-right: 0; }
+        .muted { color: var(--text-muted); font-size: 12px; }
+        .dim { color: var(--text-dim); }
+        .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #fff; font-weight: 500; }
+        .tag-on { background: var(--bg-success); border: 1px solid var(--success); }
+        .tag-off { background: var(--bg-tag-off); border: 1px solid var(--danger); }
+        .tag-warn { background: var(--bg-th); border: 1px solid #f59e0b; color: #f59e0b; }
+        .tag-neutral { background: var(--bg-th); border: 1px solid var(--border); color: var(--text-muted); }
+        .stack > div + div { margin-top: 3px; }
+        .pre {
+            background: var(--bg-pre); border: 1px solid var(--border);
+            border-radius: 5px; padding: 12px; max-height: 340px; overflow: auto;
+            white-space: pre-wrap; font-family: Consolas, Monaco, monospace; font-size: 12px; margin-top: 10px;
+        }
+        .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
+        .pager { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
+        .td-actions { word-break: normal; white-space: normal; }
+        .alert { padding: 10px 14px; border-radius: 5px; margin-bottom: 10px; color: #fff; font-size: 13px; }
+        .alert-success { background: var(--bg-success); border: 1px solid var(--success); }
+        .alert-error { background: var(--bg-danger); border: 1px solid var(--danger); }
+        .role-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 0 2px; }
+        .role-toolbar input, .role-toolbar select { margin-right: 0; }
+        .role-toolbar input[type="number"] { width: 110px; }
+        .role-toolbar input.item-id { width: 140px; }
+        details.card > summary { cursor: pointer; color: var(--accent); font-weight: 600; padding: 4px 0; }
+        details.card[open] > summary { margin-bottom: 10px; }
+
+        /* ── 插件表专用 ── */
+        .plugin-table { table-layout: fixed; --plugin-ini-w: 104px; --plugin-xui-w: 104px; }
+        .plugin-table th, .plugin-table td { padding: 5px 7px; word-break: normal; vertical-align: top; }
+        .plugin-table th { font-size: 11px; }
+        .plugin-table input, .plugin-table select { padding: 3px 5px; margin-right: 0; font-size: 12px; width: 100%; }
+        .plugin-table .plugin-r1, .plugin-table .plugin-r2 { display: flex; gap: 4px; }
         .plugin-table .plugin-r1 { height: 26px; align-items: center; }
-        /* 槽 2：**顶对齐** —— 描述框会随内容增高，只有"起点对齐"才是真的和文件框对齐 */
         .plugin-table .plugin-r2 { min-height: 26px; margin-top: 3px; align-items: flex-start; }
-        /* 槽 2 里的勾选撑到与输入框同高，否则 13px 的方块顶在最上面会显得飘 */
         .plugin-table .plugin-r2 > .plugin-chk { height: 24px; }
-        /* 拖动柄：只有按住它才允许拖整行 —— 否则在输入框里选文字都会变成拖行 */
-        .plugin-table .drag-handle {
-            cursor: grab; user-select: none; padding: 0 3px;
-            color: var(--text-muted); font-size: 14px; letter-spacing: -1px;
-        }
+        .plugin-table .drag-handle { cursor: grab; user-select: none; padding: 0 3px; color: var(--text-muted); font-size: 14px; letter-spacing: -1px; }
         .plugin-table .drag-handle:active { cursor: grabbing; }
         .plugin-table tr.dragging { opacity: .4; }
-        /* 落点提示：插到这一行之前 / 之后，用上 / 下边缘的高亮条表示 */
         .plugin-table tr.drop-before td { box-shadow: inset 0 2px 0 var(--accent); }
         .plugin-table tr.drop-after td { box-shadow: inset 0 -2px 0 var(--accent); }
-        /* 核心插件行左侧再加一道色条，分区之外多一层视觉锚点 */
         .plugin-table tr.is-core td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
-        .plugin-group-title {
-            margin: 16px 0 2px; font-size: 13px; font-weight: 600; color: var(--accent);
-        }
-        /* 「顺序」格：⠿ 与数字并排（都在第 1 行，与 Key 同高） */
+        .plugin-group-title { margin: 16px 0 2px; font-size: 13px; font-weight: 600; color: var(--accent); }
         .plugin-seq-cell { white-space: nowrap; }
         .plugin-seq { margin-left: 6px; font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-        /* 描述：常显的小字编辑区，支持换行、随内容自动增高（不折叠、也不撑列宽）
-           ★ 宽度跨到 XUI 列右端：右端与 XUI 输入框右端对齐（第 2 行 INI/XUI 两格是空的，
-             横向借过来用）。flex 子项默认可被压缩，跨列宽必须 flex:none 锁死。
-           ★ box-sizing 必须是 border-box（全局第 75 行已设，这里显式声明是提醒高度算法
-             依赖它）：scrollHeight 含 padding、不含 border，所以 JS 用
-             height = scrollHeight + 2px 得到的正好是「内容 + padding + 边框」。
-           ★ 高度还有第二个坑：自适应必须在 tr **已经进 DOM 之后**量 —— 游离节点继承不到
-             父链的 font-size（退回 16px），量出来会偏高 7px，框就凸出同行一截。 */
         .plugin-desc-ta {
             display: block; flex: none;
             width: calc(100% + var(--plugin-ini-w) + var(--plugin-xui-w));
-            box-sizing: border-box;
-            /* padding 取 3px 5px 与同行输入框一致 ⇒ 单行时两者总高都是 22px（含边框） */
-            padding: 3px 5px;
+            box-sizing: border-box; padding: 3px 5px;
             font-size: 11px; line-height: 1.45; color: var(--text-muted);
             background: transparent; border: 1px solid transparent; border-radius: 3px;
             resize: none; overflow: hidden;
         }
         .plugin-desc-ta:hover { border-color: var(--border); }
         .plugin-desc-ta:focus { border-color: var(--accent); background: var(--bg); }
-        /* 「核心 / 启用」格：两枚勾选各占一个槽，槽内居中 */
         .plugin-chk { display: flex; align-items: center; gap: 4px; margin: 0 auto; font-size: 12px; }
         .plugin-chk input { width: auto; }
-        /* 「配置界面」格：下拉 / 删除各自撑满一格 */
         .plugin-r1 > select, .plugin-r2 > .btn { width: 100%; }
-        .alert { padding: 10px; border-radius: 3px; margin-bottom: 10px; color: #fff; }
-        .alert-success { background: var(--bg-success); border: 1px solid var(--success); }
-        .alert-error { background: var(--bg-danger); border: 1px solid var(--danger); }
-        /* 右上角：主题切换 + 管理密钥。两行竖排，避免挤成一条 */
-        .topbar { position: fixed; top: 10px; right: 10px; z-index: 100; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
-        .theme-switch { display: flex; gap: 6px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 5px; padding: 4px; }
-        .theme-btn { padding: 4px 10px; font-size: 12px; background: transparent; color: var(--text); border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
-        .theme-btn:hover { border-color: var(--border); }
-        .theme-btn.active { background: var(--accent); color: var(--accent-fg); }
-        .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-        .row input, .row select { margin-right: 0; }
-        .muted { color: var(--text-muted); font-size: 12px; }
-        .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
-        .tag-on { background: var(--bg-success); border: 1px solid var(--success); }
-        .tag-off { background: var(--bg-tag-off); border: 1px solid var(--danger); }
-        /* 状态列补充标签：只用已有变量，不新增主题色，三套主题自动都对。
-           「锁定」是登录失败自动锁定（不是管理员封禁），用描边色区分开。 */
-        .tag-warn { background: var(--bg-th); border: 1px solid var(--accent); color: var(--accent); }
-        .tag-neutral { background: var(--bg-th); border: 1px solid var(--border); color: var(--text-muted); }
-        /* 一个单元格里竖排两行（状态列的两枚标签、最近登录列的时间+IP） */
-        .stack > div + div { margin-top: 3px; }
-        /* 「查看角色」展开区里的发放道具工具条 */
-        .role-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 0 2px; }
-        .role-toolbar input, .role-toolbar select { margin-right: 0; }
-        .role-toolbar input[type="number"] { width: 110px; }
-        .role-toolbar input.item-id { width: 140px; }
-        /* 折叠的危险操作区（批量改密） */
-        details.card > summary { cursor: pointer; color: var(--accent); font-weight: 600; }
-        details.card[open] > summary { margin-bottom: 10px; }
-        /* 操作列按钮多（6 个），单元格允许换行但不能从按钮文字中间断行 */
-        .td-actions { word-break: normal; white-space: normal; }
-        .pre { background: var(--bg-pre); border: 1px solid var(--border); border-radius: 3px; padding: 10px; max-height: 340px; overflow: auto; white-space: pre-wrap; font-family: Consolas, Monaco, monospace; font-size: 12px; margin-top: 10px; }
-        .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
-        .pager { margin-top: 10px; }
+
+        /* ── 更新流程向导 ── */
+        .workflow-container { max-width: 720px; margin: 0 auto; }
+        .workflow-header {
+            text-align: center; padding: 24px 0 20px;
+            border-bottom: 1px solid var(--border); margin-bottom: 24px;
+        }
+        .workflow-title { font-size: 20px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+        .workflow-desc { font-size: 13px; color: var(--text-muted); }
+        .workflow-progress {
+            display: flex; align-items: center; gap: 4px;
+            margin: 20px 0; padding: 0 20px;
+        }
+        .workflow-progress-line {
+            flex: 1; height: 2px; background: var(--border);
+            position: relative; overflow: hidden;
+        }
+        .workflow-progress-line.done { background: var(--success); }
+        .workflow-progress-line.active { background: linear-gradient(90deg, var(--success), var(--accent)); }
+        .workflow-progress-dot {
+            width: 28px; height: 28px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: 700; color: var(--text-dim);
+            background: var(--bg-panel); border: 2px solid var(--border);
+            flex-shrink: 0; transition: all .2s;
+        }
+        .workflow-progress-dot.done { background: var(--success); border-color: var(--success); color: #fff; }
+        .workflow-progress-dot.active { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); box-shadow: 0 0 12px var(--accent-soft); }
+        .workflow-steps { display: flex; flex-direction: column; gap: 12px; }
+        .workflow-step {
+            display: flex; align-items: stretch; gap: 16px;
+            padding: 16px 20px; border-radius: 8px;
+            background: var(--bg-panel); border: 1px solid var(--border);
+            transition: all .2s;
+        }
+        .workflow-step.active { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+        .workflow-step.done { border-color: var(--success); opacity: 0.85; }
+        .workflow-step-icon {
+            width: 40px; height: 40px; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 20px; flex-shrink: 0;
+            background: var(--bg-panel-2); border: 1px solid var(--border);
+        }
+        .workflow-step.done .workflow-step-icon { background: var(--success-soft); border-color: var(--success); }
+        .workflow-step.active .workflow-step-icon { background: var(--accent-soft); border-color: var(--accent); }
+        .workflow-step-body { flex: 1; min-width: 0; }
+        .workflow-step-num { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); }
+        .workflow-step-title { font-size: 15px; font-weight: 600; margin: 2px 0 4px; color: var(--text); }
+        .workflow-step-desc { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+        .workflow-step-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .workflow-step-status {
+            font-size: 11px; padding: 3px 10px; border-radius: 12px;
+            font-weight: 600; white-space: nowrap;
+        }
+        .workflow-step-status.done { background: var(--success-soft); color: var(--success); }
+        .workflow-step-status.pending { background: var(--bg-panel-2); color: var(--text-dim); }
+        .workflow-step-status.running { background: var(--accent-soft); color: var(--accent); animation: pulse 1.2s infinite; }
+        .workflow-step-status.error { background: var(--danger-soft); color: var(--danger); }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .workflow-step-input { width: 100%; margin-top: 8px; }
+        .workflow-file-label {
+            display: flex; align-items: center; justify-content: center;
+            padding: 12px; border: 2px dashed var(--border); border-radius: 8px;
+            cursor: pointer; font-size: 13px; color: var(--text-muted);
+            transition: all .15s; margin-top: 8px;
+        }
+        .workflow-file-label:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+        .workflow-file-label.has-file { border-color: var(--success); color: var(--success); background: var(--success-soft); }
+        .workflow-file-label input[type="file"] { display: none; }
+        .workflow-footer {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border);
+        }
     </style>
 </head>
 <body>
-    <div class="topbar">
-        <div class="theme-switch" id="themeSwitch">
-            <button class="theme-btn" data-theme="light" onclick="setTheme('light')">亮色</button>
-            <button class="theme-btn" data-theme="dark" onclick="setTheme('dark')">暗色</button>
-            <button class="theme-btn" data-theme="blue" onclick="setTheme('blue')">蓝色</button>
+    <script>console.log('[S4A21] v3.5 - page loaded at', new Date().toLocaleTimeString());</script>
+    <div class="toast-container" id="toastContainer"></div>
+    <div class="layout">
+        <!-- ── 左侧边栏 ── -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-logo">S4A21 Gateway</div>
+                <div class="sidebar-sub">管理后台 v2</div>
+            </div>
+            <div class="sidebar-nav">
+                <!-- 仪表盘 -->
+                <div class="sidebar-group">
+                    <div class="sidebar-group-title">总览</div>
+                    <div class="sidebar-item active" data-tab="dashboard">
+                        <span class="sidebar-item-icon">📊</span> 仪表盘
+                    </div>
+                </div>
+                <!-- 实时监控 -->
+                <div class="sidebar-group">
+                    <div class="sidebar-group-title">实时监控</div>
+                    <div class="sidebar-item" data-tab="online">
+                        <span class="sidebar-item-icon">👥</span> 在线玩家
+                    </div>
+                    <div class="sidebar-item" data-tab="anticheat">
+                        <span class="sidebar-item-icon">🛡️</span> 外挂监控
+                    </div>
+                </div>
+                <!-- 账号与封禁 -->
+                <div class="sidebar-group">
+                    <div class="sidebar-group-title">账号管理</div>
+                    <div class="sidebar-item" data-tab="accounts">
+                        <span class="sidebar-item-icon">👤</span> 账号管理
+                    </div>
+                    <div class="sidebar-item" data-tab="bans">
+                        <span class="sidebar-item-icon">🚫</span> 封禁管理
+                    </div>
+                    <div class="sidebar-item" data-tab="registerlimit">
+                        <span class="sidebar-item-icon">🔒</span> 注册限制
+                    </div>
+                </div>
+                <!-- 发放与公告 -->
+                <div class="sidebar-group">
+                    <div class="sidebar-group-title">运营活动</div>
+                    <div class="sidebar-item" data-tab="broadcast">
+                        <span class="sidebar-item-icon">📦</span> 全服发放
+                    </div>
+                    <div class="sidebar-item" data-tab="announce">
+                        <span class="sidebar-item-icon">📢</span> 公告管理
+                    </div>
+                </div>
+                <!-- 客户端配置 -->
+                <div class="sidebar-group">
+                    <div class="sidebar-group-title">客户端配置</div>
+                    <div class="sidebar-item" data-tab="integrity">
+                        <span class="sidebar-item-icon">🔍</span> 客户端校验
+                    </div>
+                    <div class="sidebar-item" data-tab="launcher">
+                        <span class="sidebar-item-icon">📥</span> 客户端配置
+                    </div>
+                    <div class="sidebar-item" data-tab="plugins">
+                        <span class="sidebar-item-icon">🔌</span> 插件管理
+                    </div>
+                </div>
+                <!-- 服务端管理 -->
+                <div class="sidebar-group">
+                    <div class="sidebar-group-title">系统运维</div>
+                    <div class="sidebar-item" data-tab="server">
+                        <span class="sidebar-item-icon">🖥️</span> 服务端管理
+                    </div>
+                    <div class="sidebar-item" data-tab="gateway">
+                        <span class="sidebar-item-icon">🌐</span> 网关管理
+                    </div>
+                    <div class="sidebar-item" data-tab="ports">
+                        <span class="sidebar-item-icon">🔌</span> 游戏端口
+                    </div>
+                    <div class="sidebar-item" data-tab="maintenance">
+                        <span class="sidebar-item-icon">🔧</span> 维护模式
+                    </div>
+                    <div class="sidebar-item" data-tab="heartbeat">
+                        <span class="sidebar-item-icon">💓</span> 心跳超时
+                    </div>
+                </div>
+            </div>
+            <div class="sidebar-footer">
+                <div>密钥: <span id="authStatus">未设置</span> | v3.5</div>
+            </div>
         </div>
-        <input type="password" id="authKey" placeholder="管理密钥" style="width: 200px; margin-right: 0;">
-    </div>
-    <div class="container">
-        <h1>S4A21 Gateway 管理后台</h1>
-        <div class="tabs">
-            <div class="tab active" data-tab="online">在线玩家</div>
-            <div class="tab" data-tab="accounts">账号管理</div>
-            <div class="tab" data-tab="bans">封禁管理</div>
-            <div class="tab" data-tab="broadcast">全服发放</div>
-            <div class="tab" data-tab="announce">公告管理</div>
-            <div class="tab" data-tab="integrity">客户端校验</div>
-            <div class="tab" data-tab="server">服务端管理</div>
-            <div class="tab" data-tab="gateway">网关管理</div>
-            <div class="tab" data-tab="ports">游戏端口</div>
-            <div class="tab" data-tab="anticheat">外挂监控</div>
-            <div class="tab" data-tab="launcher">客户端配置</div>
-            <div class="tab" data-tab="plugins">插件管理</div>
-            <div class="tab" data-tab="maintenance">维护模式</div>
-            <div class="tab" data-tab="registerlimit">注册限制</div>
-        </div>
+        <!-- ── 右侧主内容 ── -->
+        <div class="main-content">
+            <div class="topbar">
+                <div class="theme-switch" id="themeSwitch">
+                    <button class="theme-btn" data-theme="light" onclick="setTheme('light')">亮色</button>
+                    <button class="theme-btn" data-theme="dark" onclick="setTheme('dark')">暗色</button>
+                    <button class="theme-btn" data-theme="blue" onclick="setTheme('blue')">蓝色</button>
+                </div>
+                <input type="password" id="authKey" placeholder="管理密钥" style="width: 180px; margin-right: 0;" oninput="if(typeof updateAuthStatus==='function')updateAuthStatus()">
+                <span style="font-size:11px;color:var(--text-dim);">v3.5</span>
+            </div>
 
-        <!-- ==================== 在线玩家 ==================== -->
-        <div id="online" class="tab-content active">
+            <!-- ==================== 仪表盘 ==================== -->
+            <div id="dashboard" class="tab-content active">
+                <div class="page-header">
+                    <div class="page-title">仪表盘</div>
+                    <div class="page-desc">服务器运行状态概览</div>
+                </div>
+                <div class="dashboard-grid">
+                    <div class="dash-card">
+                        <div class="dash-card-icon accent">👥</div>
+                        <div class="dash-card-label">在线玩家</div>
+                        <div class="dash-card-value" id="dashOnlineCount">-</div>
+                        <div class="dash-card-sub">当前活跃连接数</div>
+                    </div>
+                    <div class="dash-card">
+                        <div class="dash-card-icon success">🏷️</div>
+                        <div class="dash-card-label">总账号数</div>
+                        <div class="dash-card-value" id="dashTotalAccounts">-</div>
+                        <div class="dash-card-sub">已注册账号总量</div>
+                    </div>
+                    <div class="dash-card">
+                        <div class="dash-card-icon warn">💰</div>
+                        <div class="dash-card-label">点券总量</div>
+                        <div class="dash-card-value" id="dashTotalCera">-</div>
+                        <div class="dash-card-sub">全部账号点券合计</div>
+                    </div>
+                    <div class="dash-card">
+                        <div class="dash-card-icon danger">🚫</div>
+                        <div class="dash-card-label">封禁账号</div>
+                        <div class="dash-card-value" id="dashBannedCount">-</div>
+                        <div class="dash-card-sub">当前被禁账号数</div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 20px;">
+                    <button class="btn btn-outline" style="width:100%; padding:14px; font-size:15px; font-weight:600; justify-content:center;"
+                            onclick="openWorkflow()">
+                        🚀 一键更新 — 启动标准更新流程
+                    </button>
+                </div>
+
+                <div class="dash-row">
+                    <div class="card">
+                        <h3>服务状态</h3>
+                        <ul class="status-list">
+                            <li>
+                                <span><span class="status-dot off" id="dashServerDot"></span>游戏服务端</span>
+                                <span id="dashServerStatus" class="muted">检查中…</span>
+                            </li>
+                            <li>
+                                <span><span class="status-dot off" id="dashGwDot"></span>网关进程</span>
+                                <span id="dashGwStatus" class="muted">检查中…</span>
+                            </li>
+                            <li>
+                                <span><span class="status-dot off" id="dashAnnounceDot"></span>公告服务</span>
+                                <span id="dashAnnounceStatus" class="muted">检查中…</span>
+                            </li>
+                            <li>
+                                <span><span class="status-dot off" id="dashMaintDot"></span>维护模式</span>
+                                <span id="dashMaintStatus" class="muted">检查中…</span>
+                            </li>
+                        </ul>
+                    </div>
+                    <div class="card">
+                        <h3>系统信息</h3>
+                        <ul class="status-list">
+                            <li><span>登录器最低版本</span><span id="dashLauncherMinVer" class="muted">-</span></li>
+                            <li><span>当前分发版本</span><span id="dashLauncherCurVer" class="muted">-</span></li>
+                            <li><span>插件下发状态</span><span id="dashPluginStatus" class="muted">-</span></li>
+                            <li><span>PVF 指纹</span><span id="dashPvfHash" class="muted">-</span></li>
+                            <li><span>端口监听数</span><span id="dashPortCount" class="muted">-</span></li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>今日概况</h3>
+                    <div class="row" style="justify-content: space-between;">
+                        <div><span class="muted">今日注册：</span><b id="dashTodayReg">-</b></div>
+                        <div><span class="muted">今日在线峰值：</span><b id="dashPeakOnline">-</b></div>
+                        <div><span class="muted">外挂检测：</span><b id="dashAcCount">-</b></div>
+                    </div>
+                </div>
+            </div>
+
+        <div id="online" class="tab-content">
             <div class="card">
                 <button class="btn" onclick="loadOnline()">刷新</button>
                 <button class="btn btn-danger" onclick="kickAll()">踢全部下线</button>
@@ -274,6 +700,7 @@
                     <button class="btn" onclick="loadAccounts(1)">查询</button>
                     <button class="btn" onclick="syncAccounts()">同步游戏库</button>
                     <select id="accountPageSize" onchange="changeAccountPageSize()" title="每页显示数量">
+                        <option value="20">每页 20</option>
                         <option value="50">每页 50</option>
                         <option value="100">每页 100</option>
                         <option value="200">每页 200</option>
@@ -950,6 +1377,38 @@
             </div>
         </div>
 
+        <!-- ==================== 心跳超时 ==================== -->
+        <div id="heartbeat" class="tab-content">
+            <div class="card">
+                <h3>心跳超时（会话保活阈值）</h3>
+                <p class="muted">
+                    登录器每 <b>30 秒</b> 发一次心跳；网关每 30 秒巡检一次，把「心跳停滞超过本值」的会话
+                    <b>连同它的游戏连接一起清掉</b>（玩家表现为「在游戏里被踢下线」）。
+                    保存后<b>立即生效</b>，不用重启网关，也不影响在线玩家。
+                </p>
+                <p class="muted">
+                    <b>取值必须大于 30</b>（否则每个正常心跳之间都会被判超时，等于把所有在线玩家清掉）。
+                    60 = 只容忍丢 1 拍；<b>120 = 容忍丢 3 拍</b>（推荐）—— 能扛住玩家侧链路抖一下、
+                    以及客户端短时间把心跳停掉。
+                </p>
+                <div class="row">
+                    <label>超时秒数</label>
+                    <input type="number" id="hbTimeout" min="30" max="3600" step="1" style="width: 90px;">
+                    <span class="muted">秒（范围 30~3600）</span>
+                </div>
+                <div class="row">
+                    <button class="btn" onclick="saveHeartbeat()">保存</button>
+                    <button class="btn" onclick="loadHeartbeat()">刷新</button>
+                    <span id="hbOverride" class="muted"></span>
+                </div>
+                <p class="muted">
+                    巡检周期固定 30 秒，所以新值最多在 <b>30 秒后</b> 开始生效。
+                    调大之后，原本会被误清的会话就不会再被清；
+                    但**已经被清掉的会话不会自动恢复**（那几名玩家需要重新登录）。
+                </p>
+            </div>
+        </div>
+
         <!-- ==================== 注册限制 ==================== -->
         <div id="registerlimit" class="tab-content">
             <div class="card">
@@ -1190,7 +1649,11 @@
             applyTheme(t);
         }
 
-        applyTheme(localStorage.getItem(THEME_KEY));
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => applyTheme(localStorage.getItem(THEME_KEY)));
+        } else {
+            applyTheme(localStorage.getItem(THEME_KEY));
+        }
 
         // fmtUtcText 显示后端返回的 **UTC 文本** 时间（统一换算成北京时间）。
         //
@@ -1285,14 +1748,6 @@
             return h.length > 20 ? h.slice(0, 12) + '…' + h.slice(-6) : h;
         }
 
-        // 统一结果提示条。type: 'success' | 'error'
-        function showResult(id, type, text) {
-            const box = document.getElementById(id);
-            if (!box) { alert(text); return; }
-            box.innerHTML = `<div class="alert alert-${type}">${esc(text)}</div>`;
-            if (type === 'success') setTimeout(() => { if (box.innerHTML.indexOf(esc(text)) >= 0) box.innerHTML = ''; }, 6000);
-        }
-
         function setText(id, text) {
             const el = document.getElementById(id);
             if (el) el.innerText = text || '';
@@ -1309,12 +1764,11 @@
             if (body) opts.body = JSON.stringify(body);
             const resp = await fetch(path, opts);
             if (resp.status === 401) {
-                alert('管理密钥错误或未设置');
-                authKey = document.getElementById('authKey').value;
-                localStorage.setItem('authKey', authKey);
+                // 只提示一次，绝不自动重试 —— 重试会形成 401→重试→401 的死循环刷屏。
+                showToastOnce('error', '', '管理密钥错误或未设置');
                 return null;
             }
-            return await resp.json();
+            return await parseApiBody(resp, path);
         }
 
         // 文件上传走 multipart，不能带 Content-Type（由浏览器自动生成 boundary）。
@@ -1325,10 +1779,229 @@
                 body: formData
             });
             if (resp.status === 401) {
-                alert('管理密钥错误或未设置');
+                showToastOnce('error', '', '管理密钥错误或未设置');
                 return null;
             }
-            return await resp.json();
+            return await parseApiBody(resp, path);
+        }
+
+        // 404/500 时后端返回的是纯文本（如 "404 page not found"），直接 .json()
+        // 会抛 SyntaxError 把调用栈搞脏。这里统一兜住：非 2xx 记一条 warn 返回 null，
+        // 各页面的 load 函数拿到 null 就自己 return，不会崩。
+        async function parseApiBody(resp, path) {
+            if (!resp.ok) {
+                console.warn('[S4A21] 接口 ' + resp.status + '：' + path);
+                return null;
+            }
+            try {
+                return await resp.json();
+            } catch (e) {
+                console.warn('[S4A21] 响应不是 JSON：' + path);
+                return null;
+            }
+        }
+
+        // ==================== Toast 通知系统 ====================
+
+        function showToast(type, title, message, duration) {
+            const container = document.getElementById('toastContainer');
+            const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+            const el = document.createElement('div');
+            el.className = 'toast ' + type;
+            el.innerHTML = '<div class="toast-icon">' + icons[type] + '</div>' +
+                '<div class="toast-body">' +
+                (title ? '<div class="toast-title">' + esc(title) + '</div>' : '') +
+                '<div>' + esc(message) + '</div>' +
+                '</div>';
+            container.appendChild(el);
+            const dur = duration || (type === 'error' ? 8000 : 4000);
+            setTimeout(() => {
+                el.classList.add('removing');
+                setTimeout(() => el.remove(), 200);
+            }, dur);
+        }
+
+        // 同一条消息 4 秒内只弹一次 —— 防止 401 等多处并发请求把同一句提示刷满屏。
+        let _lastToast = { text: '', at: 0 };
+        function showToastOnce(type, title, message) {
+            const now = Date.now();
+            if (_lastToast.text === message && (now - _lastToast.at) < 4000) return;
+            _lastToast = { text: message, at: now };
+            showToast(type, title, message);
+        }
+
+        // 兼容旧代码的 showResult —— 改为调用 toast
+        function showResult(id, type, text) {
+            // 仍然保留原元素更新（部分页面依赖它），同时弹 toast
+            const box = document.getElementById(id);
+            if (box) {
+                box.innerHTML = '<div class="alert alert-' + type + '">' + esc(text) + '</div>';
+                if (type === 'success') setTimeout(() => { if (box.innerHTML.indexOf(esc(text)) >= 0) box.innerHTML = ''; }, 6000);
+            }
+            showToast(type === 'success' ? 'success' : 'error', '', text);
+        }
+
+
+        // 更新密钥状态显示
+        let _dashTimer = null;
+        function updateAuthStatus() {
+            const el = document.getElementById('authKey');
+            const key = el ? el.value : '';
+            const prevKey = authKey;
+            authKey = key;
+            localStorage.setItem('authKey', key);
+            const status = document.getElementById('authStatus');
+            if (status) status.textContent = key ? '已设置' : '未设置';
+            // 输入是逐字符触发的，必须防抖：否则每敲一个字符就发一批请求，
+            // 半截的密钥必然 401，于是提示刷屏、输入框被盖住没法继续填。
+            if (key !== prevKey && key) {
+                clearTimeout(_dashTimer);
+                _dashTimer = setTimeout(loadDashboard, 600);
+            }
+        }
+
+        // ==================== Modal 确认框 ====================
+
+        function showConfirmModal(title, message, options) {
+            options = options || {};
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'modal-overlay';
+                const dangerLevel = options.level || 'normal'; // normal | warn | danger
+                const barClass = dangerLevel === 'danger' ? 'modal-danger-bar' : (dangerLevel === 'warn' ? 'modal-danger-bar warn' : '');
+                overlay.innerHTML = '<div class="modal-box">' +
+                    (barClass ? '<div class="' + barClass + '"></div>' : '') +
+                    '<div class="modal-title">' + esc(title) + '</div>' +
+                    '<div class="modal-body' + (dangerLevel === 'danger' ? ' danger-text' : '') + '">' + esc(message) + '</div>' +
+                    '<div class="modal-actions">' +
+                    '<button class="btn btn-outline" id="modalCancel">取消</button>' +
+                    '<button class="btn ' + (dangerLevel === 'danger' ? 'btn-danger' : 'btn') + '" id="modalConfirm">' +
+                    esc(options.confirmText || '确认') + '</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                overlay.querySelector('#modalCancel').addEventListener('click', () => { overlay.remove(); resolve(false); });
+                overlay.querySelector('#modalConfirm').addEventListener('click', () => { overlay.remove(); resolve(true); });
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) { overlay.remove(); resolve(false); } });
+                // 自动聚焦确认按钮
+                setTimeout(() => overlay.querySelector('#modalConfirm').focus(), 100);
+            });
+        }
+
+        // 包装旧的 confirm/alert，统一走 toast/modal
+        const _nativeConfirm = window.confirm;
+        const _nativeAlert = window.alert;
+
+        // ==================== 仪表盘数据加载 ====================
+
+        async function loadDashboard() {
+            // 在线玩家数
+            try {
+                const onlineData = await api('/api/admin/online');
+                if (onlineData) {
+                    const players = onlineData.players || [];
+                    setText('dashOnlineCount', String(players.length));
+                }
+            } catch(e) {}
+
+            // 账号总数
+            try {
+                const accData = await api('/api/admin/accounts?page=1&page_size=1');
+                if (accData) {
+                    setText('dashTotalAccounts', String(accData.total || 0));
+                }
+            } catch(e) {}
+
+            // 封禁数
+            try {
+                const banData = await api('/api/admin/bans');
+                if (banData) {
+                    setText('dashBannedCount', String(banData.rows ? banData.rows.length : 0));
+                }
+            } catch(e) {}
+
+            // 服务端状态
+            try {
+                const serverData = await api('/api/admin/server/status');
+                if (serverData && serverData.status) {
+                    const dot = document.getElementById('dashServerDot');
+                    const st = serverData.status.active || '';
+                    dot.className = 'status-dot ' + (st === 'running' || st === 'active' ? 'ok' : 'err');
+                    setText('dashServerStatus', st || '-');
+                }
+            } catch(e) {}
+
+            // 网关状态
+            try {
+                const gwData = await api('/api/admin/gateway/status');
+                if (gwData && gwData.status) {
+                    const dot = document.getElementById('dashGwDot');
+                    const st = gwData.status.active || '';
+                    dot.className = 'status-dot ' + (st === 'running' || st === 'active' ? 'ok' : 'err');
+                    setText('dashGwStatus', st || '-');
+                }
+            } catch(e) {}
+
+            // 维护模式
+            try {
+                const maintData = await api('/api/admin/maintenance');
+                if (maintData) {
+                    const dot = document.getElementById('dashMaintDot');
+                    const enabled = !!maintData.enabled;
+                    dot.className = 'status-dot ' + (enabled ? 'warn' : 'ok');
+                    setText('dashMaintStatus', enabled ? '已启用' : '未启用');
+                }
+            } catch(e) {}
+
+            // 登录器版本
+            try {
+                // 注意：是 /api/admin/launcher-config（连字符），不是 launcher/config
+                const launcherData = await api('/api/admin/launcher-config');
+                if (launcherData) {
+                    setText('dashLauncherMinVer', launcherData.min_version || '-');
+                }
+            } catch(e) {}
+            try {
+                const lvData = await api('/api/admin/launcher/versions');
+                if (lvData && lvData.current) {
+                    setText('dashLauncherCurVer', 'v' + (lvData.current.version || '?'));
+                }
+            } catch(e) {}
+
+            // 插件状态
+            try {
+                const pluginData = await api('/api/admin/plugins');
+                if (pluginData) {
+                    setText('dashPluginStatus', pluginData.plugins_enabled ? '已开启' : '已关闭');
+                }
+            } catch(e) {}
+
+            // PVF 指纹
+            try {
+                const pvfData = await api('/api/pvf/info');
+                if (pvfData && pvfData.hash) {
+                    setText('dashPvfHash', truncHash(pvfData.hash));
+                }
+            } catch(e) {}
+
+            // 端口数
+            try {
+                const portData = await api('/api/admin/game-ports');
+                if (portData && portData.ok) {
+                    const listening = (portData.entries || []).filter(e => e.listening).length;
+                    setText('dashPortCount', listening + ' / ' + (portData.entries || []).length);
+                }
+            } catch(e) {}
+
+            // 公告服务
+            try {
+                const anData = await api('/api/admin/announce/config');
+                if (anData && anData.ok) {
+                    const dot = document.getElementById('dashAnnounceDot');
+                    const enabled = !!anData.config && !!anData.config.enabled;
+                    dot.className = 'status-dot ' + (enabled ? 'ok' : 'off');
+                    setText('dashAnnounceStatus', enabled ? '已启用' : '已关闭');
+                }
+            } catch(e) {}
         }
 
         // ==================== 插件管理 ====================
@@ -1715,29 +2388,39 @@
         // ==================== Tab 切换 ====================
 
         const tabLoaders = {
-            online: loadOnline,
+            dashboard: () => loadDashboard(),
+            online: () => loadOnline(),
             accounts: () => loadAccounts(1),
-            bans: loadBans,
-            integrity: loadIntegrity,
+            bans: () => loadBans(),
+            integrity: () => loadIntegrity(),
             server: () => { loadServerStatus(); loadBackups(); loadServerPvfInfo(); loadRegisterBonus(); loadBonusConfig(); loadGameEvents(); },
-            gateway: loadGatewayStatus,
-            ports: loadGamePorts,
+            gateway: () => loadGatewayStatus(),
+            ports: () => loadGamePorts(),
             anticheat: () => { loadAcPlayers(); loadAcDetections(); },
             launcher: () => { loadLauncherConfig(); loadLauncherVersions(); },
-            plugins: loadPlugins,
-            maintenance: loadMaintenance,
-            registerlimit: loadRegisterLimit,
+            plugins: () => loadPlugins(),
+            maintenance: () => loadMaintenance(),
+            heartbeat: () => loadHeartbeat(),
+            registerlimit: () => loadRegisterLimit(),
             announce: () => { loadAnnounceConfig(); loadAnnouncePopups(1); loadAnnounceEvents(1); }
         };
 
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.sidebar-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const tab = item.dataset.tab;
+                const pane = document.getElementById(tab);
+                if (!pane) { console.error('[S4A21] 找不到页面容器:', tab); return; }
+                document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                tab.classList.add('active');
-                document.getElementById(tab.dataset.tab).classList.add('active');
-                const loader = tabLoaders[tab.dataset.tab];
-                if (loader) loader();
+                item.classList.add('active');
+                pane.classList.add('active');
+                try { window.scrollTo({ top: 0 }); } catch (e) {}
+                // 单个页面加载报错不能影响页面切换，所以这里吞掉异常只打日志
+                const loader = tabLoaders[tab];
+                if (loader) {
+                    try { loader(); }
+                    catch (e) { console.error('[S4A21] 页面数据加载失败:', tab, e); }
+                }
             });
         });
 
@@ -1782,7 +2465,7 @@
 
         let accountPage = 1;
         // 每页数量：50 / 100 / 200 / 500，由页面上方的下拉选择。
-        let accountPageSize = 50;
+        let accountPageSize = 20;
 
         function changeAccountPageSize() {
             const sel = document.getElementById('accountPageSize');
@@ -1909,10 +2592,10 @@
             //（历史版本要求管理员自己算 32 位 MD5，谁都不会算）。
             const pwd = prompt(`重置「${account}」的密码。\n请输入新密码（6-32 位）：`);
             if (pwd === null) return;
-            if (pwd.length < 6 || pwd.length > 32) { alert('密码长度需为 6-32 位'); return; }
+            if (pwd.length < 6 || pwd.length > 32) { showToast('error', '', '密码长度需为 6-32 位'); return; }
             const pwd2 = prompt('请再次输入新密码确认：');
             if (pwd2 === null) return;
-            if (pwd !== pwd2) { alert('两次输入的密码不一致'); return; }
+            if (pwd !== pwd2) { showToast('error', '', '两次输入的密码不一致'); return; }
             const data = await api('/api/admin/reset-password', 'POST', { account, newPassword: pwd });
             if (data) alert(data.message || (data.ok ? '重置成功' : '重置失败'));
         }
@@ -2220,8 +2903,8 @@
         async function resetAllPasswords(dryRun) {
             const pwd = document.getElementById('allPwd1').value;
             const pwd2 = document.getElementById('allPwd2').value;
-            if (pwd.length < 6 || pwd.length > 32) { alert('密码长度需为 6-32 位'); return; }
-            if (pwd !== pwd2) { alert('两次输入的密码不一致'); return; }
+            if (pwd.length < 6 || pwd.length > 32) { showToast('error', '', '密码长度需为 6-32 位'); return; }
+            if (pwd !== pwd2) { showToast('error', '', '两次输入的密码不一致'); return; }
 
             if (!dryRun) {
                 const lines = [
@@ -2267,7 +2950,7 @@
         async function banAccount() {
             const account = document.getElementById('banAccount').value;
             const reason = document.getElementById('banReason').value;
-            if (!account) { alert('请输入账号'); return; }
+            if (!account) { showToast('error', '', '请输入账号'); return; }
             await api('/api/admin/ban', 'POST', { account, reason });
             document.getElementById('banAccount').value = '';
             document.getElementById('banReason').value = '';
@@ -2817,7 +3500,7 @@
             const labels = { start: '启动', stop: '停止', restart: '重启' };
             if (!confirm(`确认${labels[action] || action}服务端？`)) return;
             const data = await api('/api/admin/server/control', 'POST', { action });
-            if (data && data.ok === false) alert('操作失败：' + (data.error || '未知错误'));
+            if (data && data.ok === false) showToast('error', '', '操作失败：' + (data.error || '未知错误'));
             loadServerStatus();
         }
 
@@ -3052,8 +3735,8 @@
             const interval = parseInt(document.getElementById('bonusInterval').value, 10);
             const amount = parseInt(document.getElementById('bonusAmount').value, 10);
             // 前端先挡一道明显非法的输入，后端还会再校验一次（两侧都要）。
-            if (!(interval >= 1 && interval <= 86400)) { alert('计费周期要在 1 ~ 86400 秒之间'); return; }
-            if (!(amount >= 0 && amount <= 10000000)) { alert('每周期点券要在 0 ~ 10000000 之间'); return; }
+            if (!(interval >= 1 && interval <= 86400)) { showToast('error', '', '计费周期要在 1 ~ 86400 秒之间'); return; }
+            if (!(amount >= 0 && amount <= 10000000)) { showToast('error', '', '每周期点券要在 0 ~ 10000000 之间'); return; }
 
             const cfg = {
                 enabled: document.getElementById('bonusEnabled').checked,
@@ -3290,7 +3973,7 @@
             const labels = { start: '启动', stop: '停止', restart: '重启' };
             if (!confirm(`确认${labels[action] || action}网关？`)) return;
             const data = await api('/api/admin/gateway/control', 'POST', { action });
-            if (data && data.ok === false) alert('操作失败：' + (data.error || '未知错误'));
+            if (data && data.ok === false) showToast('error', '', '操作失败：' + (data.error || '未知错误'));
             loadGatewayStatus();
         }
 
@@ -3742,6 +4425,38 @@
             loadRegisterLimit();
         }
 
+        // ==================== 心跳超时 ====================
+
+        async function loadHeartbeat() {
+            const data = await api('/api/admin/heartbeat');
+            if (!data) return;
+            if (data.ok === false) {
+                setText('hbOverride', '读取失败：' + (data.error || '未知错误'));
+                return;
+            }
+            document.getElementById('hbTimeout').value = data.timeout_seconds;
+            setText('hbOverride', data.override_file ? `覆盖文件：${data.override_file}` : '');
+        }
+
+        async function saveHeartbeat() {
+            const sec = parseInt(document.getElementById('hbTimeout').value, 10);
+            // 前端先拦一道：下限 30 = 登录器心跳周期，配小了会把所有在线玩家清掉。
+            if (!Number.isFinite(sec) || sec < 30 || sec > 3600) {
+                alert('超时秒数必须是 30~3600 之间的整数（必须大于心跳周期 30 秒）');
+                return;
+            }
+            const data = await api('/api/admin/heartbeat', 'POST', { timeout_seconds: sec });
+            if (!data) return;
+            if (data.ok === false) {
+                alert('保存失败：' + (data.message || data.error || '未知错误'));
+                return;
+            }
+            alert(data.changed === false
+                ? '配置无变化'
+                : '保存成功，已立即生效（最多 30 秒内被下一轮巡检采用）');
+            loadHeartbeat();
+        }
+
         async function loadRegisterLogs() {
             const ip = document.getElementById('regLogIp').value.trim();
             const machine = document.getElementById('regLogMachine').value.trim();
@@ -4030,13 +4745,384 @@
 
         // ==================== 初始化 ====================
 
-        document.getElementById('authKey').value = authKey;
-        document.getElementById('authKey').addEventListener('change', (e) => {
-            authKey = e.target.value;
-            localStorage.setItem('authKey', authKey);
-        });
+        try {
+            document.getElementById('authKey').value = authKey;
+            document.getElementById('authKey').addEventListener('change', (e) => {
+                authKey = e.target.value;
+                localStorage.setItem('authKey', authKey);
+            });
 
-        loadOnline();
-    </script>
+            // 没有密钥就别发请求 —— 必然 401，只会白弹一次「密钥错误」挡住输入框。
+            if (authKey) loadOnline();
+
+            // 页面加载后检查密钥状态并加载仪表盘
+            updateAuthStatus();
+            if (authKey) loadDashboard();
+        } catch(e) {
+            console.error('[S4A21] Init error:', e);
+        }
+
+
+        // ==================== 更新流程向导 ====================
+
+        let workflowStepStatuses = {}; // step number -> 'pending' | 'done' | 'error'
+
+        function openWorkflow() {
+            const overlay = document.getElementById('workflowOverlay');
+            overlay.style.display = 'block';
+            document.body.style.overflow = 'hidden';
+            initWorkflow();
+        }
+
+        function closeWorkflow() {
+            const overlay = document.getElementById('workflowOverlay');
+            overlay.style.display = 'none';
+            document.body.style.overflow = '';
+        }
+
+        function initWorkflow() {
+            renderWorkflowProgress();
+            updateWorkflowSummary();
+        }
+
+        function renderWorkflowProgress() {
+            const container = document.getElementById('workflowProgress');
+            let html = '';
+            for (let i = 1; i <= 10; i++) {
+                const status = workflowStepStatuses[i] || 'pending';
+                let dotClass = 'workflow-progress-dot';
+                if (status === 'done') dotClass += ' done';
+                else if (i === getCurrentWorkflowStep()) dotClass += ' active';
+                html += '<div class="' + dotClass + '">' + (status === 'done' ? '✓' : i) + '</div>';
+                if (i < 10) {
+                    const lineClass = 'workflow-progress-line' + (status === 'done' ? ' done' : '');
+                    html += '<div class="' + lineClass + '"></div>';
+                }
+            }
+            container.innerHTML = html;
+        }
+
+        function getCurrentWorkflowStep() {
+            for (let i = 1; i <= 10; i++) {
+                if (!workflowStepStatuses[i] || workflowStepStatuses[i] !== 'done') return i;
+            }
+            return 10;
+        }
+
+        function updateWorkflowSummary() {
+            const done = Object.values(workflowStepStatuses).filter(s => s === 'done').length;
+            setText('workflowSummary', done + ' / 10 步完成');
+        }
+
+        function updateStepStatus(stepNum, status) {
+            workflowStepStatuses[stepNum] = status;
+            const step = document.querySelector('[data-step="' + stepNum + '"]');
+            if (step) {
+                step.classList.remove('active', 'done', 'locked');
+                if (status === 'done') step.classList.add('done');
+                else if (status === 'error') step.classList.add('active');
+                else step.classList.add('active');
+                const statusEl = step.querySelector('.workflow-step-status');
+                if (statusEl) {
+                    statusEl.className = 'workflow-step-status ' + status;
+                    if (status === 'done') statusEl.textContent = '已完成';
+                    else if (status === 'error') statusEl.textContent = '失败';
+                    else if (status === 'running') statusEl.textContent = '执行中…';
+                    else statusEl.textContent = '待执行';
+                }
+            }
+
+            renderWorkflowProgress();
+            updateWorkflowSummary();
+        }
+
+        function onWorkflowFileSelect(step) {
+            const fileInput = document.getElementById('wfStep' + step + 'File');
+            const label = document.getElementById('wfStep' + step + 'Label');
+            const nameSpan = document.getElementById('wfStep' + step + 'FileName');
+            if (fileInput.files && fileInput.files.length > 0) {
+                const f = fileInput.files[0];
+                const sizeMB = (f.size / 1024 / 1024).toFixed(2);
+                nameSpan.textContent = f.name + ' (' + sizeMB + ' MB)';
+                label.classList.add('has-file');
+            }
+        }
+
+        async function executeWorkflowStep(stepNum) {
+            const step = document.querySelector('[data-step="' + stepNum + '"]');
+            if (!step) return;
+
+            const statusEl = step.querySelector('.workflow-step-status');
+            updateStepStatus(stepNum, 'running');
+            const btn = step.querySelector('button');
+            if (btn) btn.disabled = true;
+
+            try {
+                switch (stepNum) {
+                    case 1: {
+                        const msg = document.getElementById('wfStep1Msg').value.trim();
+                        if (!msg) throw new Error('请输入公告内容');
+                        const data = await api('/api/admin/announce/popup', 'POST', { message: msg, mode: 0 });
+                        if (!data || data.ok === false) throw new Error(data.message || '发送失败');
+                        showToast('success', '步骤 1 完成', '公告已发送');
+                        break;
+                    }
+                    case 2: {
+                        const file = document.getElementById('wfStep2File').files[0];
+                        if (!file) throw new Error('请选择 PVF 文件');
+                        const fd = new FormData();
+                        fd.append('file', file);
+                        const data = await upload('/api/admin/upload-pvf', fd);
+                        if (!data || data.ok === false) throw new Error(data.message || '上传失败');
+                        showToast('success', '步骤 2 完成', '客户端校验 PVF 已上传');
+                        break;
+                    }
+                    case 3: {
+                        const file = document.getElementById('wfStep3File').files[0];
+                        if (!file) throw new Error('请选择 PVF 文件');
+                        const fd = new FormData();
+                        fd.append('file', file);
+                        const data = await upload('/api/admin/server/pvf', fd);
+                        if (!data || data.ok === false) throw new Error(data.message || '上传失败');
+                        showToast('success', '步骤 3 完成', '服务端 PVF 已上传');
+                        break;
+                    }
+                    case 4: {
+                        const file = document.getElementById('wfStep4File').files[0];
+                        if (!file) throw new Error('请选择登录器文件');
+                        const ver = document.getElementById('wfStep4Ver').value.trim();
+                        if (!ver) throw new Error('请输入版本号');
+                        if (!/^\d+\.\d+\.\d+$/.test(ver)) throw new Error('版本号必须是 x.y.z 格式（如 2.5.0）');
+                        const fd = new FormData();
+                        fd.append('file', file, file.name);
+                        fd.append('version', ver);
+                        const note = document.getElementById('wfStep4Note').value.trim();
+                        if (note) fd.append('name', note);
+                        const data = await upload('/api/admin/launcher/upload', fd);
+                        if (!data || data.ok === false) throw new Error(data.message || '上传失败');
+                        showToast('success', '步骤 4 完成', '登录器已上传 (v' + ver + ')');
+                        break;
+                    }
+                    case 5: {
+                        const data = await api('/api/admin/online/kick', 'POST', { account: '' });
+                        if (!data || data.ok === false) throw new Error(data.message || '踢下线失败');
+                        showToast('success', '步骤 5 完成', '全部玩家已下线');
+                        break;
+                    }
+                    case 6: {
+                        const msg = document.getElementById('wfStep6Msg').value.trim();
+                        const data = await api('/api/admin/maintenance', 'POST', {
+                            enabled: true,
+                            message: msg || '服务器维护中'
+                        });
+                        if (!data || data.ok === false) throw new Error(data.message || '开启失败');
+                        showToast('success', '步骤 6 完成', '维护模式已开启');
+                        break;
+                    }
+                    case 7: {
+                        const data = await api('/api/admin/server/control', 'POST', { action: 'stop' });
+                        if (!data || data.ok === false) throw new Error(data.message || '停止失败');
+                        showToast('success', '步骤 7 完成', '服务端已停止');
+                        break;
+                    }
+                    case 8: {
+                        const data = await api('/api/admin/server/backup', 'POST', {});
+                        if (!data || data.ok === false) throw new Error(data.message || '备份失败');
+                        showToast('success', '步骤 8 完成', '数据库备份完成');
+                        break;
+                    }
+                    case 9: {
+                        const data = await api('/api/admin/server/control', 'POST', { action: 'start' });
+                        if (!data || data.ok === false) throw new Error(data.message || '启动失败');
+                        showToast('success', '步骤 9 完成', '服务端已启动');
+                        break;
+                    }
+                    case 10: {
+                        const data = await api('/api/admin/maintenance', 'POST', { enabled: false });
+                        if (!data || data.ok === false) throw new Error(data.message || '解除失败');
+                        showToast('success', '步骤 10 完成', '维护模式已解除，更新完成！');
+                        break;
+                    }
+                }
+                updateStepStatus(stepNum, 'done');
+                if (stepNum === 10) {
+                    showToast('success', '🎉 更新流程全部完成', '所有 10 个步骤已执行完毕', 10000);
+                }
+            } catch (e) {
+                updateStepStatus(stepNum, 'error');
+                showToast('error', '步骤 ' + stepNum + ' 失败', e.message, 8000);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        function resetWorkflow() {
+            workflowStepStatuses = {};
+            document.querySelectorAll('.workflow-step').forEach(s => {
+                s.classList.remove('done', 'locked', 'active');
+                const statusEl = s.querySelector('.workflow-step-status');
+                if (statusEl) { statusEl.className = 'workflow-step-status pending'; statusEl.textContent = '待执行'; }
+                const btn = s.querySelector('button');
+                if (btn) btn.disabled = false;
+            });
+
+            renderWorkflowProgress();
+            updateWorkflowSummary();
+            showToast('info', '', '流程已重置');
+        }
+
+</script>
+
+    <!-- ── 一键更新全屏覆盖层 ── -->
+    <div id="workflowOverlay" style="display:none; position:fixed; inset:0; z-index:8000; background:var(--bg); overflow-y:auto;">
+        <div style="max-width:760px; margin:0 auto; padding:24px 20px 40px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:20px;">
+                <div>
+                    <div style="font-size:20px; font-weight:700; color:var(--accent);">🚀 一键更新</div>
+                    <div class="muted" style="font-size:13px; margin-top:2px;">共 10 步 · 可跳过任意步骤</div>
+                </div>
+                <button class="btn btn-outline btn-sm" onclick="closeWorkflow()" style="font-size:16px; padding:6px 14px;">✕ 关闭</button>
+            </div>
+
+            <div class="workflow-progress" id="workflowProgress" style="margin:20px 0;"></div>
+
+            <div class="workflow-steps" id="workflowSteps">
+                <div class="workflow-step" data-step="1">
+                    <div class="workflow-step-icon">📢</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 1</div>
+                        <div class="workflow-step-title">发送停机公告</div>
+                        <div class="workflow-step-desc">向全部在线玩家发送弹窗公告，告知即将停机维护</div>
+                        <input type="text" class="workflow-step-input" id="wfStep1Msg" placeholder="公告内容" value="服务器即将进行版本更新维护，请所有玩家提前下线保存进度。">
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm btn-success" onclick="executeWorkflowStep(1)">发送公告</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="2">
+                    <div class="workflow-step-icon">🔍</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 2</div>
+                        <div class="workflow-step-title">上传客户端校验 PVF</div>
+                        <div class="workflow-step-desc">上传新版本 PVF 文件，用于客户端完整性校验</div>
+                        <label class="workflow-file-label" id="wfStep2Label">
+                            <input type="file" id="wfStep2File" accept=".pvf" onchange="onWorkflowFileSelect(2)">
+                            <span id="wfStep2FileName">选择 PVF 文件…</span>
+                        </label>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="3">
+                    <div class="workflow-step-icon">📦</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 3</div>
+                        <div class="workflow-step-title">上传服务端 PVF</div>
+                        <div class="workflow-step-desc">上传服务端使用的 PVF 文件</div>
+                        <label class="workflow-file-label" id="wfStep3Label">
+                            <input type="file" id="wfStep3File" accept=".pvf" onchange="onWorkflowFileSelect(3)">
+                            <span id="wfStep3FileName">选择 PVF 文件…</span>
+                        </label>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="4">
+                    <div class="workflow-step-icon">📥</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 4</div>
+                        <div class="workflow-step-title">上传登录器</div>
+                        <div class="workflow-step-desc">上传新版登录器 exe，设置版本号</div>
+                        <div class="row" style="margin-top:8px;">
+                            <input type="text" id="wfStep4Ver" placeholder="版本号（如 2.5.0）" style="width:120px;">
+                            <input type="text" id="wfStep4Note" placeholder="备注（选填）" style="width:140px;">
+                        </div>
+                        <label class="workflow-file-label" id="wfStep4Label">
+                            <input type="file" id="wfStep4File" accept=".exe" onchange="onWorkflowFileSelect(4)">
+                            <span id="wfStep4FileName">选择登录器 exe…</span>
+                        </label>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="5">
+                    <div class="workflow-step-icon">🚪</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 5</div>
+                        <div class="workflow-step-title">踢全部玩家下线</div>
+                        <div class="workflow-step-desc">断开所有在线玩家的连接</div>
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm btn-danger" onclick="executeWorkflowStep(5)">踢全部下线</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="6">
+                    <div class="workflow-step-icon">🔧</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 6</div>
+                        <div class="workflow-step-title">开启维护模式</div>
+                        <div class="workflow-step-desc">开启维护模式，玩家无法登录</div>
+                        <input type="text" class="workflow-step-input" id="wfStep6Msg" placeholder="维护提示信息" value="服务器维护中，请稍后重试" style="margin-top:8px;">
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm" onclick="executeWorkflowStep(6)">开启维护</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="7">
+                    <div class="workflow-step-icon">⏹️</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 7</div>
+                        <div class="workflow-step-title">停止服务端</div>
+                        <div class="workflow-step-desc">停止游戏服务端进程</div>
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm btn-danger" onclick="executeWorkflowStep(7)">停止服务端</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="8">
+                    <div class="workflow-step-icon">💾</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 8</div>
+                        <div class="workflow-step-title">备份数据库</div>
+                        <div class="workflow-step-desc">备份游戏数据库和网关数据库</div>
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm btn-success" onclick="executeWorkflowStep(8)">执行备份</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="9">
+                    <div class="workflow-step-icon">▶️</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 9</div>
+                        <div class="workflow-step-title">重启服务端</div>
+                        <div class="workflow-step-desc">启动游戏服务端进程</div>
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm btn-success" onclick="executeWorkflowStep(9)">启动服务端</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+                <div class="workflow-step" data-step="10">
+                    <div class="workflow-step-icon">✅</div>
+                    <div class="workflow-step-body">
+                        <div class="workflow-step-num">步骤 10</div>
+                        <div class="workflow-step-title">解除维护模式</div>
+                        <div class="workflow-step-desc">关闭维护模式，恢复玩家登录</div>
+                        <div class="workflow-step-actions" style="margin-top:8px;">
+                            <button class="btn btn-sm btn-success" onclick="executeWorkflowStep(10)">解除维护</button>
+                        </div>
+                    </div>
+                    <div class="workflow-step-status pending">待执行</div>
+                </div>
+            </div>
+
+            <div class="workflow-footer">
+                <button class="btn btn-outline btn-sm" onclick="resetWorkflow()">重置流程</button>
+                <span id="workflowSummary" class="muted">0 / 10 步完成</span>
+            </div>
+        </div>
+    </div>
 </body>
 </html>

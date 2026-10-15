@@ -67,9 +67,10 @@ type GatewayConfig struct {
 	GatewayControl GatewayControlSection `json:"GatewayControl"`
 	Maintenance    MaintenanceSection    `json:"Maintenance"`
 
-// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit）——
+// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit / Heartbeat）——
 // 这几段会被管理后台在运行中改写（httprouter 的 runtimeConfigBackend），
-// 而认证侧（auth 的版本门禁、注册限额判定）与 HTTP 侧（policy/notice/update 端点）在并发读。
+// 而认证侧（auth 的版本门禁、注册限额判定）、HTTP 侧（policy/notice/update 端点）
+// 与清理协程（cmd/gateway 的巡检 ticker 读 Heartbeat.TimeoutSeconds）在并发读。
 	//
 	// G-5（2026-10-04 审查）：原先全程无锁 —— 管理员开维护模式的同时有玩家登录，
 	// 可能读到**撕裂的切片头**（Maintenance.AdminAccounts）而崩溃，或读到半改的门禁值。
@@ -157,6 +158,35 @@ func (c *GatewayConfig) SetRegisterLimitRuntime(enabled *bool, perIPPerDay, perM
 	}
 	if perMachine != nil {
 		c.RegisterLimit.PerMachine = *perMachine
+	}
+}
+
+// HeartbeatSnapshot 返回心跳段的运行时快照（并发安全）。
+//
+// 会话超时清理协程每 CheckIntervalSeconds 读一次 TimeoutSeconds
+// （cmd/gateway/main.go 的巡检 ticker）—— 管理员在后台改超时的同时它正在跑，
+// 无锁读会读到半改的值（-race 下直接报数据竞争），所以统一走快照。
+func (c *GatewayConfig) HeartbeatSnapshot() HeartbeatSection {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	return c.Heartbeat
+}
+
+// SetHeartbeatRuntime 在锁内更新心跳段的运行时可变字段（传 nil = 不改该项）。
+//
+// 目前**只暴露 TimeoutSeconds**：CheckIntervalSeconds 在启动时就决定了巡检 ticker
+// 的周期（newHeartbeatTicker），改它需要重建 ticker，不在本接口范围内。
+//
+// 顺序约定与 SetLauncher 一致：由调用方**先落盘 override、成功后再调本函数**，
+// 避免落盘失败时留下"内存已改、重启还原"的不一致。
+//
+// 取值边界（由调用方校验）：必须**大于登录器心跳周期**（161/193/216 上都是 30s），
+// 否则每一次正常心跳之间都会判超时；又不宜过大，否则玩家客户端崩溃后会话长期挂着。
+func (c *GatewayConfig) SetHeartbeatRuntime(timeoutSeconds *int) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if timeoutSeconds != nil {
+		c.Heartbeat.TimeoutSeconds = *timeoutSeconds
 	}
 }
 

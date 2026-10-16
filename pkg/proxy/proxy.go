@@ -713,6 +713,59 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 
 	remoteIP := GetRemoteIP(client)
 
+	// ★★★ 游戏口协议是**服务端先说话**（2026-10-16 线上抓包实证）：
+	// 后端一收到 PROXY 头就主动下发 83 字节频道 greeting（内容含频道名
+	// ch.10 与 endpoint），客户端收到它才发登录包。因此**后端连接必须
+	// 在等首包之前建立**——方案 D 初版把「连后端」挪到首包准入之后，
+	// 结果客户端等 greeting、网关等首包，互相干等到客户端超时（线上
+	// 实测 1.8~8 秒），就是用户反馈的「进频道/切频道延迟比较高」。
+	//
+	// 准入依然只认首包凭证：客户端的登录包在准入通过前一个字节都不会
+	// 进后端，不通过就地关闭后端连接。代价与旧代码一致——静默连接最多
+	// 占一个后端连接直到首包超时（30s）。
+	//
+	// GamePortAuth 关闭时先按 IP 白名单快拒（与旧代码逐字一致）：那时
+	// 白名单是唯一闸门，没必要让扫描器摸到后端。开启时不能预拒——凭证
+	// 命中有权放行任意来源 IP（正式服2 事件二误伤的修法）。
+	if !p.profile.GamePortAuth.Enabled && !p.sessionManager.IsIPAllowed(remoteIP) {
+		p.logger.Warn(fmt.Sprintf("拒绝非白名单 IP 的 Game 连接: %s -> %d", remoteIP, publicPort))
+		return
+	}
+
+	// 后端连接先于首包建立（连到该公网端口映射的后端游戏端口，而非 Channel 端口）
+	backend, err := p.connectBackendTo(backendPort)
+	if err != nil {
+		p.logger.Warn(fmt.Sprintf("连接游戏后端 %d 失败: %v", backendPort, err))
+		return
+	}
+	defer backend.Close()
+
+	setNoDelay(client, true)
+	setNoDelay(backend, true)
+	setKeepAlive(client, p.keepAlivePeriod)
+
+	// PROXY protocol：必须在转发客户端首包**之前**写入。服务端会把它读掉，
+	// 当作会话的真实远端地址 —— PK 场的 UDP 绑定校验、组队/副本下发给
+	// 队友的 P2P 端点、账号的最后登录 IP 三处都依赖它。后端也正是收到它
+	// 才下发 greeting，所以这一笔同样不能晚。
+	if p.proxyProtocolEnabled() {
+		if err := p.writeProxyHeader(backend, client, publicPort); err != nil {
+			p.logger.Warn(fmt.Sprintf(
+				"Game %d PROXY 头写入失败，放弃连接: %v", publicPort, err))
+			return
+		}
+	}
+
+	// 下行：后端 -> 客户端。**必须在等首包之前启动**——greeting 到达就要
+	// 立刻转发给客户端，晚一步客户端就多干等一整轮（S5A9 的 LOGIN 回包
+	// 带 Endpoint(地址,端口)，由 gameAdapter 改写；S4A21 无游戏口下行
+	// 适配器 = 纯透传）。
+	downlinkDone := make(chan struct{})
+	go func() {
+		p.copyDownlink(backend, client, p.gameAdapter, fmt.Sprintf("Game %d 下行", publicPort))
+		close(downlinkDone)
+	}()
+
 	// 首包：尽量读齐一个完整帧。
 	//
 	// 为什么不再是"读一次就转发"（旧行为）：登录包被 TCP 分包切碎时只读到
@@ -775,39 +828,6 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 			delete(p.connCounts, publicPort)
 		}
 		p.mu.Unlock()
-	}()
-
-	// 后端连接在**准入通过之后**建立。旧代码先连后端再读首包，扫描器
-	// 也能消耗后端连接；方案 D 把准入前移到连后端之前。
-	// 连到该公网端口映射的后端游戏端口，而非 Channel 端口。
-	backend, err := p.connectBackendTo(backendPort)
-	if err != nil {
-		p.logger.Warn(fmt.Sprintf("连接游戏后端 %d 失败: %v", backendPort, err))
-		return
-	}
-	defer backend.Close()
-
-	setNoDelay(client, true)
-	setNoDelay(backend, true)
-	setKeepAlive(client, p.keepAlivePeriod)
-
-	// PROXY protocol：必须在转发客户端首包**之前**写入。服务端会把它读掉，
-	// 当作会话的真实远端地址 —— PK 场的 UDP 绑定校验、组队/副本下发给
-	// 队友的 P2P 端点、账号的最后登录 IP 三处都依赖它。
-	if p.proxyProtocolEnabled() {
-		if err := p.writeProxyHeader(backend, client, publicPort); err != nil {
-			p.logger.Warn(fmt.Sprintf(
-				"Game %d PROXY 头写入失败，放弃连接: %v", publicPort, err))
-			return
-		}
-	}
-
-	// 下行：后端 -> 客户端（S5A9 的 LOGIN 回包带 Endpoint(地址,端口)，
-	// 由 gameAdapter 改写；S4A21 无游戏口下行适配器 = 纯透传）
-	downlinkDone := make(chan struct{})
-	go func() {
-		p.copyDownlink(backend, client, p.gameAdapter, fmt.Sprintf("Game %d 下行", publicPort))
-		close(downlinkDone)
 	}()
 
 	// ★★ 会话归属。

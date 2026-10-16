@@ -49,11 +49,13 @@ func buildGameLoginFrame(mId, pwd string) []byte {
 }
 
 // nonLoginFirstPacket 构造一个"完整但非登录"的首帧：14 字节头、length=14（无正文）。
+// 这正是真实客户端的 keepalive 握手包形态——服务端日志里的
+// CHECK_USER_CONNECTION handshake body=0，线上抓包可见客户端连上游戏口后
+// 隔几秒发出的就是它。
 //
-// 用途：方案 D 把「连后端」前移到首包准入之后，集成测试必须先让客户端把
-// 首包写进来，代理才会去连后端。这个首帧立即读齐（不会耗在首包超时等待），
-// parseGameLoginPacket 判非登录包 ⇒ 走 IP 白名单回退 = 旧行为，
-// 让不关心准入细节的测试（Stop 唤醒、端口热加载）沿用旧断言。
+// 用途：让不关心准入细节的集成测试（Stop 唤醒、端口热加载）有一个立即读齐的
+// 首帧——不会耗在首包超时等待；parseGameLoginPacket 判非登录包 ⇒ 走 IP
+// 白名单回退 = 旧行为，随后被原样转发给后端。
 func nonLoginFirstPacket() []byte {
 	b := make([]byte, gamePacketHeaderSize)
 	b[0] = 0xAA // 与旧测试一致的首字节

@@ -150,9 +150,10 @@ func TestStopClosesConnectionPromptly(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 方案 D 起「连后端」前移到首包准入之后：必须先写首包，代理才会连后端。
 	// 首帧用"完整但非登录"的 14 字节帧——立即读齐、不进首包超时等待；
 	// 非登录包 ⇒ 回退 IP 白名单（127.0.0.1 上建有会话）⇒ 放行，与旧行为等价。
+	// 注意后端连接在首包之前就已建立（游戏口是服务端先说话协议，
+	// 见 handleGameClient 的时序说明），这里的 Accept 本就能立刻拿到。
 	if _, err := conn.Write(nonLoginFirstPacket()); err != nil {
 		t.Fatalf("发送首包失败: %v", err)
 	}

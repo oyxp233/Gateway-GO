@@ -22,15 +22,28 @@ func BuildBootstrapPortConfig(cfg *config.GatewayConfig) *ProxyPortConfig {
 			PortRange:   PortRange{Start: 20001, End: 20201},
 		}
 	}
+	return buildBootstrapFromSection(&cfg.GameServer, cfg.Gateway.ProxyPort)
+}
 
+// BuildBootstrapPortConfigForProfile 从某个游戏服的配置段派生初始端口配置。
+//
+// 多服模型（2026-10-16）：每个服有自己的 proxy_ports-<id>.json，
+// 文件缺失时由该服自己的 GamePorts/GamePortMap 派生生成。
+// channelPort 是该服频道口的公网监听端口（0 时回落 Gateway.ProxyPort，
+// 由调用方按 config.GameServerEntry.ChannelListenerPort 规则算好传入）。
+func BuildBootstrapPortConfigForProfile(profile config.GameServerEntry, channelPort int) *ProxyPortConfig {
+	return buildBootstrapFromSection(&profile.GameServerSection, channelPort)
+}
+
+func buildBootstrapFromSection(section *config.GameServerSection, channelPort int) *ProxyPortConfig {
 	boot := &ProxyPortConfig{
-		ChannelPort: cfg.Gateway.ProxyPort,
-		BackendHost: cfg.GameServer.BackendHost,
-		BackendPort: cfg.GameServer.BackendChannelPort,
+		ChannelPort: channelPort,
+		BackendHost: section.BackendHost,
+		BackendPort: section.BackendChannelPort,
 	}
 
 	seen := map[int]bool{}
-	for _, entry := range cfg.GameServer.GamePortMap {
+	for _, entry := range section.GamePortMap {
 		parts := strings.Split(entry, ":")
 		if len(parts) != 2 {
 			continue
@@ -44,7 +57,7 @@ func BuildBootstrapPortConfig(cfg *config.GatewayConfig) *ProxyPortConfig {
 	}
 
 	// GamePorts 里没被映射覆盖的端口按同端口转发
-	for _, port := range cfg.GameServer.GamePorts {
+	for _, port := range section.GamePorts {
 		if !seen[port] {
 			seen[port] = true
 			boot.GamePorts = append(boot.GamePorts, GamePortMapping{Public: port, Backend: port, Enabled: true})

@@ -164,21 +164,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 代理服务器
-	var proxyServer *proxy.ProxyServer
-	portConfig := proxy.NewPortConfigStoreBootstrap(filepath.Dir(configPath), func(newConfig *proxy.ProxyPortConfig) proxy.ReloadResult {
-		if proxyServer != nil {
-			return proxyServer.ReloadPorts(newConfig)
-		}
-		return proxy.ReloadResult{}
-	}, proxy.BuildBootstrapPortConfig(cfg))
-	portConfig.StartWatching()
-
+	// 代理服务器（多服管理器：每个 GameServers 条目一个独立 ProxyServer，
+	// 各自监听自己的频道口与游戏口段、各自一份端口表）。
+	//
 	// 游戏口准入（方案 D）的凭证校验器：复用 AccountService 的密码判定入口
 	// （含迁移账号的空 salt 直比 MD5 分支）。nil 时口令路径不可用，
 	// 仅 token 路径生效，且任何"无法验证"都回退旧行为、不会据此拒人。
-	proxyServer = proxy.NewProxyServer(cfg, sessionMgr, log, portConfig, accountSvc)
-	proxyServer.Start()
+	// 对 S5A95 服由 NewProxyServer 内部强制关闭（后端自校验 digest）。
+	proxyMgr := proxy.NewProxyManager(cfg, filepath.Dir(configPath), sessionMgr, log, accountSvc)
+	proxyReport := proxyMgr.Start()
+	for _, id := range proxyReport.ChannelFailed {
+		log.Error(fmt.Sprintf("[Proxy] 服 %s 频道口监听失败（端口被占或配置错误），该服不可用", id))
+	}
+	for id, failed := range proxyReport.GamePortFailed {
+		for port, reason := range failed {
+			log.Error(fmt.Sprintf("[Proxy] 服 %s 游戏口 %d 启动失败: %s", id, port, reason))
+		}
+	}
+	log.Info(fmt.Sprintf("[Proxy] 多服代理已启动: %s", proxyMgr.Summary()))
 
 	// HTTP 服务器
 	//
@@ -188,16 +191,10 @@ func main() {
 	sessionsBackend := httprouter.NewLocalSessionBackend(sessionMgr, db)
 	pvfBackend := httprouter.NewLocalPvfBackend(pvfSvc)
 	portsBackend := httprouter.NewLocalPortsBackend(func() map[int]int {
-		if proxyServer != nil {
-			return proxyServer.GetActivePorts()
-		}
-		return nil
+		return proxyMgr.ActivePorts()
 	}, func() map[int]int {
-		if proxyServer != nil {
-			return proxyServer.PortConnections()
-		}
-		return nil
-	}, portConfig)
+		return proxyMgr.PortConnections()
+	}, proxyMgr.DefaultPortStore())
 	runtimeBackend := httprouter.NewLocalRuntimeConfigBackend(cfg, settingsEditor, sessionsBackend)
 	announceBackend := httprouter.NewLocalAnnounceBackend(announceSvc)
 
@@ -205,7 +202,7 @@ func main() {
 		accountSvc, adminSvc, banSvc, pvfSvc, integritySvc,
 		registerBonusSvc, bonusSvc, deviceSvc, serverMgr, gatewayMgr, settingsEditor,
 		qqBindSvc, announceSvc,
-		cert, portConfig, httprouter.Backends{
+		cert, proxyMgr.DefaultPortStore(), httprouter.Backends{
 			Sessions: sessionsBackend,
 			Pvf:      pvfBackend,
 			Ports:    portsBackend,
@@ -275,7 +272,7 @@ func main() {
 	log.Info(fmt.Sprintf("收到信号 %v，正在关闭...", sig))
 
 	close(done)
-	proxyServer.Stop()
+	proxyMgr.Stop()
 	authServer.Stop()
 	log.Close()
 }

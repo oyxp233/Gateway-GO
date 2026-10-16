@@ -65,7 +65,7 @@ func newTestProxy(t *testing.T, store *PortConfigStore, sm *session.SessionManag
 			IdleTimeoutSeconds:      30,
 		},
 	}
-	return NewProxyServer(cfg, sm, log, store, nil)
+	return NewProxyServer(cfg, cfg.DefaultGameServerEntry(), sm, log, store, nil)
 }
 
 // wireStore 把端口表的 onChange 接到代理服务器上（模拟 main.go 的接线）。

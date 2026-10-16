@@ -21,23 +21,16 @@ import (
 	"s4a21-gateway/pkg/logger"
 	"s4a21-gateway/pkg/models"
 	"s4a21-gateway/pkg/safego"
-	"s4a21-gateway/pkg/security"
 	"s4a21-gateway/pkg/session"
 )
 
 const (
-	channelHeaderSize   = 11
-	scAskChannelInfoNew = 0x12
-	copyBufferSize      = 8192
-	maxFrameSize        = 1024 * 1024
-
-	// 频道列表明文布局（与服务端 ChannelProtocolHandler 对齐）：
-	// 2B 组号 + 4B 条目数，每条 20B 名称 + 4B 容量 + 4B 在线数 + 16B IP + 4B 端口。
-	channelListPrefixSize = 6
-	channelListEntrySize  = 48
-	channelListIPOffset   = 28
-	channelListPortOffset = 44
+	copyBufferSize = 8192
+	maxFrameSize   = 1024 * 1024
 )
+
+// 频道列明文布局与 0x12 opcode、ChannelListRewriter 已搬迁至
+// adapter_s4a21.go（S4A21ChannelAdapter）；帧头常量见 adapter.go。
 
 // portView 端口映射的只读快照。
 //
@@ -119,29 +112,40 @@ type GameCredentialVerifier interface {
 	VerifyAccountCredential(mId, pwdField string) (bool, error)
 }
 
-// ProxyServer 管理 Channel/Game 代理端口。
+// ProxyServer 管理单个游戏服（Profile）的 Channel/Game 代理端口。
+//
+// 双服模型（2026-10-16）：一个网关进程持多个 ProxyServer（每个启用的
+// GameServers 条目一个，由 ProxyManager 统一装配）。本结构体内的全部
+// 配置读取都走 p.profile（该服自己的段），不再有"全网关一个 GameServer"。
 type ProxyServer struct {
-	config             *config.GatewayConfig
-	sessionManager     *session.SessionManager
-	rewriter           *ChannelListRewriter
-	logger             *logger.ConsoleLogger
-	listenAddr         string
-	gamePortMap        map[int]int
-	ports              atomic.Pointer[portView]
-	shutdown           chan struct{}
-	wg                 sync.WaitGroup
-	mu                 sync.RWMutex
-	channelLock        sync.Mutex
-	channelListener    net.Listener
-	channelCts         chan struct{}
-	gameListeners      map[int]net.Listener
-	gameCts            map[int]chan struct{}
-	gamePorts          map[int]struct{}
-	connCounts         map[int]int
-	portConfig         *PortConfigStore
+	config          *config.GatewayConfig
+	profile         config.GameServerEntry
+	sessionManager  *session.SessionManager
+	logger          *logger.ConsoleLogger
+	listenAddr      string
+	gamePortMap     map[int]int
+	ports           atomic.Pointer[portView]
+	shutdown        chan struct{}
+	wg              sync.WaitGroup
+	mu              sync.RWMutex
+	channelLock     sync.Mutex
+	channelListener net.Listener
+	channelCts      chan struct{}
+	gameListeners   map[int]net.Listener
+	gameCts         map[int]chan struct{}
+	gamePorts       map[int]struct{}
+	connCounts      map[int]int
+	portConfig      *PortConfigStore
+
 	firstReadTimeout   time.Duration
 	idleTimeout        time.Duration
 	backendConnTimeout time.Duration
+
+	// channelAdapter / gameAdapter 是本服的下行适配器（按 profile.Protocol
+	// 在构造时绑定）。nil = 纯透传（S4A21 且 RewriteChannelList=false 时）。
+	channelAdapter DownlinkAdapter
+	gameAdapter    DownlinkAdapter
+
 	// gameAuth 是游戏口凭证校验器（方案 D）。nil = 口令路径不可用
 	// （仅 token 路径生效；生产环境由 cmd/gateway 注入 AccountService）。
 	gameAuth GameCredentialVerifier
@@ -152,41 +156,64 @@ type ProxyServer struct {
 	keepAlivePeriod time.Duration
 }
 
-// NewProxyServer 创建代理服务器。
+// channelPort 返回本服频道口（频道列表转发）的公网监听端口。
+// profile.ChannelListenerPort=0（仅单服允许）= 沿用 Gateway.ProxyPort，
+// 与改造前逐字节等价。
+func (p *ProxyServer) channelPort() int {
+	if p.profile.ChannelListenerPort > 0 {
+		return p.profile.ChannelListenerPort
+	}
+	return p.config.Gateway.ProxyPort
+}
+
+// NewProxyServer 创建某个游戏服的代理服务器。
 //
-// gameAuth 是游戏口首包凭证校验器（方案 D），传 nil 时口令路径不可用
-// （仅 token 路径生效，且任何"无法验证"都回退旧行为，不会据此拒人）。
+// profile 是该服的配置（config.GameServers 中的一个条目）；gameAuth 是
+// 游戏口首包凭证校验器（方案 D），传 nil 时口令路径不可用（仅 token 路径
+// 生效，且任何"无法验证"都回退旧行为，不会据此拒人）。
 func NewProxyServer(
 	cfg *config.GatewayConfig,
+	profile config.GameServerEntry,
 	sm *session.SessionManager,
 	logger *logger.ConsoleLogger,
 	portConfig *PortConfigStore,
 	gameAuth GameCredentialVerifier,
 ) *ProxyServer {
-	gamePortMap := cfg.GamePortMapResolved()
+	gamePortMap := profile.GamePortMapResolved()
+
+	// S5A9（DNF95）两个服务端侧差异，在适配器绑定前一次性落地：
+	//  1. PROXY protocol 强制关 —— S5A9 的 DfoServer 不认这行头，
+	//     发了会把游戏包头当垃圾，全体连不上；
+	//  2. 方案 D 首包凭证强制关 —— 首包布局是 S5A9 自己的 GameFrame，
+	//     parseGameLoginPacket 解不出来；且 S5A9 后端**自校验 digest**，
+	//     准入由后端把关，网关侧只做每 IP 并发限制（回退白名单口径）。
+	if profile.Protocol == config.ProtocolS5A95 {
+		profile.ProxyProtocol = "off"
+		profile.GamePortAuth.Enabled = false
+	}
 
 	// 初始视图先按 appsettings 建好；Start() 会用端口表覆盖它。
 	// 这样即使退回 appsettings 分支，频道列表过滤也有正确判据。
 	initialView := buildPortViewFromResolved(gamePortMap)
 
-	firstReadTimeout := time.Duration(cfg.GameServer.FirstReadTimeoutSeconds) * time.Second
-	if cfg.GameServer.FirstReadTimeoutSeconds <= 0 {
+	firstReadTimeout := time.Duration(profile.FirstReadTimeoutSeconds) * time.Second
+	if profile.FirstReadTimeoutSeconds <= 0 {
 		firstReadTimeout = 0
 	}
 
-	idleTimeout := time.Duration(cfg.GameServer.IdleTimeoutSeconds) * time.Second
-	if cfg.GameServer.IdleTimeoutSeconds <= 0 {
+	idleTimeout := time.Duration(profile.IdleTimeoutSeconds) * time.Second
+	if profile.IdleTimeoutSeconds <= 0 {
 		idleTimeout = 0
 	}
 
-	backendConnTimeout := time.Duration(cfg.GameServer.BackendConnectTimeoutSeconds) * time.Second
-	if cfg.GameServer.BackendConnectTimeoutSeconds <= 0 {
+	backendConnTimeout := time.Duration(profile.BackendConnectTimeoutSeconds) * time.Second
+	if profile.BackendConnectTimeoutSeconds <= 0 {
 		backendConnTimeout = 0
 	}
 
 	// <=0 视为「不开保活」，保持历史行为（缺省关）。
-	keepAlivePeriod := time.Duration(cfg.GameServer.TcpKeepAliveSeconds) * time.Second
-	if cfg.GameServer.TcpKeepAliveSeconds <= 0 {
+	keepAlivePeriod := time.Duration(profile.TcpKeepAliveSeconds) * time.Second
+	if profile.TcpKeepAliveSeconds <= 0 {
 		keepAlivePeriod = 0
 	}
 
@@ -197,45 +224,61 @@ func NewProxyServer(
 	}
 
 	srv := &ProxyServer{
-		config:             cfg,
-		sessionManager:     sm,
-		rewriter:           NewChannelListRewriter(cfg.GameServer.KeyTimeZoneOffsetHours),
-		logger:             logger,
-		listenAddr:         cfg.Gateway.ListenAddress,
-		gamePortMap:        gamePortMap,
-		shutdown:           make(chan struct{}),
-		gameListeners:      make(map[int]net.Listener),
-		gameCts:            make(map[int]chan struct{}),
-		gamePorts:          gamePorts,
-		connCounts:         make(map[int]int),
-		portConfig:         portConfig,
-		firstReadTimeout:   firstReadTimeout,
-		idleTimeout:        idleTimeout,
-		backendConnTimeout: backendConnTimeout,
-		keepAlivePeriod:    keepAlivePeriod,
-		gameAuth:           gameAuth,
+		config:              cfg,
+		profile:             profile,
+		sessionManager:      sm,
+		logger:              logger,
+		listenAddr:          cfg.Gateway.ListenAddress,
+		gamePortMap:         gamePortMap,
+		shutdown:            make(chan struct{}),
+		gameListeners:       make(map[int]net.Listener),
+		gameCts:             make(map[int]chan struct{}),
+		gamePorts:           gamePorts,
+		connCounts:          make(map[int]int),
+		portConfig:          portConfig,
+		firstReadTimeout:    firstReadTimeout,
+		idleTimeout:         idleTimeout,
+		backendConnTimeout:  backendConnTimeout,
+		keepAlivePeriod:     keepAlivePeriod,
+		gameAuth:            gameAuth,
 	}
 	srv.ports.Store(initialView)
+
+	// 下行适配器按协议绑定（差异全部收在适配层，热路径无分支）。
+	switch profile.Protocol {
+	case config.ProtocolS5A95:
+		// S5A9 的地址下发只有改写一条路（Directory + Endpoint 两个包），
+		// RewriteChannelList 开关对它不适用 —— 置 false 只对 S4A21 有意义。
+		srv.channelAdapter = NewS5A95ChannelAdapter(profile.PublicIP, &srv.ports, logger)
+		srv.gameAdapter = NewS5A95GameAdapter(profile.PublicIP, &srv.ports, logger)
+	default:
+		if profile.RewriteChannelList {
+			srv.channelAdapter = NewS4A21ChannelAdapter(profile, &srv.ports, logger)
+		}
+	}
 	return srv
 }
 
-// Start 启动所有代理端口。
+// Start 启动所有代理端口，返回本次游戏口热加载结果（供多服管理器汇总
+// 启动报告：哪个服的哪些端口没起来，必须显式可见）。
 //
 // Game 端口以 proxy_ports.json（PortConfigStore）为准：该文件首次运行时
 // 由 appsettings 的 GameServer 段派生生成，此后它就是端口表的唯一真源。
 // 若这里直接读 appsettings，管理员在后台保存的端口改动会在下次重启后回滚。
-func (p *ProxyServer) Start() {
+func (p *ProxyServer) Start() ReloadResult {
 	// Channel 代理端口（频道列表转发）
 	p.StartChannelListener()
 
 	if cfg := p.storedPortConfig(); cfg != nil {
-		p.ReloadPorts(cfg)
-	} else {
-		// 端口表不可用（理论上不会走到）：退回 appsettings 的静态端口列表。
-		p.logger.Warn("端口表不可用，Game 代理退回 appsettings 的 GameServer.GamePorts")
-		p.startGameProxies()
+		res := p.ReloadPorts(cfg)
+		p.logger.Info("代理服务器已启动")
+		return res
 	}
+	// 端口表不可用（理论上不会走到）：退回 appsettings 的静态端口列表。
+	p.logger.Warn("端口表不可用，Game 代理退回 appsettings 的 GameServer.GamePorts")
+	p.startGameProxies()
 	p.logger.Info("代理服务器已启动")
+	return ReloadResult{Failed: map[int]string{}}
 }
 
 // storedPortConfig 返回端口表中当前生效的配置，未就绪时返回 nil。
@@ -374,7 +417,7 @@ func (p *ProxyServer) ReloadPorts(newConfig *ProxyPortConfig) ReloadResult {
 		go p.acceptGameLoop(listener, publicPort, backendPort, cts)
 		res.Opened = append(res.Opened, publicPort)
 		p.logger.Info(fmt.Sprintf("Game 代理已启动: %s -> %s:%d",
-			addr, p.config.GameServer.BackendHost, backendPort))
+			addr, p.profile.BackendHost, backendPort))
 	}
 	sort.Ints(res.Opened)
 	sort.Slice(res.Closed, func(i, j int) bool { return res.Closed[i].Port < res.Closed[j].Port })
@@ -450,7 +493,7 @@ func (p *ProxyServer) StartChannelListener() {
 		return
 	}
 
-	addr := net.JoinHostPort(p.listenAddr, strconv.Itoa(p.config.Gateway.ProxyPort))
+	addr := net.JoinHostPort(p.listenAddr, strconv.Itoa(p.channelPort()))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		p.logger.Error(fmt.Sprintf("启动 Channel 代理失败: %v", err))
@@ -462,6 +505,17 @@ func (p *ProxyServer) StartChannelListener() {
 	p.wg.Add(1)
 	go p.acceptChannelLoop(listener, p.channelCts)
 	p.logger.Info(fmt.Sprintf("Channel 代理已开放: %s", addr))
+}
+
+// ChannelListenerUp 返回频道口监听是否真正起来了。
+//
+// StartChannelListener 失败只记日志不退出进程（单服故障不该拖死整个网关），
+// 因此调用方需要这个探针来汇总启动报告 —— 多服模型下某个服起不来
+// 必须在启动日志里显式可见，不能静默。
+func (p *ProxyServer) ChannelListenerUp() bool {
+	p.channelLock.Lock()
+	defer p.channelLock.Unlock()
+	return p.channelListener != nil
 }
 
 // StopChannelListener 关闭 Channel 代理端口。
@@ -482,7 +536,7 @@ func (p *ProxyServer) StopChannelListener() {
 
 func (p *ProxyServer) startGameProxies() {
 	seen := make(map[int]bool)
-	for _, port := range p.config.GameServer.GamePorts {
+	for _, port := range p.profile.GamePorts {
 		if seen[port] {
 			continue
 		}
@@ -505,7 +559,7 @@ func (p *ProxyServer) startGameProxies() {
 		backendPort := p.resolveBackendPort(port)
 		p.wg.Add(1)
 		go p.acceptGameLoop(listener, port, backendPort, cts)
-		p.logger.Info(fmt.Sprintf("Game 代理已启动: %s -> %s:%d", addr, p.config.GameServer.BackendHost, backendPort))
+		p.logger.Info(fmt.Sprintf("Game 代理已启动: %s -> %s:%d", addr, p.profile.BackendHost, backendPort))
 	}
 }
 
@@ -609,7 +663,7 @@ func (p *ProxyServer) handleChannelClient(client net.Conn) {
 	p.logger.Info(fmt.Sprintf("Channel 连接验证通过: %s (%s)", sessionObj.Account, remoteIP))
 
 	// 建立后端连接
-	backend, err := p.connectBackendTo(p.config.GameServer.BackendChannelPort)
+	backend, err := p.connectBackendTo(p.profile.BackendChannelPort)
 	if err != nil {
 		p.logger.Warn(fmt.Sprintf("连接游戏后端失败: %v", err))
 		return
@@ -624,7 +678,7 @@ func (p *ProxyServer) handleChannelClient(client net.Conn) {
 	setKeepAlive(client, p.keepAlivePeriod)
 	if p.proxyProtocolEnabled() {
 		if err := p.writeProxyHeader(
-			backend, client, p.config.Gateway.ProxyPort); err != nil {
+			backend, client, p.channelPort()); err != nil {
 			p.logger.Warn(fmt.Sprintf(
 				"Channel PROXY 头写入失败，放弃连接: %v", err))
 			return
@@ -644,9 +698,9 @@ func (p *ProxyServer) handleChannelClient(client net.Conn) {
 		task <- struct{}{}
 	}()
 
-	// 下行（带帧重写）
+	// 下行（带帧重写：适配器为 nil 时纯透传）
 	go func() {
-		p.copyChannelDownlink(backendStream, clientStream, "Channel 下行")
+		p.copyDownlink(backendStream, clientStream, p.channelAdapter, "Channel 下行")
 		task <- struct{}{}
 	}()
 
@@ -694,16 +748,16 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 	// ★ 槽位 defer 必须紧跟 Acquire 注册：后面还有若干 return 路径
 	// （后端连接失败等），任何一条漏掉都会让该维度额度被永久占住。
 	if adm.authed {
-		if !p.sessionManager.TryAcquireGameSlotByMId(adm.mId, p.config.GameServer.MaxConnectionsPerIP) {
+		if !p.sessionManager.TryAcquireGameSlotByMId(adm.mId, p.profile.MaxConnectionsPerIP) {
 			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（账号 %s 并发已达上限 %d）",
-				remoteIP, publicPort, adm.mId, p.config.GameServer.MaxConnectionsPerIP))
+				remoteIP, publicPort, adm.mId, p.profile.MaxConnectionsPerIP))
 			return
 		}
 		defer p.sessionManager.ReleaseGameSlotByMId(adm.mId)
 	} else {
-		if !p.sessionManager.TryAcquireGameSlot(remoteIP, p.config.GameServer.MaxConnectionsPerIP) {
+		if !p.sessionManager.TryAcquireGameSlot(remoteIP, p.profile.MaxConnectionsPerIP) {
 			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（单 IP 并发已达上限 %d）",
-				remoteIP, publicPort, p.config.GameServer.MaxConnectionsPerIP))
+				remoteIP, publicPort, p.profile.MaxConnectionsPerIP))
 			return
 		}
 		defer p.sessionManager.ReleaseGameSlot(remoteIP)
@@ -748,10 +802,11 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		}
 	}
 
-	// 下行：后端 -> 客户端
+	// 下行：后端 -> 客户端（S5A9 的 LOGIN 回包带 Endpoint(地址,端口)，
+	// 由 gameAdapter 改写；S4A21 无游戏口下行适配器 = 纯透传）
 	downlinkDone := make(chan struct{})
 	go func() {
-		p.copyWithTimeout(backend, client, fmt.Sprintf("Game %d 下行", publicPort))
+		p.copyDownlink(backend, client, p.gameAdapter, fmt.Sprintf("Game %d 下行", publicPort))
 		close(downlinkDone)
 	}()
 
@@ -903,7 +958,7 @@ type gameAdmission struct {
 // 所以 RequireCredential=false（缺省）时本方案**不新增任何拒绝路径**，
 // 可以在生产上先观察，再收紧。
 func (p *ProxyServer) admitGameClient(remoteIP string, firstBuf []byte, frameComplete bool) gameAdmission {
-	cfg := p.config.GameServer.GamePortAuth
+	cfg := p.profile.GamePortAuth
 	if !cfg.Enabled || !frameComplete {
 		return p.fallbackWhitelist(remoteIP)
 	}
@@ -1153,12 +1208,13 @@ func (p *ProxyServer) copyWithTimeout(src, dst net.Conn, context string) {
 	}
 }
 
-// copyChannelDownlink Channel 下行透传，带帧重写。
-func (p *ProxyServer) copyChannelDownlink(src, dst net.Conn, context string) {
+// copyDownlink 下行透传；adapter 非 nil 时按帧交给适配器改写
+// （频道口 / 游戏口共用，协议差异在适配器里）。
+func (p *ProxyServer) copyDownlink(src, dst net.Conn, adapter DownlinkAdapter, context string) {
 	buf := make([]byte, copyBufferSize)
 	pending := make([]byte, 0, copyBufferSize)
 
-	if !p.config.GameServer.RewriteChannelList {
+	if adapter == nil {
 		// 纯透传
 		p.copyWithTimeout(src, dst, context)
 		return
@@ -1179,74 +1235,14 @@ func (p *ProxyServer) copyChannelDownlink(src, dst net.Conn, context string) {
 		// 追加到缓冲区
 		pending = append(pending, buf[:n]...)
 
-		// 处理缓冲区
-		pending = p.processChannelData(pending, dst)
+		// 处理缓冲区（完整帧逐个过适配器，残包返回拼到下一次读）
+		pending = adapter.ProcessDownlink(pending, dst)
 	}
-}
-
-func (p *ProxyServer) processChannelData(pending []byte, dst net.Conn) []byte {
-	// 每次读到的数据块取一次端口视图快照：配置热加载对下一块数据即生效，
-	// 且整个处理过程共享同一个不可变快照（无锁、无并发 map 读写风险）。
-	view := p.ports.Load()
-
-	offset := 0
-	for offset+channelHeaderSize <= len(pending) {
-		// 帧格式：[2 bytes seq][4 bytes length][...body]
-		frameLength := int(binary.LittleEndian.Uint32(pending[offset+2 : offset+6]))
-		if frameLength < channelHeaderSize || frameLength > maxFrameSize {
-			// 帧长度非法：原样转发剩余字节
-			dst.Write(pending[offset:])
-			return nil
-		}
-
-		if len(pending)-offset < frameLength {
-			break
-		}
-
-		msgNo := pending[offset+1]
-		if msgNo == scAskChannelInfoNew {
-			body := pending[offset+channelHeaderSize : offset+frameLength]
-			rewritten, kept, dropped := p.rewriter.RewriteChannelInfoWithFallback(
-				body, p.config.GameServer.PublicIP, view)
-			if dropped > 0 && kept == 0 {
-				p.logger.Warn(fmt.Sprintf(
-					"[频道列表] %d 条频道全部不在端口表的开放范围内，已放弃过滤（请检查端口表映射口径）",
-					dropped))
-			} else if dropped > 0 {
-				p.logger.Info(fmt.Sprintf(
-					"[频道列表] 已隐藏 %d 个已关闭端口的频道，保留 %d 个", dropped, kept))
-			}
-			if rewritten != nil && len(rewritten) > 0 {
-				// 输出重写后的帧头 + body
-				header := make([]byte, channelHeaderSize)
-				copy(header, pending[offset:offset+channelHeaderSize])
-				binary.LittleEndian.PutUint32(header[2:6], uint32(channelHeaderSize+len(rewritten)))
-				dst.Write(header)
-				dst.Write(rewritten)
-			} else {
-				// 重写失败：原样转发
-				dst.Write(pending[offset : offset+frameLength])
-			}
-		} else {
-			dst.Write(pending[offset : offset+frameLength])
-		}
-
-		offset += frameLength
-	}
-
-	if offset == 0 {
-		return pending
-	}
-
-	if offset < len(pending) {
-		return pending[offset:]
-	}
-	return nil
 }
 
 // connectBackendTo 连接到游戏后端的指定端口。
 func (p *ProxyServer) connectBackendTo(port int) (net.Conn, error) {
-	addr := net.JoinHostPort(p.config.GameServer.BackendHost, strconv.Itoa(port))
+	addr := net.JoinHostPort(p.profile.BackendHost, strconv.Itoa(port))
 	var conn net.Conn
 	var err error
 	if p.backendConnTimeout > 0 {
@@ -1265,7 +1261,7 @@ func (p *ProxyServer) connectBackendTo(port int) (net.Conn, error) {
 
 // connectBackend 连接到游戏后端 Channel 端口。
 func (p *ProxyServer) connectBackend() (net.Conn, error) {
-	return p.connectBackendTo(p.config.GameServer.BackendChannelPort)
+	return p.connectBackendTo(p.profile.BackendChannelPort)
 }
 
 func (p *ProxyServer) resolveBackendPort(publicPort int) int {
@@ -1364,7 +1360,7 @@ func GetRemoteIP(conn net.Conn) string {
 // 大小写与首尾空白都容忍，免得配置文件里写成 "V1" 变成静默失效。
 func (p *ProxyServer) proxyProtocolEnabled() bool {
 	switch strings.ToLower(
-		strings.TrimSpace(p.config.GameServer.ProxyProtocol)) {
+		strings.TrimSpace(p.profile.ProxyProtocol)) {
 	case "v1", "1", "true", "on":
 		return true
 	default:
@@ -1392,7 +1388,7 @@ func (p *ProxyServer) writeProxyHeader(backend, client net.Conn, publicPort int)
 	}
 
 	// 目的地址按「客户端看到的公网 IP」上报；未配置时回退到本机出接口地址。
-	dstIP := strings.TrimSpace(p.config.GameServer.PublicIP)
+	dstIP := strings.TrimSpace(p.profile.PublicIP)
 	if dstIP == "" || dstIP == "0.0.0.0" {
 		dstIP, _ = splitHostPort(client.LocalAddr())
 	}
@@ -1462,206 +1458,6 @@ func setKeepAlive(conn net.Conn, period time.Duration) {
 
 // getFd 已删除（2026-09-23）：会话登记改为直接持有 net.Conn，
 // 踢下线时逐个 Close 真连接（历史版本只记 fd 句柄数，踢人不断链路）。
-
-// ChannelListRewriter 频道列表端口重写器。
-type ChannelListRewriter struct {
-	timezoneOffset int
-}
-
-func NewChannelListRewriter(timezoneOffset int) *ChannelListRewriter {
-	return &ChannelListRewriter{timezoneOffset: timezoneOffset}
-}
-
-// currentKey 返回当天有效的频道列表密钥。
-//
-// 密钥日期口径统一由 pkg/security 提供（含时区偏移处理），
-// 本包不再自行格式化日期，避免两处实现在跨零点/跨时区时行为漂移。
-func (r *ChannelListRewriter) currentKey() string {
-	return security.ChannelKey(r.timezoneOffset)
-}
-
-// previousDayKey 返回昨天的频道列表密钥，用于跨零点回退。
-func (r *ChannelListRewriter) previousDayKey() string {
-	return security.ChannelKeyPreviousDay(r.timezoneOffset)
-}
-
-// RewriteChannelInfoWithFallback 重写频道列表：改写 IP/端口，并剔除已关闭端口的频道。
-//
-// 返回可直接下发的密文；kept/dropped 供调用方做审计日志。
-// body 无法解密时原样返回（kept=dropped=0）。
-func (r *ChannelListRewriter) RewriteChannelInfoWithFallback(
-	body []byte,
-	publicIP string,
-	view *portView,
-) ([]byte, int, int) {
-	plaintext, key, ok := r.decryptAny(body)
-	if !ok {
-		// 解密失败，原样返回
-		return body, 0, 0
-	}
-
-	rewritten, kept, dropped := rewritePlaintextAndFilter(plaintext, publicIP, view)
-	if kept == 0 && dropped > 0 {
-		// 安全阀：一条都没命中，说明端口表与频道列表口径对不上
-		// （例如全部被写成同端口转发）。宁可不改，也不能让所有频道凭空消失。
-		return body, 0, dropped
-	}
-	if dropped == 0 && bytes.Equal(plaintext, rewritten) {
-		// 与原文一致，省掉一次压缩 + 加密
-		return body, kept, 0
-	}
-	return r.encrypt(rewritten, key), kept, dropped
-}
-
-// decryptAny 依次尝试当天、昨天的频道列表密钥，返回明文与命中的密钥。
-func (r *ChannelListRewriter) decryptAny(data []byte) ([]byte, string, bool) {
-	current := r.currentKey()
-	if plaintext, err := r.decrypt(data, current); err == nil && isValidChannelList(plaintext) {
-		return plaintext, current, true
-	}
-	previous := r.previousDayKey()
-	if plaintext, err := r.decrypt(data, previous); err == nil && isValidChannelList(plaintext) {
-		return plaintext, previous, true
-	}
-	return nil, "", false
-}
-
-func (r *ChannelListRewriter) decrypt(data []byte, key string) ([]byte, error) {
-	if len(data) == 0 {
-		return data, nil
-	}
-	// 检查 zlib 头 (0x78 0x9C)
-	if len(data) > 1 && data[0] == 0x78 {
-		var err error
-		data, err = zlibDecompress(data)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return aes128DecryptECB(data, getKeyBytes(key))
-}
-
-func (r *ChannelListRewriter) encrypt(data []byte, key string) []byte {
-	padded := padTo16(data)
-	encrypted, err := aes128EncryptECB(padded, getKeyBytes(key))
-	if err != nil {
-		return data
-	}
-	return zlibCompress(encrypted)
-}
-
-func getKeyBytes(key string) []byte {
-	keyBytes := make([]byte, 16)
-	src := []byte(key)
-	copy(keyBytes, src[:len(src)])
-	if len(src) < 16 {
-		copy(keyBytes, src)
-	}
-	return keyBytes
-}
-
-func isValidChannelList(plaintext []byte) bool {
-	if len(plaintext) < 6 {
-		return false
-	}
-	count := int(binary.LittleEndian.Uint32(plaintext[2:6]))
-	if count < 0 {
-		return false
-	}
-	expected := padTo16Len(6 + count*48)
-	return len(plaintext) == expected
-}
-
-// rewritePlaintextAndFilter 单遍完成两件事：
-//  1. 剔除"所在端口已关闭"的频道条目（回传 kept/dropped 供审计）；
-//  2. 把保留条目的 IP 改写为公网 IP、端口改写为公网端口。
-//
-// 过滤口径与 ReloadPorts 的开监听口径严格一致：条目端口（服务端填的是后端监听
-// 端口，如 10011）在端口表里存在一条 Enabled=true 的映射（如 20011:10011），
-// 才算"这个频道可进"。端口被停用 / 被删除 / 从未纳管时，网关都不会为它开监听，
-// 客户端连上去必然失败（connection refused），因此直接从列表里移除，
-// 玩家在选频道界面既看不到、也选不到它。
-//
-// 安全性依据：服务端并不靠条目下标决定频道号，而是由连接落在哪个监听端口推导
-// （见 DfoServer CharacterSelectHandler / GameNetworkConfig.ResolveGameChannel），
-// 所以移除条目导致的列表下标平移不会造成"选 A 频道进 B 频道"。
-func rewritePlaintextAndFilter(plaintext []byte, publicIP string, view *portView) ([]byte, int, int) {
-	if len(plaintext) < channelListPrefixSize {
-		return plaintext, 0, 0
-	}
-	count := int(binary.LittleEndian.Uint32(plaintext[2:channelListPrefixSize]))
-	if count <= 0 {
-		return plaintext, 0, 0
-	}
-
-	keep := make([]bool, count)
-	kept := 0
-	for i := 0; i < count; i++ {
-		off := channelListPrefixSize + i*channelListEntrySize
-		if off+channelListEntrySize > len(plaintext) {
-			break
-		}
-		backendPort := int(binary.LittleEndian.Uint32(
-			plaintext[off+channelListPortOffset : off+channelListPortOffset+4]))
-		if _, ok := view.publicFor(backendPort); !ok {
-			continue
-		}
-		keep[i] = true
-		kept++
-	}
-
-	dropped := count - kept
-	if kept == 0 {
-		// 全部被过滤：交由调用方走安全阀
-		return plaintext, 0, dropped
-	}
-
-	out := make([]byte, channelListPrefixSize+kept*channelListEntrySize)
-	copy(out[0:2], plaintext[0:2]) // 组号原样保留
-	binary.LittleEndian.PutUint32(out[2:channelListPrefixSize], uint32(kept))
-
-	ipBytes := []byte(publicIP)
-	if len(ipBytes) > 16 {
-		ipBytes = ipBytes[:16]
-	}
-
-	dst := channelListPrefixSize
-	for i := 0; i < count; i++ {
-		if !keep[i] {
-			continue
-		}
-		src := channelListPrefixSize + i*channelListEntrySize
-		copy(out[dst:dst+channelListEntrySize], plaintext[src:src+channelListEntrySize])
-
-		// 重写 IP
-		ipOff := dst + channelListIPOffset
-		clear(out[ipOff : ipOff+16])
-		if len(ipBytes) > 0 {
-			copy(out[ipOff:ipOff+len(ipBytes)], ipBytes)
-		}
-
-		// 重写端口（后端 -> 公网）
-		backendPort := int(binary.LittleEndian.Uint32(
-			plaintext[src+channelListPortOffset : src+channelListPortOffset+4]))
-		if pub, ok := view.publicFor(backendPort); ok {
-			binary.LittleEndian.PutUint32(out[dst+channelListPortOffset:], uint32(pub))
-		}
-
-		dst += channelListEntrySize
-	}
-
-	return out, kept, dropped
-}
-
-func clear(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
-func padTo16Len(length int) int {
-	return length + (16-length%16)%16
-}
 
 func padTo16(data []byte) []byte {
 	padding := (16 - len(data)%16) % 16

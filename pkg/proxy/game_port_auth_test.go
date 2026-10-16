@@ -103,7 +103,7 @@ func newGameAuthFixture(t *testing.T, verifier GameCredentialVerifier, mutate fu
 	}
 
 	sm := session.NewSessionManager(func() {}, func() {})
-	return NewProxyServer(cfg, sm, log, nil, verifier), sm
+	return NewProxyServer(cfg, cfg.DefaultGameServerEntry(), sm, log, nil, verifier), sm
 }
 
 // TestParseGameLoginPacket 严格登录包解析（准入依据，比归属用的

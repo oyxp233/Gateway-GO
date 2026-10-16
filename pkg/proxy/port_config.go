@@ -62,20 +62,47 @@ type fsWatcher struct {
 	done       chan struct{}
 }
 
+// PortConfigFileName 是默认服的端口表文件名（保持历史文件名不变，
+// 老部署无需迁移）。
+const PortConfigFileName = "proxy_ports.json"
+
+// PortConfigFileNameFor 返回某个游戏服的端口表文件名。
+// profileId 为空时退回默认文件名。
+func PortConfigFileNameFor(profileId string) string {
+	if profileId == "" {
+		return PortConfigFileName
+	}
+	return "proxy_ports-" + profileId + ".json"
+}
+
 // NewPortConfigStore 创建端口配置存储。
 func NewPortConfigStore(configDir string, onChange func(*ProxyPortConfig) ReloadResult) *PortConfigStore {
-	return newPortConfigStore(configDir, onChange, nil)
+	return newPortConfigStore(configDir, PortConfigFileName, onChange, nil)
 }
 
 // NewPortConfigStoreBootstrap 创建端口配置存储，文件缺失时用 bootstrap 初始化
 // （bootstrap 从 appsettings 的 GamePorts/GamePortMap 派生，保证新旧配置一致）。
 func NewPortConfigStoreBootstrap(configDir string, onChange func(*ProxyPortConfig) ReloadResult, bootstrap *ProxyPortConfig) *PortConfigStore {
-	return newPortConfigStore(configDir, onChange, bootstrap)
+	return newPortConfigStore(configDir, PortConfigFileName, onChange, bootstrap)
 }
 
-func newPortConfigStore(configDir string, onChange func(*ProxyPortConfig) ReloadResult, bootstrap *ProxyPortConfig) *PortConfigStore {
+// NewPortConfigStoreNamedBootstrap 按指定文件名创建端口配置存储。
+//
+// 多服模型（2026-10-16 双服改造）：每个游戏服一份端口表。默认服仍用
+// PortConfigFileName（proxy_ports.json）——历史部署零迁移；其余服用
+// PortConfigFileNameFor(profileId)（proxy_ports-<id>.json）。
+// profileId 字符集由 config.ValidateGameServers 约束为 [a-z0-9-]，
+// 不会拼出路径穿越。
+func NewPortConfigStoreNamedBootstrap(configDir string, fileName string, onChange func(*ProxyPortConfig) ReloadResult, bootstrap *ProxyPortConfig) *PortConfigStore {
+	if fileName == "" {
+		fileName = PortConfigFileName
+	}
+	return newPortConfigStore(configDir, fileName, onChange, bootstrap)
+}
+
+func newPortConfigStore(configDir string, fileName string, onChange func(*ProxyPortConfig) ReloadResult, bootstrap *ProxyPortConfig) *PortConfigStore {
 	store := &PortConfigStore{
-		configPath: filepath.Join(configDir, "proxy_ports.json"),
+		configPath: filepath.Join(configDir, fileName),
 		onChange:   onChange,
 		bootstrap:  bootstrap,
 	}

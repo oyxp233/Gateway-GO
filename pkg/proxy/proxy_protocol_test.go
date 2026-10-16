@@ -49,12 +49,21 @@ func (c *fakeConn) Write(b []byte) (int, error) {
 }
 
 func newHeaderTestProxy(publicIP, mode string) *ProxyServer {
+	section := config.GameServerSection{
+		PublicIP:      publicIP,
+		ProxyProtocol: mode,
+	}
 	return &ProxyServer{
 		config: &config.GatewayConfig{
-			GameServer: config.GameServerSection{
-				PublicIP:      publicIP,
-				ProxyProtocol: mode,
-			},
+			GameServer: section,
+		},
+		// 多服模型后 ProxyProtocol / PublicIP 按服读取（profile 维度），
+		// 这里按 NewProxyServer 的构造形态补齐，保持锚测试的意图不变。
+		profile: config.GameServerEntry{
+			Id:                config.ProtocolS4A21,
+			Name:              "test",
+			Protocol:          config.ProtocolS4A21,
+			GameServerSection: section,
 		},
 	}
 }

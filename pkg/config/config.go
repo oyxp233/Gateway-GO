@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +55,16 @@ type GatewayConfig struct {
 	Gateway        GatewaySection        `json:"Gateway"`
 	Database       DatabaseSection       `json:"Database"`
 	GameServer     GameServerSection     `json:"GameServer"`
+	// GameServers 是多服模型（2026-10-16 双服改造）：一个网关同时带多个
+	// 游戏服（S4A21 / S5A9-DNF95 …），每个服一套后端地址、端口表、
+	// 频道列改写协议与启动参数模板。
+	//
+	// ★ 与旧 GameServer 段的关系：加载时规范化（见 NormalizeGameServers）——
+	//   只有旧段时合成单元素列表；两段都在时以 GameServers 为准。
+	//   规范化后 GameServer 被置为「默认服（第一个启用服）」的内嵌段，
+	//   作为**派生镜像**供老读取方（LaunchArgs 模板等）无缝工作。
+	//   新代码一律用 GameServers，不要读 GameServer。
+	GameServers []GameServerEntry `json:"GameServers"`
 	Pvf            PvfSection            `json:"Pvf"`
 	Launcher       LauncherSection       `json:"Launcher"`
 	Admin          AdminSection          `json:"Admin"`
@@ -294,6 +305,202 @@ type GameServerSection struct {
 	//     一致性，后端又不验密码）。
 	// 方案 D 用首包凭证同时解决两者，详见 pkg/proxy 的 admitGameClient。
 	GamePortAuth GamePortAuthSection `json:"GamePortAuth"`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 多服模型（2026-10-16 双服改造）
+//
+// 一个网关同时带 S4A21 与 S5A9（DNF95）两个服：登录器让玩家自选进哪个，
+// 网关按「服」隔离后端地址、公网端口段、频道列改写协议与启动参数模板。
+//
+// 协议差异全部收在 pkg/proxy 的下行适配层里（S4A21ChannelAdapter /
+// S5A95ChannelAdapter / S5A95GameAdapter），转发热路径不加任何 if/else。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 协议标识。Protocol 决定该服绑定哪组下行适配器。
+const (
+	// ProtocolS4A21 是 S4A21（86 版本）游戏协议：频道列 0x12 明文布局
+	// （条目 48B、IP@28、端口@44、zlib + AES 日密钥）。
+	ProtocolS4A21 = "s4a21"
+	// ProtocolS5A95 是 S5A9（DNF95）游戏协议：频道口 op18 Directory
+	// （AES-ECB 固定密钥 + zlib，条目 64B、IP@28、端口@60），
+	// 游戏口 LOGIN 回复内嵌 Endpoint(地址, 端口)。
+	ProtocolS5A95 = "s5a95"
+)
+
+// GameServerEntry 是一个游戏服的完整配置。
+//
+// 内嵌 GameServerSection（JSON 字段扁平提升），额外多出五个「服」维度字段。
+type GameServerEntry struct {
+	// Id 是服的唯一标识，同时是登录器 CMD_LOGIN 的 game 字段值。
+	// 只允许 [a-z0-9-]（会进文件名 proxy_ports-<id>.json）。
+	Id string `json:"Id"`
+	// Name 是展示名（管理后台 / 日志用）。
+	Name string `json:"Name"`
+	// Protocol 见 ProtocolS4A21 / ProtocolS5A95。
+	Protocol string `json:"Protocol"`
+	// Enabled 缺省（键缺失）= 启用；显式 false = 停用（不开任何监听）。
+	// 用指针而不是 bool：运营加一个服时忘了写 Enabled 也不至于把它停掉。
+	Enabled *bool `json:"Enabled"`
+	// ChannelListenerPort 是该服频道口（频道列表）的公网监听端口。
+	// 0 = 用 Gateway.ProxyPort —— 仅「只有一个启用服」时允许，
+	// 多服必须显式配置且互不碰撞（见 ValidateGameServers）。
+	ChannelListenerPort int `json:"ChannelListenerPort"`
+
+	GameServerSection
+}
+
+// IsEnabled 键缺失视为启用（见 Enabled 注释）。
+func (e *GameServerEntry) IsEnabled() bool {
+	return e.Enabled == nil || *e.Enabled
+}
+
+// DefaultGameServerEntry 返回规范后的默认服（第一个启用服）。
+//
+// 配置未经 NormalizeGameServers 规范化时（测试直接构造字面量等），
+// 这里按旧 GameServer 段合成一个等价条目 —— 保证任何调用路径
+// 都能拿到一个可用的服配置。
+func (c *GatewayConfig) DefaultGameServerEntry() GameServerEntry {
+	for i := range c.GameServers {
+		if c.GameServers[i].IsEnabled() {
+			return c.GameServers[i]
+		}
+	}
+	// 未规范化：按旧段合成（Id/Protocol 取 legacy 口径）。
+	entry := GameServerEntry{
+		Id:                 ProtocolS4A21,
+		Name:               "S4A21",
+		Protocol:           ProtocolS4A21,
+		GameServerSection:  c.GameServer,
+	}
+	enabled := true
+	entry.Enabled = &enabled
+	return entry
+}
+
+// NormalizeGameServers 把配置规范成多服模型（幂等）：
+//   - GameServers 非空：以其为准，逐条补默认值；
+//   - 只有旧 GameServer 段：合成单元素列表（等价改造前行为）；
+//   - 规范化后把 GameServer 置为默认服的内嵌段（派生镜像，见字段注释）。
+//
+// 返回 error 表示配置存在硬冲突（端口碰撞等）—— 调用方应拒绝启动，
+// 而不是让某个服静默不工作。
+func (c *GatewayConfig) NormalizeGameServers() error {
+	if len(c.GameServers) == 0 {
+		// 旧配置：合成单服。Id 用 s4a21，端口 0 = 沿用 Gateway.ProxyPort，
+		// 与改造前逐字节等价。
+		enabled := true
+		c.GameServers = []GameServerEntry{{
+			Id:                ProtocolS4A21,
+			Name:              "S4A21",
+			Protocol:          ProtocolS4A21,
+			Enabled:           &enabled,
+			GameServerSection: c.GameServer,
+		}}
+	} else {
+		for i := range c.GameServers {
+			e := &c.GameServers[i]
+			if e.Id == "" {
+				e.Id = ProtocolS4A21
+			}
+			if e.Name == "" {
+				e.Name = e.Id
+			}
+			if e.Protocol == "" {
+				e.Protocol = ProtocolS4A21
+			}
+		}
+	}
+
+	if err := c.ValidateGameServers(); err != nil {
+		return err
+	}
+
+	// 派生镜像：默认服（第一个启用服）的内嵌段回写到 GameServer，
+	// 老读取方（如 service.buildLaunchArgs 读 GameServer.LaunchArgsFormat）
+	// 无需改动即继续工作在默认服上。
+	def := c.DefaultGameServerEntry()
+	c.GameServer = def.GameServerSection
+	return nil
+}
+
+// ValidateGameServers 校验多服配置的硬冲突。
+//
+// 全部是「不校验就会静默坏一个服」的问题：公网端口碰撞 = 监听失败、
+// 频道口碰撞 = 两个服抢同一个口、协议未知 = 适配器绑不上。
+func (c *GatewayConfig) ValidateGameServers() error {
+	seenId := map[string]bool{}
+	seenPublic := map[int]string{}  // 公网 Game 端口 -> 占用服 Id
+	seenChannel := map[int]string{} // 频道口 -> 占用服 Id
+	enabledCount := 0
+
+	reserve := func(port int, what string) error {
+		switch {
+		case port == c.Gateway.TcpPort:
+			return fmt.Errorf("%s 与 Gateway.TcpPort(%d) 碰撞", what, port)
+		case port == c.Gateway.HttpPort:
+			return fmt.Errorf("%s 与 Gateway.HttpPort(%d) 碰撞", what, port)
+		case port == c.Gateway.ProxyPort:
+			return fmt.Errorf("%s 与 Gateway.ProxyPort(%d) 碰撞", what, port)
+		case c.Gateway.AdminHttpPort > 0 && port == c.Gateway.AdminHttpPort:
+			return fmt.Errorf("%s 与 Gateway.AdminHttpPort(%d) 碰撞", what, port)
+		case c.Gateway.InternalPort > 0 && port == c.Gateway.InternalPort:
+			return fmt.Errorf("%s 与 Gateway.InternalPort(%d) 碰撞", what, port)
+		}
+		return nil
+	}
+
+	for i := range c.GameServers {
+		e := &c.GameServers[i]
+		if !e.IsEnabled() {
+			continue
+		}
+		enabledCount++
+
+		if seenId[e.Id] {
+			return fmt.Errorf("GameServers: Id %q 重复", e.Id)
+		}
+		seenId[e.Id] = true
+
+		for _, r := range e.Id {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				return fmt.Errorf("GameServers: Id %q 含非法字符（只允许小写字母/数字/连字符）", e.Id)
+			}
+		}
+
+		switch e.Protocol {
+		case ProtocolS4A21, ProtocolS5A95:
+		default:
+			return fmt.Errorf("GameServers[%s]: 未知 Protocol %q（可选 %s / %s）",
+				e.Id, e.Protocol, ProtocolS4A21, ProtocolS5A95)
+		}
+
+		channelPort := e.ChannelListenerPort
+		if channelPort == 0 {
+			if enabledCount > 1 {
+				return fmt.Errorf("GameServers[%s]: 多服配置必须显式指定 ChannelListenerPort（0 只允许单服）", e.Id)
+			}
+			channelPort = c.Gateway.ProxyPort
+		}
+		if channelPort < 1 || channelPort > 65535 {
+			return fmt.Errorf("GameServers[%s]: ChannelListenerPort %d 非法", e.Id, e.ChannelListenerPort)
+		}
+		if err := reserve(channelPort, fmt.Sprintf("GameServers[%s].ChannelListenerPort", e.Id)); err != nil {
+			return err
+		}
+		if other, ok := seenChannel[channelPort]; ok {
+			return fmt.Errorf("GameServers[%s] 与 [%s] 的频道口 %d 碰撞", e.Id, other, channelPort)
+		}
+		seenChannel[channelPort] = e.Id
+
+		for pub := range e.GamePortMapResolved() {
+			if other, ok := seenPublic[pub]; ok {
+				return fmt.Errorf("GameServers[%s] 与 [%s] 的公网 Game 端口 %d 碰撞", e.Id, other, pub)
+			}
+			seenPublic[pub] = e.Id
+		}
+	}
+	return nil
 }
 
 // GamePortAuthSection 是游戏口准入（方案 D）的配置段。
@@ -766,6 +973,12 @@ func LoadConfig(path string) (*GatewayConfig, error) {
 
 	applyEnvOverrides(cfg)
 
+	// 多服规范化 + 硬冲突校验。冲突时拒绝启动 —— 端口碰撞的后果是
+	// 某个服静默不监听，比启动失败难查得多。
+	if err := cfg.NormalizeGameServers(); err != nil {
+		return nil, fmt.Errorf("GameServers 配置无效: %w", err)
+	}
+
 	return cfg, nil
 }
 
@@ -878,8 +1091,13 @@ func (c *GatewayConfig) AdminSplitEnabled() bool {
 
 // GamePortMapResolved 解析 GamePortMap 配置为 map[publicPort]backendPort。
 func (c *GatewayConfig) GamePortMapResolved() map[int]int {
+	return c.GameServer.GamePortMapResolved()
+}
+
+// GamePortMapResolved 服级口径（多服模型：每个服有自己的端口表）。
+func (s *GameServerSection) GamePortMapResolved() map[int]int {
 	result := make(map[int]int)
-	for _, entry := range c.GameServer.GamePortMap {
+	for _, entry := range s.GamePortMap {
 		parts := strings.Split(entry, ":")
 		if len(parts) == 2 {
 			pub := parsePort(strings.TrimSpace(parts[0]))

@@ -294,16 +294,16 @@ func fetchChannelList(host string, port int, tzOffset int, firstPacketLen int) (
 // extractChannelListFrame 从流里切出一个完整的 0x12 帧的 body。
 func extractChannelListFrame(buf []byte) ([]byte, bool) {
 	offset := 0
-	for offset+channelHeaderSize <= len(buf) {
+	for offset+channelFrameHeaderSize <= len(buf) {
 		length := int(binary.LittleEndian.Uint32(buf[offset+2 : offset+6]))
-		if length < channelHeaderSize || length > maxFrameSize {
+		if length < channelFrameHeaderSize || length > maxFrameSize {
 			return nil, false
 		}
 		if len(buf)-offset < length {
 			return nil, false
 		}
 		if buf[offset+1] == scAskChannelInfoNew {
-			return buf[offset+channelHeaderSize : offset+length], true
+			return buf[offset+channelFrameHeaderSize : offset+length], true
 		}
 		offset += length
 	}

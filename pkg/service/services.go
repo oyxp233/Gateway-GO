@@ -2793,6 +2793,18 @@ type BonusConfig struct {
 	Enabled           bool `json:"enabled"`
 	IntervalSeconds   int  `json:"interval_seconds"`
 	AmountPerInterval int  `json:"amount_per_interval"`
+	// Timezone 判定「星期 / 时间段」所用的时区（IANA 名称，如 Asia/Shanghai）。
+	//
+	// 留空 = 服务器本地时区 —— 这是改造前的隐含行为，存量配置不受影响。
+	// ★ 但服务器本地时区未必是运营心里的时区（Linux 云主机出厂常是 UTC），
+	//   跨机器部署同一份 bonus.json 时**必须**显式写死，否则"6 点上班"
+	//   在不同机器上指向不同时刻。
+	Timezone string `json:"timezone"`
+	// Rules 分档规则：按书写顺序匹配，**首条命中即用**，一条都没命中时
+	// 回落到 AmountPerInterval。
+	//
+	// 老配置没有这个键 → 解析成 nil → 行为与改造前完全一致。
+	Rules []BonusRule `json:"rules"`
 	// ActiveThresholdMinutes 旧口径的「活跃阈值」（最近 N 分钟内有 HTTP 心跳
 	// 即算在线）。2026-09-23 起泡点改为按真实在游戏内的时长计费，本字段
 	// **不再参与发放判定**，仅为兼容既有 bonus.json / 部署脚本保留；
@@ -2976,6 +2988,12 @@ func (s *BonusService) runLoop(cancel <-chan struct{}) {
 		}
 	}
 
+	// lastSlot 上一轮生效的档位名，用于打「档位切换」日志。
+	//
+	// 只有跨档的那几轮才写日志 —— 每轮都写的话，60 秒一条噪声会把真正
+	// 有用的切换记录淹掉；而这一条恰恰是"配了规则到底按哪档在发"的唯一凭据。
+	lastSlot := ""
+
 	for {
 		select {
 		case <-cancel:
@@ -2999,7 +3017,18 @@ func (s *BonusService) runLoop(cancel <-chan struct{}) {
 			continue
 		}
 
-		s.grantBonus(cfg)
+		slot, err := s.grantBonusAt(cfg, time.Now())
+		if err != nil {
+			// grantBonusAt 已经因此一分未发，这里不重复发放，只补一条告警。
+			s.logger.Warn(fmt.Sprintf("泡点: 分档配置不可用，本轮不发放: %v", err))
+		} else if slot != lastSlot {
+			if lastSlot == "" {
+				s.logger.Info(fmt.Sprintf("泡点计费启动，当前档位: %s", slot))
+			} else {
+				s.logger.Info(fmt.Sprintf("泡点档位切换: %s → %s", lastSlot, slot))
+			}
+			lastSlot = slot
+		}
 
 		if !wait(time.Duration(cfg.IntervalSeconds) * time.Second) {
 			return
@@ -3037,6 +3066,19 @@ func (s *BonusService) validateConfig(cfg *BonusConfig) error {
 	if cfg.ActiveThresholdMinutes < 0 || cfg.ActiveThresholdMinutes > 1440 {
 		return fmt.Errorf("active_threshold_minutes 取值范围 0~1440")
 	}
+	// 分档规则：非法就整份拒绝。
+	//
+	// 这里沿用本文件一贯的"失败即停"口径（见 GetConfig 注释）：任何一条规则
+	// 解析不出来都让**整份配置判非法**，主循环跳过本轮并打 WARN，
+	// 而不是悄悄忽略那一条 —— 忽略的后果是这条规则静默失效，
+	// 玩家拿到的钱和运营以为的不一样，且没有任何地方报错。
+	if err := validateBonusRules(cfg.Rules); err != nil {
+		return err
+	}
+	// 时区同理：配了却解析不出来必须报错，不能退回 Local 了事。
+	if _, err := cfg.Location(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -3046,20 +3088,45 @@ func (s *BonusService) validateConfig(cfg *BonusConfig) error {
 // 的 last_heartbeat。发放条件是玩家真的连着游戏频道且累计满一个计费周期，
 // 会话一旦被清理 / 踢下线就再也遍历不到，从根上杜绝「掉线还发泡点」。
 func (s *BonusService) grantBonus(cfg *BonusConfig) {
+	if _, err := s.grantBonusAt(cfg, time.Now()); err != nil {
+		s.logger.Warn(fmt.Sprintf("泡点: 分档规则不可用，本轮不发放: %v", err))
+	}
+}
+
+// grantBonusAt 结算一轮泡点，返回本轮生效的档位名。
+//
+// now 可注入是为了两件事：测试能构造确定的时刻（如"周三 23:59"），
+// runLoop 能据此感知档位切换并打一条变更日志（排障时最需要先确认的就是
+// "这台机器现在到底按哪一档在发"）。
+//
+// 返回值 err 非空表示**配置本身不可用**（时区解析失败 / 规则非法）→
+// 本轮一分不发。这是刻意的失败即止：与其按猜出来的金额发钱，
+// 不如停一轮并在日志里留痕。
+//
+// ★ 同样的档位适用于本轮所有会话：一次结算只差几十毫秒，
+//   硬要为每人重算"他各自走到哪一段"只会把账算得更糊涂。
+func (s *BonusService) grantBonusAt(cfg *BonusConfig, now time.Time) (string, error) {
+	amountPerInterval, slot, err := cfg.ResolveBonus(now)
+	if err != nil {
+		return "", err
+	}
+
 	sm := s.sessionManager()
 	if sm == nil {
 		s.logger.Warn("泡点: 会话管理器未注入，本轮不发放（计费口径为「真实进入游戏才计时」）")
-		return
+		return slot, nil
 	}
 
-	awards := sm.CollectBonusAwards(time.Now().Unix(), int64(cfg.IntervalSeconds))
+	awards := sm.CollectBonusAwards(now.Unix(), int64(cfg.IntervalSeconds))
 	for _, a := range awards {
 		display := a.Account
 		if display == "" {
 			display = a.MId
 		}
 		// 本轮可能结算出多个周期（例如主循环被拖慢后补上），按周期数发放。
-		delta := int64(cfg.AmountPerInterval) * a.Intervals
+		// ★ 金额取**本轮档位** amountPerInterval，而不是 cfg.AmountPerInterval ——
+		//   后者现在只是"没有任何规则命中时"的兜底档。
+		delta := int64(amountPerInterval) * a.Intervals
 
 		// 网关库镜像：登录器 CMD_ACCOUNT_INFO 与删除账号预演读这份。
 		if err := s.db.UpdateAccountCera(a.MId, delta); err != nil {
@@ -3075,9 +3142,12 @@ func (s *BonusService) grantBonus(cfg *BonusConfig) {
 		} else if n == 0 {
 			s.logger.Warn(fmt.Sprintf("泡点: 账号 %s 在游戏库无账号行，本次 %d cera 只记入网关库镜像", display, delta))
 		}
-		s.logger.Info(fmt.Sprintf("泡点: %s +%d cera（本轮 %d 个周期，累计已发 %d，余 %d 秒）",
-			display, delta, a.Intervals, a.Granted, a.Remainder))
+		// 带上档位名：同一套 rules 下金额会随时间变化，日志里没有档位名
+		// 就没法回答"这几块钱是哪一档发的"。
+		s.logger.Info(fmt.Sprintf("泡点[%s]: %s +%d cera（本轮 %d 个周期，累计已发 %d，余 %d 秒）",
+			slot, display, delta, a.Intervals, a.Granted, a.Remainder))
 	}
+	return slot, nil
 }
 
 // DeviceCredentialService 设备凭证服务。

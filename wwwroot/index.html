@@ -421,6 +421,24 @@
         .plugin-chk input { width: auto; }
         .plugin-r1 > select, .plugin-r2 > .btn { width: 100%; }
 
+        /* ── 泡点分档规则表 ── */
+        .bonus-days { display: flex; gap: 3px; flex-wrap: wrap; }
+        .bonus-day {
+            display: inline-flex; align-items: center; justify-content: center;
+            min-width: 26px; height: 24px; padding: 0 5px;
+            font-size: 12px; line-height: 1;
+            border: 1px solid var(--border); border-radius: 4px;
+            cursor: pointer; user-select: none;
+            color: var(--text-muted); background: transparent;
+        }
+        .bonus-day:hover { border-color: var(--accent); }
+        .bonus-day.on {
+            background: var(--accent-soft); border-color: var(--accent);
+            color: var(--accent); font-weight: 600;
+        }
+        .bonus-slot-hint { font-size: 13px; }
+        .bonus-slot-hint b { color: var(--accent); }
+
         /* ── 更新流程向导 ── */
         .workflow-container { max-width: 720px; margin: 0 auto; }
         .workflow-header {
@@ -1023,8 +1041,32 @@
                 </p>
                 <div class="row">
                     <label><input type="checkbox" id="bonusEnabled"> 启用泡点</label>
-                    <label>计费周期（秒）</label><input type="text" id="bonusInterval" style="width: 100px;">
-                    <label>每周期点券</label><input type="text" id="bonusAmount" style="width: 100px;">
+                    <label>计费周期（秒）</label><input type="text" id="bonusInterval" style="width: 90px;">
+                    <label>默认档每周期点券</label><input type="text" id="bonusAmount" style="width: 100px;">
+                    <label>时区</label><input type="text" id="bonusTimezone" style="width: 150px;" placeholder="Asia/Shanghai">
+                </div>
+                <p class="muted">
+                    星期与时间段都按<b>上面这个时区</b>判定。留空 = 服务器本地时区（云主机出厂常是 UTC，
+                    极易配错，建议写死 <code>Asia/Shanghai</code>）。
+                    <b>默认档</b>只在下面<b>没有任何规则命中</b>时才生效。
+                </p>
+                <table>
+                    <thead><tr>
+                        <th style="width:20%">档位名</th>
+                        <th style="width:24%">生效星期</th>
+                        <th style="width:9%">开始</th>
+                        <th style="width:9%">结束</th>
+                        <th style="width:12%">每周期点券</th>
+                        <th style="width:26%"></th>
+                    </tr></thead>
+                    <tbody id="bonusRuleTable"></tbody>
+                </table>
+                <div class="row">
+                    <button class="btn" onclick="addBonusRule()">+ 新增档位</button>
+                    <span class="muted">按书写顺序匹配，<b>第一条命中的生效</b>；特例要排前面（可用 ↑↓ 调序）。</span>
+                </div>
+                <div class="row">
+                    <span id="bonusNowSlot" class="muted bonus-slot-hint"></span>
                 </div>
                 <div class="row">
                     <button class="btn" onclick="loadBonusConfig()">读取</button>
@@ -3715,6 +3757,158 @@
         //
         // 读写的是网关运行目录下的 bonus.json。两个进程都能直接改这个文件，
         // 所以这里不需要走内部 API；泡点主循环每轮重读盘，保存即生效。
+
+        // bonusRules 档位规则的编辑态（与后端 bonus.json 的 rules[] 一一对应）。
+        // 下标顺序就是优先级 —— 后端按数组顺序匹配，首条命中即用。
+        let bonusRules = [];
+
+        const BONUS_DAY_LABELS = ['一', '二', '三', '四', '五', '六', '日'];
+
+        // parseClockJS 与后端 parseClock 同口径："HH:MM" → 当日分钟数，认不出返回 NaN。
+        function parseClockJS(s) {
+            const raw = String(s === null || s === undefined ? '' : s).trim();
+            const i = raw.indexOf(':');
+            if (i < 0) return NaN;
+            const h = parseInt(raw.slice(0, i).trim(), 10);
+            const m = parseInt(raw.slice(i + 1).trim(), 10);
+            if (isNaN(h) || isNaN(m)) return NaN;
+            if (h < 0 || h > 24 || m < 0 || m > 59) return NaN;
+            if (h === 24 && m !== 0) return NaN;
+            return h * 60 + m;
+        }
+
+        // bonusNowParts 取"当前时刻在指定时区下的星期与分钟数"。
+        // 时区非法或浏览器不支持 Intl 时区时抛错，由调用方兜住。
+        function bonusNowParts(tz) {
+            const opts = { hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' };
+            if (tz) opts.timeZone = tz;
+            const parts = new Intl.DateTimeFormat('en-US', opts).formatToParts(new Date());
+            const get = (t) => { const p = parts.find(x => x.type === t); return p ? p.value : ''; };
+            const map = { Sun: 7, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+            let h = parseInt(get('hour'), 10);
+            if (h === 24) h = 0; // 少数实现 hour12:false 会给 24
+            return { wd: map[get('weekday')] || 0, min: h * 60 + parseInt(get('minute'), 10), hour: h, minute: parseInt(get('minute'), 10) };
+        }
+
+        // bonusRuleMatches 与后端 bonusRuleCompiled.matches 同口径，用于"当前档位"预览。
+        // ★ 这只是给运营看的提示，真正发放以后端为准 —— 两边算法必须一致，
+        //   否则预览说 120、实际发 60 就坑人了（改一边记得改另一边）。
+        function bonusRuleMatches(r, wd, min) {
+            let s = parseClockJS(r.start), e = parseClockJS(r.end);
+            if (isNaN(s) || isNaN(e)) return false;
+            if (s === e) { s = 0; e = 1440; }          // 起止相同 = 全天
+            const wraps = s > e;                        // 跨零点
+            let w = wd;
+            // 跨零点时段归属到"它的起始日"：22:00~06:00 配周五，周六凌晨仍算这一夜。
+            if (wraps && min < e) w = (wd === 1 ? 7 : wd - 1);
+            const days = r.days || [];
+            if (days.length > 0 && days.indexOf(w) < 0) return false;
+            return wraps ? (min >= s || min < e) : (min >= s && min < e);
+        }
+
+        function addBonusRule() {
+            bonusRules.push({ name: '', days: [1, 2, 3, 4, 5], start: '06:00', end: '24:00', amount: 100 });
+            renderBonusRules();
+        }
+
+        function delBonusRule(i) {
+            if (i < 0 || i >= bonusRules.length) return;
+            bonusRules.splice(i, 1);
+            renderBonusRules();
+        }
+
+        function moveBonusRule(i, delta) {
+            const j = i + delta;
+            if (i < 0 || i >= bonusRules.length || j < 0 || j >= bonusRules.length) return;
+            const tmp = bonusRules[i];
+            bonusRules[i] = bonusRules[j];
+            bonusRules[j] = tmp;
+            renderBonusRules();
+        }
+
+        function toggleBonusDay(i, d) {
+            const r = bonusRules[i];
+            if (!r) return;
+            const k = r.days.indexOf(d);
+            if (k >= 0) r.days.splice(k, 1); else r.days.push(d);
+            r.days.sort((a, b) => a - b);
+            renderBonusRules();
+        }
+
+        function renderBonusRules() {
+            const tbody = document.getElementById('bonusRuleTable');
+            if (!tbody) return;
+            if (bonusRules.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无档位规则 —— 此时一律按「默认档」发放（改造前的行为）</td></tr>';
+                updateBonusNowSlot();
+                return;
+            }
+            tbody.innerHTML = bonusRules.map((r, i) => {
+                const days = BONUS_DAY_LABELS.map((label, k) => {
+                    const d = k + 1;
+                    const on = (r.days || []).indexOf(d) >= 0;
+                    return `<span class="bonus-day${on ? ' on' : ''}" onclick="toggleBonusDay(${i},${d})" title="${on ? '取消' : '选中'}周${label}">${label}</span>`;
+                }).join('');
+                return `<tr>
+                    <td><input type="text" class="bonus-rule-name" data-i="${i}" value="${esc(r.name)}" placeholder="（留空自动叫 规则${i + 1}）" style="width:100%;"></td>
+                    <td><div class="bonus-days">${days}</div></td>
+                    <td><input type="text" class="bonus-rule-start" data-i="${i}" value="${esc(r.start)}" style="width:70px;"></td>
+                    <td><input type="text" class="bonus-rule-end" data-i="${i}" value="${esc(r.end)}" style="width:70px;"></td>
+                    <td><input type="text" class="bonus-rule-amount" data-i="${i}" value="${esc(r.amount)}" style="width:80px;"></td>
+                    <td>
+                        <button class="btn btn-sm" onclick="moveBonusRule(${i},-1)"${i === 0 ? ' disabled' : ''}>↑</button>
+                        <button class="btn btn-sm" onclick="moveBonusRule(${i},1)"${i === bonusRules.length - 1 ? ' disabled' : ''}>↓</button>
+                        <button class="btn btn-sm btn-danger" onclick="delBonusRule(${i})">删除</button>
+                    </td>
+                </tr>`;
+            }).join('');
+
+            // 输入即写回编辑态。用事件委托，避免每次重绘后重新绑定。
+            tbody.querySelectorAll('input[data-i]').forEach(el => {
+                el.addEventListener('input', () => {
+                    const idx = parseInt(el.getAttribute('data-i'), 10);
+                    const r = bonusRules[idx];
+                    if (!r) return;
+                    if (el.classList.contains('bonus-rule-name')) r.name = el.value;
+                    else if (el.classList.contains('bonus-rule-start')) r.start = el.value;
+                    else if (el.classList.contains('bonus-rule-end')) r.end = el.value;
+                    else if (el.classList.contains('bonus-rule-amount')) r.amount = el.value;
+                    updateBonusNowSlot();
+                });
+            });
+            updateBonusNowSlot();
+        }
+
+        // updateBonusNowSlot 实时预览"此刻会命中哪一档"。
+        //
+        // ★ 这条提示的价值在于**排障**：运营改完规则最想知道的就是
+        //   "现在到底按哪一档在发"。它用浏览器时钟算，只是参考，
+        //   真正的判定在网关侧（按服务器时钟 + 配置时区）。
+        function updateBonusNowSlot() {
+            const el = document.getElementById('bonusNowSlot');
+            if (!el) return;
+            const tz = (document.getElementById('bonusTimezone').value || '').trim();
+            let now;
+            try {
+                now = bonusNowParts(tz);
+            } catch (e) {
+                el.innerHTML = '<span style="color:var(--danger)">时区无法识别，请填 IANA 名称（如 Asia/Shanghai）</span>';
+                return;
+            }
+            const hhmm = String(now.hour).padStart(2, '0') + ':' + String(now.minute).padStart(2, '0');
+            const wdName = '周' + (BONUS_DAY_LABELS[now.wd - 1] || '?');
+            for (let i = 0; i < bonusRules.length; i++) {
+                const r = bonusRules[i];
+                if (bonusRuleMatches(r, now.wd, now.min)) {
+                    const name = (r.name || '').trim() || ('规则' + (i + 1));
+                    el.innerHTML = `此刻（${esc(tz || '服务器本地时区')} ${wdName} ${hhmm}）命中 <b>${esc(name)}</b> → 每周期 ${esc(r.amount)} 点`;
+                    return;
+                }
+            }
+            const fallback = document.getElementById('bonusAmount').value;
+            el.innerHTML = `此刻（${esc(tz || '服务器本地时区')} ${wdName} ${hhmm}）未命中任何档位 → <b>默认档</b> 每周期 ${esc(fallback)} 点`;
+        }
+
         async function loadBonusConfig() {
             const data = await api('/api/admin/bonus/config');
             if (!data) return;
@@ -3728,6 +3922,16 @@
             document.getElementById('bonusEnabled').checked = !!c.enabled;
             document.getElementById('bonusInterval').value = c.interval_seconds;
             document.getElementById('bonusAmount').value = c.amount_per_interval;
+            document.getElementById('bonusTimezone').value = c.timezone || '';
+            // 老配置没有 rules → 空数组 → 表格显示"暂无档位"，行为与改造前一致。
+            bonusRules = Array.isArray(c.rules) ? c.rules.map(r => ({
+                name: r.name || '',
+                days: Array.isArray(r.days) ? r.days.slice() : [],
+                start: r.start || '',
+                end: r.end || '',
+                amount: r.amount
+            })) : [];
+            renderBonusRules();
             setText('bonusPath', data.path || '');
         }
 
@@ -3736,12 +3940,32 @@
             const amount = parseInt(document.getElementById('bonusAmount').value, 10);
             // 前端先挡一道明显非法的输入，后端还会再校验一次（两侧都要）。
             if (!(interval >= 1 && interval <= 86400)) { showToast('error', '', '计费周期要在 1 ~ 86400 秒之间'); return; }
-            if (!(amount >= 0 && amount <= 10000000)) { showToast('error', '', '每周期点券要在 0 ~ 10000000 之间'); return; }
+            if (!(amount >= 0 && amount <= 10000000)) { showToast('error', '', '默认档每周期点券要在 0 ~ 10000000 之间'); return; }
+            if (bonusRules.length > 64) { showToast('error', '', '档位最多 64 条，当前 ' + bonusRules.length + ' 条'); return; }
+
+            const rules = [];
+            for (let i = 0; i < bonusRules.length; i++) {
+                const r = bonusRules[i];
+                const label = (r.name || '').trim() || ('第 ' + (i + 1) + ' 条');
+                if (isNaN(parseClockJS(r.start))) { showToast('error', '', '档位「' + label + '」的开始时间要写成 HH:MM'); return; }
+                if (isNaN(parseClockJS(r.end))) { showToast('error', '', '档位「' + label + '」的结束时间要写成 HH:MM'); return; }
+                const amt = parseInt(r.amount, 10);
+                if (!(amt >= 0 && amt <= 10000000)) { showToast('error', '', '档位「' + label + '」的每周期点券要在 0 ~ 10000000 之间'); return; }
+                rules.push({
+                    name: (r.name || '').trim(),
+                    days: (r.days || []).slice().sort((a, b) => a - b),
+                    start: String(r.start).trim(),
+                    end: String(r.end).trim(),
+                    amount: amt
+                });
+            }
 
             const cfg = {
                 enabled: document.getElementById('bonusEnabled').checked,
                 interval_seconds: interval,
-                amount_per_interval: amount
+                amount_per_interval: amount,
+                timezone: (document.getElementById('bonusTimezone').value || '').trim(),
+                rules: rules
             };
             const data = await api('/api/admin/bonus/config', 'POST', cfg);
             if (!data) return;

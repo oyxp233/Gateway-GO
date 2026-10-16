@@ -434,13 +434,22 @@ func (c *GatewayConfig) ValidateGameServers() error {
 	seenChannel := map[int]string{} // 频道口 -> 占用服 Id
 	enabledCount := 0
 
-	reserve := func(port int, what string) error {
+	// skipProxyPort 的来历（2026-10-16 修的自指缺陷）：
+	//
+	// 频道口在**单服**模式下本来就是 Gateway.ProxyPort —— 配置写 0 表示"沿用
+	// ProxyPort"（见 ChannelListenerPort 字段注释），此时拿它去和 ProxyPort
+	// 比，等于拿一个端口撞它自己，必然报错。
+	//
+	// 后果不是"功能不可用"，是**进程 Fatal 拒绝启动**：所有"只有旧 GameServer
+	// 段、没显式配 ChannelListenerPort"的存量配置（161 就是这种）一加载就炸。
+	// 其余四个端口的碰撞判定照旧 —— 那些是真的撞别人。
+	reserve := func(port int, what string, skipProxyPort bool) error {
 		switch {
 		case port == c.Gateway.TcpPort:
 			return fmt.Errorf("%s 与 Gateway.TcpPort(%d) 碰撞", what, port)
 		case port == c.Gateway.HttpPort:
 			return fmt.Errorf("%s 与 Gateway.HttpPort(%d) 碰撞", what, port)
-		case port == c.Gateway.ProxyPort:
+		case !skipProxyPort && port == c.Gateway.ProxyPort:
 			return fmt.Errorf("%s 与 Gateway.ProxyPort(%d) 碰撞", what, port)
 		case c.Gateway.AdminHttpPort > 0 && port == c.Gateway.AdminHttpPort:
 			return fmt.Errorf("%s 与 Gateway.AdminHttpPort(%d) 碰撞", what, port)
@@ -485,7 +494,10 @@ func (c *GatewayConfig) ValidateGameServers() error {
 		if channelPort < 1 || channelPort > 65535 {
 			return fmt.Errorf("GameServers[%s]: ChannelListenerPort %d 非法", e.Id, e.ChannelListenerPort)
 		}
-		if err := reserve(channelPort, fmt.Sprintf("GameServers[%s].ChannelListenerPort", e.Id)); err != nil {
+		// 频道口跳过与 ProxyPort 的比对：单服时它就是 ProxyPort 本身
+		// （见上方 reserve 的 skipProxyPort 注释）。
+		if err := reserve(channelPort,
+			fmt.Sprintf("GameServers[%s].ChannelListenerPort", e.Id), true); err != nil {
 			return err
 		}
 		if other, ok := seenChannel[channelPort]; ok {
@@ -745,6 +757,16 @@ type ServerSection struct {
 	LogTailLines           int    `json:"LogTailLines"`
 	BackupMaxFileSizeBytes int64  `json:"BackupMaxFileSizeBytes"`
 	ControlEnabled         bool   `json:"ControlEnabled"`
+
+	// BackupRetainCount 每个类别（db / pvf / logs）保留最近多少份 .tar.gz。
+	//
+	// 0 或负数 = 不清理（**默认值**，与改造前一样只增不减）——
+	// 自动删备份是破坏性动作，必须显式配置才生效，绝不能靠缺省打开。
+	//
+	// ★ 只清理「本次产出涉及的类别」，且只认 <类别>-<时间戳>.tar.gz 这一个命名族：
+	//   改造前散装的 inventory-*.db / gateway-*.db / Script-*.pvf 一个都不动
+	//   —— 那些文件是运维在没有"保留 N 份"这套约定时留下来的，自动删掉属于越权。
+	BackupRetainCount int `json:"BackupRetainCount"`
 
 	// BackupPurgeAuditLog 控制「备份完成后是否清理游戏库的背包审计日志并收缩库文件」。
 	//

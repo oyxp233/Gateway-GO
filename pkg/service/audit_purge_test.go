@@ -226,21 +226,13 @@ func TestBackupPurgesAfterSuccess(t *testing.T) {
 	if res.GameDbBytesAfter >= res.GameDbBytesBefore {
 		t.Fatalf("库未变小: %d -> %d", res.GameDbBytesBefore, res.GameDbBytesAfter)
 	}
-	// 备份产物里必须还留着完整审计日志（清的是线上库，不是备份）
-	entries, err := os.ReadDir(cfg.Server.BackupDir)
-	if err != nil {
-		t.Fatalf("readdir: %v", err)
-	}
-	var invFile string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "inventory-") {
-			invFile = filepath.Join(cfg.Server.BackupDir, e.Name())
-		}
-	}
-	if invFile == "" {
-		t.Fatal("没找到 inventory 备份产物")
-	}
-	if n := countAuditRows(t, invFile); n != 30000 {
+	// 备份产物里必须还留着完整审计日志（清的是线上库，不是备份）。
+	//
+	// 2026-10-16 起库是打进 db-<时间戳>.tar.gz 里的，不再散装落盘，
+	// 所以这里改成去包里取 inventory-*.db 的字节再数 —— 断言口径一字未变：
+	// 清的是线上库，备份必须还是满的。
+	invBytes := extractEntryBytes(t, cfg.Server.BackupDir, "db", "inventory-")
+	if n := countAuditRowsInBytes(t, invBytes); n != 30000 {
 		t.Errorf("备份里应有完整 %d 行审计日志，实得 %d", 30000, n)
 	}
 	if res.GameDbBytesBefore < before.Size() {

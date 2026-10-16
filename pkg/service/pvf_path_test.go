@@ -211,28 +211,15 @@ func TestBackupIncludesPvfFromPublishSubdir(t *testing.T) {
 		t.Fatalf("备份应成功，实际失败: %s", res.Error)
 	}
 
-	entries, err := os.ReadDir(backupDir)
-	if err != nil {
-		t.Fatalf("读备份目录失败: %v", err)
-	}
-	var found string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "Script-") && strings.HasSuffix(e.Name(), ".pvf") {
-			found = filepath.Join(backupDir, e.Name())
-		}
-	}
-	if found == "" {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Fatalf("备份目录里没有 PVF（只有 %v）—— PVF 又被静默跳过了", names)
-	}
+	// 2026-10-16 起 PVF 打进 pvf-<时间戳>.tar.gz，不再散装落盘。
+	// 断言口径不变：**备份里必须有 PVF，且字节与源一致**。
+	// 改成从包里取，而不是删掉这条 —— 删了它，"PVF 被静默跳过"就会重新变成
+	// 一个没人发现的故障（这正是这条测试当年被加进来的原因）。
+	dst := extractEntryBytes(t, backupDir, "pvf", "Script-")
 
-	src, _ := os.ReadFile(pvfPath)
-	dst, err := os.ReadFile(found)
+	src, err := os.ReadFile(pvfPath)
 	if err != nil {
-		t.Fatalf("读备份副本失败: %v", err)
+		t.Fatalf("读源 PVF 失败: %v", err)
 	}
 	if !bytes.Equal(src, dst) {
 		t.Fatalf("备份的 PVF 内容与源不一致")

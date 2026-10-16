@@ -577,6 +577,7 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/server/pvf/info", s.handleAdminServerPvfInfo).Methods("GET")
 	r.HandleFunc("/api/admin/server/backup", s.handleAdminServerBackup).Methods("POST")
 	r.HandleFunc("/api/admin/server/backups", s.handleAdminServerBackups).Methods("GET")
+	r.HandleFunc("/api/admin/backup/targets", s.handleAdminBackupTargets).Methods("GET")
 
 	// 网关管理
 	r.HandleFunc("/api/admin/gateway/status", s.handleAdminGatewayStatus).Methods("GET")
@@ -2578,8 +2579,35 @@ func (s *Server) handleAdminServerBackup(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result := s.serverMgr.Backup()
+	// body 可以是空的（更新流程向导第 8 步与旧前端发的就是 {}），
+	// 这时走默认目标集 = 两个库 + PVF，行为与改造前一致。
+	//
+	// ★ 空 body 不能判成 400：io.EOF 是「没有内容」而不是「内容坏了」。
+	var body struct {
+		Targets []string `json:"targets"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "请求体不是合法 JSON"})
+		return
+	}
+
+	result := s.serverMgr.BackupWith(service.BackupOptions{Targets: body.Targets})
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": result.Ok, "error": result.Error, "result": result})
+}
+
+// handleAdminBackupTargets 列出可备份目标（只读）。
+//
+// 备份是"选了什么就备什么"的操作，前提是先让人看见有哪些东西可备、
+// 每个现在多大多新、路径解析到了哪 —— 勾一个不存在的文件必须当场看得出来。
+func (s *Server) handleAdminBackupTargets(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	targets := s.serverMgr.ListBackupTargets()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok": true, "count": len(targets), "items": targets,
+	})
 }
 
 func (s *Server) handleAdminServerBackups(w http.ResponseWriter, r *http.Request) {

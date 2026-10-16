@@ -3598,98 +3598,13 @@ func (s *ServerManager) ServerPvfInfo() (*PvfResult, error) {
 // 清空背包审计日志并 VACUUM 收缩文件。顺序不能反 —— 这些日志清掉后就只存在于
 // 备份里了，没有备份副本时绝不删线上数据。
 func (s *ServerManager) Backup() *BackupResult {
-	dir := s.config.Server.BackupDir
-	if dir == "" {
-		return &BackupResult{Ok: false, Error: "未配置备份目录 BackupDir"}
-	}
-	if err := utils.MkdirAll(dir); err != nil {
-		return &BackupResult{Ok: false, Error: err.Error()}
-	}
-
-	stamp := time.Now().UTC().Format("20060102-150405")
-	var done []string
-	var errs []string
-
-	// 1. 游戏库存库（最关键的数据）
-	gamePath := s.config.Database.GamePath
-	gameBackedUp := false
-	if gamePath != "" && utils.FileExists(gamePath) {
-		dst := filepath.Join(dir, fmt.Sprintf("inventory-%s.db", stamp))
-		if err := backupSqliteFile(gamePath, dst); err != nil {
-			errs = append(errs, fmt.Sprintf("inventory: %v", err))
-		} else {
-			done = append(done, dst)
-			gameBackedUp = true
-		}
-	}
-
-	// 2. 网关库
-	gwPath := s.config.Database.Path
-	if gwPath != "" && utils.FileExists(gwPath) {
-		dst := filepath.Join(dir, fmt.Sprintf("gateway-%s.db", stamp))
-		if err := backupSqliteFile(gwPath, dst); err != nil {
-			errs = append(errs, fmt.Sprintf("gateway: %v", err))
-		} else {
-			done = append(done, dst)
-		}
-	}
-
-	// 3. 服务端 PVF
+	// 2026-10-16 起真正的实现在 BackupWith：可勾选目标 + 分类 tar.gz 打包。
+	// 这里保留旧签名与旧语义（空选项 = 默认目标集 = 两个库 + PVF），
+	// 现有调用方（后台「立即备份」、更新流程向导第 8 步、旧单测）一行都不用改。
 	//
-	// 解析不出路径**不算备份失败**（备份主目标是两个库），但绝不静默 ——
-	// 2026-09-27 之前这段一声不吭，PVF 长期没进备份也没人发现。
-	if pvfPath, err := s.resolvePvfPath(); err != nil {
-		if s.logger != nil {
-			s.logger.Error(fmt.Sprintf("[备份] 跳过 PVF：%v", err))
-		}
-	} else if utils.FileExists(pvfPath) {
-		dst := filepath.Join(dir, fmt.Sprintf("Script-%s.pvf", stamp))
-		if err := utils.CopyFile(pvfPath, dst); err != nil {
-			errs = append(errs, fmt.Sprintf("pvf: %v", err))
-		} else {
-			done = append(done, dst)
-		}
-	} else if s.logger != nil {
-		s.logger.Error(fmt.Sprintf("[备份] 跳过 PVF：解析到的路径上还没有文件（%s）", pvfPath))
-	}
-
-	if len(done) == 0 && len(errs) == 0 {
-		return &BackupResult{Ok: false, Error: "没有找到可备份的目标文件（请检查 GamePath / Path / PvfPath 配置）"}
-	}
-	if len(errs) > 0 {
-		if s.logger != nil {
-			s.logger.Error(fmt.Sprintf("[备份] 部分失败: %v，成功 %d 项", errs, len(done)))
-		}
-		return &BackupResult{Ok: false, Error: strings.Join(errs, "; ")}
-	}
-
-	// 4. 审计日志清理 + 库文件收缩（只在库存库备份成功之后做）
-	result := &BackupResult{Ok: true}
-	if !s.config.Server.PurgeAuditLogEnabled() {
-		result.AuditPurgeSkipped = "未启用（Server.BackupPurgeAuditLog=false）"
-	} else if !gameBackedUp {
-		result.AuditPurgeSkipped = "游戏库未备份（GamePath 未配置或文件不存在），为避免丢数据跳过清理"
-	} else {
-		rows, before, after, err := purgeGameAuditLog(gamePath, s.logger)
-		result.AuditPurgedRows = rows
-		result.GameDbBytesBefore = before
-		result.GameDbBytesAfter = after
-		if err != nil {
-			// 清理失败**不回滚备份**：备份本身是成功的，这里只作为告警回报。
-			result.AuditPurgeError = err.Error()
-			if s.logger != nil {
-				s.logger.Warn(fmt.Sprintf("[备份] 审计日志清理告警: %v", err))
-			}
-		} else if rows > 0 && s.logger != nil {
-			s.logger.Info(fmt.Sprintf("[备份] 已清理审计日志 %d 条，游戏库 %.1fMB -> %.1fMB",
-				rows, float64(before)/1048576.0, float64(after)/1048576.0))
-		}
-	}
-
-	if s.logger != nil {
-		s.logger.Info(fmt.Sprintf("[备份] 完成，共 %d 项 -> %s", len(done), dir))
-	}
-	return result
+	// ★ 差异只有一处且是刻意的：产物从「三份散装文件」变成「db-/pvf- 两个 .tar.gz」。
+	//   恢复时要先解压（tar -xzf），界面上已写明。
+	return s.BackupWith(BackupOptions{})
 }
 
 // auditPurgeBatchRows 是单批删除的行数。
@@ -3935,6 +3850,13 @@ type BackupResult struct {
 	AuditPurgeSkipped string `json:"AuditPurgeSkipped"` // 为什么没清理（未启用/游戏库未备份）
 	GameDbBytesBefore int64  `json:"GameDbBytesBefore"` // 清理前库存库文件大小
 	GameDbBytesAfter  int64  `json:"GameDbBytesAfter"`  // 清理（VACUUM）后库存库文件大小
+
+	// 以下三项是 2026-10-16「可勾选目标 + 分类 tar.gz」改造新增。
+	// 保留旧字段不动：前端向导第 8 步只认 AuditPurge* / GameDbBytes*，
+	// 加字段不影响它，删字段会立刻把它打回「备份失败」。
+	Archives    []BackupArchive `json:"Archives"`     // 本次产出的压缩包（db/pvf/logs 各一个）
+	Selected    []string        `json:"Selected"`     // 实际备份进去的目标 key
+	RetainError []string        `json:"RetainError"`  // 保留策略清理失败的原因（不影响备份成功）
 }
 
 // GatewayManager 网关自身管理服务。

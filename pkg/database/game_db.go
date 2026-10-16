@@ -35,9 +35,12 @@ type BackupFile struct {
 // 返回结构化对象而不是裸路径：管理后台要显示「大小 / 时间」两列。
 // 历史实现返回 []string，前端拿不到 stat 信息，只能显示 "-"。
 //
-// 覆盖 .db / .sqlite / .bak / .pvf 四类：
-// 备份动作会把游戏库、网关库存成 .db，把服务端 PVF 存成 Script-<时间戳>.pvf，
-// 少一类就会出现「刚备份成功但列表里没有」的假象。
+// 覆盖 .db / .sqlite / .bak / .pvf / .gz / .tgz 六类：
+//   - 改造前：游戏库、网关库存成 .db，服务端 PVF 存成 Script-<时间戳>.pvf；
+//   - 2026-10-16 起：产物改为分类压缩包 db-/pvf-/logs-<北京时间>.tar.gz。
+//
+// ★ .gz 这一类是**必须**加的：漏了它就正好重演注释里写的那个历史缺陷 ——
+//   备份明明成功、界面却显示"暂无备份"。每加一种产出格式都要回来看这里。
 // 按修改时间**倒序**（最新备份在前），同秒时用文件名兜底保证顺序稳定。
 func ListBackups(backupDir string) ([]BackupFile, error) {
 	entries, err := os.ReadDir(backupDir)
@@ -51,11 +54,14 @@ func ListBackups(backupDir string) ([]BackupFile, error) {
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(e.Name())) {
-		case ".db", ".sqlite", ".bak", ".pvf":
+		case ".db", ".sqlite", ".bak", ".pvf", ".gz", ".tgz":
 		default:
 			continue
 		}
-		// 跳过写了一半的临时文件（备份过程用 .tmp 后缀落盘再改名）
+		// 跳过写了一半的临时文件。
+		// ★ 这一步比扩展名判断更靠后是刻意的：压缩包落盘用的是
+		//   <名字>.tar.gz.tmp，先判扩展名的话它压根进不到这里；
+		//   反过来若只看后缀，一个正好叫 xxx.gz 的半截文件会被当成成品列出来。
 		if strings.HasSuffix(strings.ToLower(e.Name()), ".tmp") {
 			continue
 		}

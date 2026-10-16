@@ -951,13 +951,31 @@
                 <h3>备份</h3>
                 <div class="row">
                     <button class="btn btn-success" onclick="doBackup()">立即备份</button>
+                    <button class="btn" onclick="loadBackupTargets()">刷新可备份项</button>
                     <button class="btn" onclick="loadBackups()">刷新列表</button>
+                    <button class="btn btn-sm" onclick="selectBackupPreset('db')">只选库+PVF</button>
+                    <button class="btn btn-sm" onclick="selectBackupPreset('all')">全选存在的</button>
+                    <button class="btn btn-sm" onclick="selectBackupPreset('none')">全不选</button>
                     <span id="backupDir" class="muted"></span>
                 </div>
-                <div class="muted">备份游戏库 / 网关库 / 服务端 PVF；<b>游戏库备份成功后</b>会清空背包审计日志
-                    （inventory_audit_log）并 VACUUM 收缩库文件——被清掉的日志只保留在本次备份里。
-                    清理期间数据库有短暂写锁，建议低峰或停服后执行。</div>
+                <div class="muted">
+                    勾选要备份的目标，产出 <b>tar.gz 压缩包</b>（按类别分包：
+                    <code>db-YYYYMMDD-HHMMSS.tar.gz</code> / <code>pvf-…</code> / <code>logs-…</code>，
+                    时间是北京时间）。恢复时先 <code>tar -xzf</code> 解压。<br>
+                    游戏库进包后才会清空背包审计日志（inventory_audit_log）并 VACUUM 收缩库文件
+                    ——被清掉的日志只保留在本次备份里，清理期间数据库有短暂写锁，建议低峰或停服后执行。<br>
+                    <b>日志</b>（网关 / 后台 / 服务端）默认不勾，需要时手动勾上——它们体积大，
+                    勾了会让这一步多花些时间。<br>
+                    旧备份自动清理由 <code>appsettings.json</code> 的 <code>Server.BackupRetainCount</code>
+                    控制（每个类别各保留最近 N 份；<b>0 或留空 = 不清理</b>，改造前留下的散装
+                    <code>inventory-*.db</code> 等文件不会被自动删）。
+                </div>
                 <div id="backupResult"></div>
+                <table>
+                    <thead><tr><th style="width: 34px;"></th><th>备份目标</th><th>路径</th><th>大小</th><th>最后修改</th></tr></thead>
+                    <tbody id="backupTargetTable"></tbody>
+                </table>
+                <h3>已有备份</h3>
                 <table>
                     <thead><tr><th>文件名</th><th>大小</th><th>时间</th></tr></thead>
                     <tbody id="backupTable"></tbody>
@@ -2435,7 +2453,7 @@
             accounts: () => loadAccounts(1),
             bans: () => loadBans(),
             integrity: () => loadIntegrity(),
-            server: () => { loadServerStatus(); loadBackups(); loadServerPvfInfo(); loadRegisterBonus(); loadBonusConfig(); loadGameEvents(); },
+            server: () => { loadServerStatus(); loadBackupTargets(); loadBackups(); loadServerPvfInfo(); loadRegisterBonus(); loadBonusConfig(); loadGameEvents(); },
             gateway: () => loadGatewayStatus(),
             ports: () => loadGamePorts(),
             anticheat: () => { loadAcPlayers(); loadAcDetections(); },
@@ -3564,19 +3582,89 @@
             box.scrollTop = box.scrollHeight;
         }
 
+        // ==================== 可备份目标 ====================
+        //
+        // 后端 /api/admin/backup/targets 返回全部目标（含"文件不存在"的），
+        // 这里照单全收但不存在的行禁用勾选 —— 让运维一眼看出"这一项目前没有文件"，
+        // 而不是发现勾选项莫名变少了。
+        let backupTargets = [];
+
+        async function loadBackupTargets() {
+            const data = await api('/api/admin/backup/targets');
+            if (!data) return;
+            backupTargets = data.items || [];
+            renderBackupTargets();
+        }
+
+        function renderBackupTargets() {
+            const tbody = document.getElementById('backupTargetTable');
+            tbody.innerHTML = '';
+            if (!backupTargets.length) {
+                tbody.innerHTML = '<tr><td colspan="5" class="muted">没有可备份的目标（请检查配置）</td></tr>';
+                return;
+            }
+            backupTargets.forEach(t => {
+                // ★ 动态行禁止内联 onclick（与账号表同一规矩），统一走 data-act + bindRowActions。
+                const dis = t.exists ? '' : 'disabled';
+                const dim = t.exists ? '' : 'muted';
+                tbody.innerHTML += `<tr class="${dim}">
+                    <td><input type="checkbox" class="backup-target-cb" data-key="${escAttr(t.key)}" ${dis}></td>
+                    <td>${esc(t.label)}<span class="muted">（${esc(t.kind)}）</span></td>
+                    <td class="muted" title="${escAttr(t.path || '')}">${esc(t.path || '（未解析到路径）')}</td>
+                    <td>${t.exists ? esc(fmtSize(t.size)) : '-'}</td>
+                    <td>${t.exists ? esc(fmtTime(t.modified_at)) : '-'}</td>
+                </tr>`;
+            });
+            selectBackupPreset('db');
+        }
+
+        // 预设：db = 库 + PVF（改造前的默认行为）；all = 所有存在的；none = 清空。
+        //
+        // ★ 默认落在 'db' 而不是 'all'：日志动辄几百 MB，默认勾上会让
+        //   「更新流程向导 → 备份数据库」那一步从几秒变成几十秒。
+        function selectBackupPreset(preset) {
+            const cbs = document.querySelectorAll('.backup-target-cb');
+            const dbKeys = ['game_db', 'gateway_db', 'pvf'];
+            cbs.forEach(cb => {
+                if (cb.disabled) { cb.checked = false; return; }
+                if (preset === 'all') cb.checked = true;
+                else if (preset === 'none') cb.checked = false;
+                else cb.checked = dbKeys.indexOf(cb.getAttribute('data-key')) >= 0;
+            });
+        }
+
+        function selectedBackupTargets() {
+            const out = [];
+            document.querySelectorAll('.backup-target-cb').forEach(cb => {
+                if (cb.checked && !cb.disabled) out.push(cb.getAttribute('data-key'));
+            });
+            return out;
+        }
+
         async function doBackup() {
-            showResult('backupResult', 'success', '正在备份，请稍候…（库较大时会在备份后收缩，可能需要几十秒）');
-            const data = await api('/api/admin/server/backup', 'POST', {});
+            const targets = selectedBackupTargets();
+            if (!targets.length) {
+                showResult('backupResult', 'error', '请至少勾选一个备份目标');
+                return;
+            }
+            showResult('backupResult', 'success',
+                `正在备份 ${targets.length} 项，请稍候…（库较大时压缩与收缩可能需要几分钟）`);
+            const data = await api('/api/admin/server/backup', 'POST', { targets });
             if (!data) return;
             if (!data.ok) {
                 showResult('backupResult', 'error', data.error || '备份失败');
                 loadBackups();
                 return;
             }
-            // 备份成功后再补一句审计日志清理的结果：这一步失败不影响备份本身，
+            // 备份成功后再补上审计日志清理的结果：这一步失败不影响备份本身，
             // 但必须让操作者看到（否则"库没变小"会变成一个查不出原因的疑问）。
             const r = data.result || {};
             let msg = '备份完成';
+            const arch = r.Archives || [];
+            if (arch.length) {
+                msg += '：' + arch.map(a => `${a.name}（${fmtSize(a.raw_bytes)} → ${fmtSize(a.size)}`
+                    + (a.pruned_old > 0 ? `，清理旧包 ${a.pruned_old} 个` : '') + '）').join('、');
+            }
             if (r.AuditPurgeError) {
                 msg += `；审计日志清理告警：${r.AuditPurgeError}`;
                 showResult('backupResult', 'error', msg);

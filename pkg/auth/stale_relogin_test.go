@@ -36,6 +36,16 @@ const testLauncherVer = "9.9.9"
 
 func newLoginFixture(t *testing.T, staleSeconds int) (*Handler, *session.SessionManager) {
 	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.Heartbeat.StaleForceSeconds = staleSeconds
+	cfg.RateLimit.Enabled = false
+	return newLoginFixtureWithConfig(t, cfg)
+}
+
+// newLoginFixtureWithConfig 与 newLoginFixture 相同，但允许调用方自带配置
+// （双服测试要配 GameServers，见 dual_game_login_test.go）。
+func newLoginFixtureWithConfig(t *testing.T, cfg *config.GatewayConfig) (*Handler, *session.SessionManager) {
+	t.Helper()
 
 	dir, err := os.MkdirTemp("", "s4a21-login-test-")
 	if err != nil {
@@ -80,8 +90,6 @@ func newLoginFixture(t *testing.T, staleSeconds int) (*Handler, *session.Session
 		t.Fatalf("建网关库表失败: %v", err)
 	}
 
-	cfg := config.DefaultConfig()
-	cfg.Heartbeat.StaleForceSeconds = staleSeconds
 	cfg.RateLimit.Enabled = false
 
 	sm := session.NewSessionManager(nil, nil)

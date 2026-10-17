@@ -124,6 +124,8 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	account := deref(req.Account, "")
 	passwordMd5 := deref(req.PasswordMd5, "")
 	deviceSecret := deref(req.DeviceSecret, "")
+	// gameId：选服字段（2026-10-17 双服）。老登录器不带 ⇒ 空串 ⇒ 默认服。
+	gameId := strings.TrimSpace(deref(req.Game, ""))
 
 	if clientIP == "" {
 		clientIP = "unknown"
@@ -149,9 +151,18 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 		return failureResponse(req.Cmd, models.Err.Banned, errorMessages[models.Err.Banned])
 	}
 
-	result := h.accountSvc.Login(account, passwordMd5, deviceSecret, clientIP)
+	// 选服校验前移到封禁检查之后、密码校验之前没有意义 —— game 字段的
+	// 拒绝码与密码无关，放在 accountSvc.Login 内部统一判定（见 service.Login）。
+	// 这里只负责把字段透传到底，错误码由 Login 返回。
+	result := h.accountSvc.Login(account, passwordMd5, deviceSecret, clientIP, gameId)
 	if result.ErrorCode != models.Err.Ok {
-		h.logger.Warn(fmt.Sprintf("登录失败: 账号=%s 错误码=%d IP=%s", account, result.ErrorCode, clientIP))
+		// 选服类失败不记"登录失败"警告（那会把排障引向密码方向），
+		// 单独一条 Info 级别日志，带上 game 字段原值。
+		if result.ErrorCode == models.Err.GameNotFound || result.ErrorCode == models.Err.GameDisabled {
+			h.logger.Info(fmt.Sprintf("拒绝登录: 账号=%s game=%q 错误码=%d", account, gameId, result.ErrorCode))
+		} else {
+			h.logger.Warn(fmt.Sprintf("登录失败: 账号=%s 错误码=%d IP=%s", account, result.ErrorCode, clientIP))
+		}
 		msg := errorMessages[result.ErrorCode]
 		if result.Message != nil {
 			msg = *result.Message
@@ -191,7 +202,8 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	// ReplaceAccountSessions 内部第一步就是 GenerateToken()，失败时返回 ("", err) ⇒
 	// 登录响应 200 但 token 为空，玩家心跳与游戏连接全部鉴权失败，而服务端日志
 	// 却显示"登录成功"，极难定位。这里显式判错并回报服务端错误。
-	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, alreadyOnline)
+	// gameId 一并写进会话：在线统计/后台展示按服分流（2026-10-17 双服）。
+	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, gameId, alreadyOnline)
 	if err != nil {
 		h.logger.Error(fmt.Sprintf("创建会话失败: 账号=%s IP=%s: %v", account, clientIP, err))
 		return failureResponse(req.Cmd, models.Err.DatabaseError, "服务器内部错误，请稍后重试")
@@ -631,4 +643,7 @@ var errorMessages = map[int]string{
 	// 这里是兜底：万一走了不带的路径，玩家至少能看懂发生了什么。
 	models.Err.RegisterIpLimit:      "同一网络今日注册账号已达上限，请明天再试或联系管理员",
 	models.Err.RegisterMachineLimit: "该设备注册账号数已达上限，请联系管理员",
+	// ── 双服选服（2026-10-17）────────────────────────────────────────
+	models.Err.GameNotFound: "所选游戏不存在，请更新登录器或联系管理员",
+	models.Err.GameDisabled: "该游戏暂未开放，请稍后再试或选择其它游戏",
 }

@@ -219,7 +219,7 @@ func TestReloadPorts_ExistingConnectionSurvivesClose(t *testing.T) {
 
 	sm := session.NewSessionManager(func() {}, func() {})
 	// 建一个本机会话，让 127.0.0.1 进入 Game 代理白名单
-	if _, err := sm.CreateSession("tester", "test-mid", "127.0.0.1", "dev-secret"); err != nil {
+	if _, err := sm.CreateSession("tester", "test-mid", "127.0.0.1", "dev-secret", ""); err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
 

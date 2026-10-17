@@ -106,6 +106,12 @@ type ErrorCode struct {
 	// ── 注册限额（1036~1037，2026-10-13）─────────────────────────────
 	RegisterIpLimit      int
 	RegisterMachineLimit int
+	// ── 双服选服（1038~1039，2026-10-17）─────────────────────────────
+	//
+	// CMD_LOGIN 带 game 字段选服（S4A21 / S5A95 两个 Profile）。
+	// 老登录器不带 game 字段 ⇒ 空串 ⇒ 默认服，行为不变。
+	GameNotFound int
+	GameDisabled int
 }
 
 var Err = ErrorCode{
@@ -149,6 +155,8 @@ var Err = ErrorCode{
 	// 是被"同一 IP 当日刷太多"还是"同一台机器号太多"挡下的。
 	RegisterIpLimit:      1036,
 	RegisterMachineLimit: 1037,
+	GameNotFound:         1038,
+	GameDisabled:         1039,
 	RateLimited:          3002,
 	UnknownCommand:           3003,
 	DecodeFailed:             3005,
@@ -180,6 +188,12 @@ type GatewayRequest struct {
 	// ForceLogin 强制登录：账号已在线时踢掉旧会话并登录。
 	// 未携带（false）时若账号已在线，登录返回 AccountOnline(1023)。
 	ForceLogin  *bool             `json:"force_login,omitempty"`
+	// Game 是 CMD_LOGIN 的选服字段（2026-10-17 双服）。
+	//
+	// 取值 = 网关配置里 GameServers[].Id（如 "s4a21" / "s5a95"）。
+	// 老登录器不带此字段 ⇒ nil ⇒ 默认服（配置里第一个启用的服），
+	// 行为与改造前完全一致；登录器选服时带上它。
+	Game       *string           `json:"game,omitempty"`
 	CharacterId *int64            `json:"character_id,omitempty"`
 	Items       []MailItemRequest `json:"items,omitempty"`
 
@@ -245,6 +259,28 @@ type FingerprintEntry struct {
 	Display   string `json:"display"`
 }
 
+// DriverEntry 是「内核驱动白名单」的一条（2026-10-16 加）。
+//
+// 与 FingerprintEntry 分开定义、**不要复用**，原因有二：
+//  1. FingerprintEntry 参与 white/black 名单的 `%v` 规范摘要（listDigest），
+//     登录器侧有逐字节同构的 C# 实现；给它加字段会同时改掉 white/black 的摘要，
+//     导致全体登录器判定"缓存被改"而全量重拉。新结构把影响面隔离在驱动名单内。
+//  2. 驱动条目还需要 Signer/Reason 两个**展示与审计**字段，
+//     混进指纹条目里语义也不对。
+//
+// ★ 只有 FileName + Hash 参与 driver_digest（见 httprouter.driverDigest）：
+//   Signer/Reason 只给人看，改了不影响登录器判定。
+type DriverEntry struct {
+	FileName  string `json:"file"`
+	Hash      string `json:"hash"`   // SHA-256 大写（与 ComputeFileFingerprint 一致）
+	Algorithm string `json:"algo"`   // 固定 "SHA-256"
+	Size      int64  `json:"size"`
+	Display   string `json:"display"`  // 形如 "AMDRyzenMasterDriver.sys [7250DDCB…]"
+	Signer    string `json:"signer"`   // 内嵌签名者展示名（网关侧校验后写入）
+	Reason    string `json:"reason"`   // 放行理由（必填，审计用）
+	AddedUtc  string `json:"added_utc"` // 首次加入时间（RFC3339）
+}
+
 // IntegritySnapshot 是完整性策略的不可变快照。
 type IntegritySnapshot struct {
 	Revision       int                `json:"revision"`
@@ -252,6 +288,12 @@ type IntegritySnapshot struct {
 	WhiteList      []FingerprintEntry `json:"white_list"`
 	BlackList      []FingerprintEntry `json:"black_list"`
 	AllowedModules []string           `json:"allowed_modules"`
+	// DriverAllow 内核驱动白名单（登录器内核威胁扫描的放行名单）。
+	//
+	// 与 WhiteList 的区别：WhiteList 管的是**游戏客户端目录里的文件**（缺失/被改即拦），
+	// DriverAllow 管的是**内核驱动**（命中 BYOVD 判据时凭"文件名+SHA-256"放行）。
+	// 二者判定位置与语义都不同，只是共用一份策略快照（revision/热加载/下发链路）。
+	DriverAllow []DriverEntry `json:"driver_allow"`
 }
 
 // PvfInfo 表示 PVF 文件的权威指纹信息。
@@ -483,6 +525,13 @@ type Session struct {
 	MId           string
 	ClientIP      string
 	DeviceSecret  string
+	// GameId 是本次登录选服的 Id（GameServers[].Id，2026-10-17 双服）。
+	//
+	// 老会话/老登录器登录的会话此字段为空串（默认服）。
+	// 在线统计、泡点结算、后台踢人都以它分服展示。
+	// 单账号单令牌天然覆盖"切服"：换服登录会踢掉旧会话建新会话，
+	// GameId 随之换成新选服的 Id。
+	GameId        string
 	CreatedAt     int64
 	LastHeartbeat int64
 	BonusGranted  int64

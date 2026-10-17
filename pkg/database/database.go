@@ -2,7 +2,9 @@ package database
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,6 +99,16 @@ func (db *Database) EnsureInitialized() error {
 		device_secret_issued_at TEXT DEFAULT '',
 		device_history TEXT DEFAULT '',
 		device_secret_last_rotated INTEGER DEFAULT 0,
+		-- s5a9_digest：S5A9（DNF95）服的一次性登录凭证（2026-10-17 双服）。
+		--
+		-- DNF95 客户端把启动参数第 5 段当 digest 发给游戏服务端，
+		-- 服务端拿它与账号绑定的 PBKDF2 凭据比对、陌生账号自动建号
+		-- （AuthenticationService.VerifyOrCreateLogin）。**同一账号的 digest
+		-- 必须每次一致** —— 服务端存的就是它的派生哈希，换了就对不上。
+		-- 因此这里由网关签发一次、永久复用，与玩家改不改网关密码无关
+		-- （透传密码 MD5 会让改密账号被 S5A9 后端永久拒登）。
+		-- S4A21 服的账号此列恒为空，不参与其登录链。
+		s5a9_digest TEXT DEFAULT '',
 		last_login_at INTEGER DEFAULT 0,
 		last_login_ip TEXT DEFAULT '',
 		failed_login_count INTEGER DEFAULT 0,
@@ -356,6 +368,12 @@ func (db *Database) migrateSchema() error {
 		if _, err := db.gatewayDB.Exec("ALTER TABLE accounts ADD COLUMN device_history TEXT DEFAULT ''"); err != nil {
 			return err
 		}
+	}
+	// s5a9_digest（2026-10-17 双服）：S5A9 服登录凭证列。老库没有这一列，
+	// 而新版登录 S5A95 账号时必然要读写它 —— 缺列会让整条登录链 SQL 报错，
+	// 所以在这里补上；insert 语句已同步带这一列（空串）。
+	if err := db.ensureColumn("accounts", "s5a9_digest", "TEXT DEFAULT ''"); err != nil {
+		return err
 	}
 
 	// register_bonus_logs 旧表(m_id 为主键列)升级：补齐新字段
@@ -675,14 +693,14 @@ type BanEntry struct {
 // GetAccountByName 通过名称查询账号。
 func (db *Database) GetAccountByName(name string) (*Account, error) {
 	row := db.gatewayDB.QueryRow(
-		"SELECT m_id, name, pwd_hash, salt, cera, token_cera, happy_token_cera, device_secret, device_secret_issued_at, device_history, device_secret_last_rotated, last_login_at, last_login_ip, failed_login_count, lockout_until, created_at, last_heartbeat FROM accounts WHERE name = ?",
+		"SELECT m_id, name, pwd_hash, salt, cera, token_cera, happy_token_cera, device_secret, device_secret_issued_at, device_history, device_secret_last_rotated, last_login_at, last_login_ip, failed_login_count, lockout_until, created_at, last_heartbeat, s5a9_digest FROM accounts WHERE name = ?",
 		name)
 
 	var a Account
 	if err := row.Scan(
 		&a.MId, &a.Name, &a.PwdHash, &a.Salt, &a.Cera, &a.TokenCera, &a.HappyTokenCera,
 		&a.DeviceSecret, &a.DeviceSecretIssuedAt, &a.DeviceHistory, &a.DeviceSecretLastRotated,
-		&a.LastLoginAt, &a.LastLoginIP, &a.FailedLoginCount, &a.LockoutUntil, &a.CreatedAt, &a.LastHeartbeat); err != nil {
+		&a.LastLoginAt, &a.LastLoginIP, &a.FailedLoginCount, &a.LockoutUntil, &a.CreatedAt, &a.LastHeartbeat, &a.S5A9Digest); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -694,14 +712,14 @@ func (db *Database) GetAccountByName(name string) (*Account, error) {
 // GetAccountByMId 通过 MId 查询账号。
 func (db *Database) GetAccountByMId(mId string) (*Account, error) {
 	row := db.gatewayDB.QueryRow(
-		"SELECT m_id, name, pwd_hash, salt, cera, token_cera, happy_token_cera, device_secret, device_secret_issued_at, device_history, device_secret_last_rotated, last_login_at, last_login_ip, failed_login_count, lockout_until, created_at, last_heartbeat FROM accounts WHERE m_id = ?",
+		"SELECT m_id, name, pwd_hash, salt, cera, token_cera, happy_token_cera, device_secret, device_secret_issued_at, device_history, device_secret_last_rotated, last_login_at, last_login_ip, failed_login_count, lockout_until, created_at, last_heartbeat, s5a9_digest FROM accounts WHERE m_id = ?",
 		mId)
 
 	var a Account
 	if err := row.Scan(
 		&a.MId, &a.Name, &a.PwdHash, &a.Salt, &a.Cera, &a.TokenCera, &a.HappyTokenCera,
 		&a.DeviceSecret, &a.DeviceSecretIssuedAt, &a.DeviceHistory, &a.DeviceSecretLastRotated,
-		&a.LastLoginAt, &a.LastLoginIP, &a.FailedLoginCount, &a.LockoutUntil, &a.CreatedAt, &a.LastHeartbeat); err != nil {
+		&a.LastLoginAt, &a.LastLoginIP, &a.FailedLoginCount, &a.LockoutUntil, &a.CreatedAt, &a.LastHeartbeat, &a.S5A9Digest); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -713,11 +731,11 @@ func (db *Database) GetAccountByMId(mId string) (*Account, error) {
 // InsertAccount 插入新账号。
 func (db *Database) InsertAccount(a *Account) error {
 	_, err := db.gatewayDB.Exec(
-		`INSERT INTO accounts (m_id, name, pwd_hash, salt, cera, token_cera, happy_token_cera, device_secret, device_secret_last_rotated, last_login_at, last_login_ip, failed_login_count, lockout_until, created_at, last_heartbeat)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO accounts (m_id, name, pwd_hash, salt, cera, token_cera, happy_token_cera, device_secret, device_secret_last_rotated, last_login_at, last_login_ip, failed_login_count, lockout_until, created_at, last_heartbeat, s5a9_digest)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.MId, a.Name, a.PwdHash, a.Salt, a.Cera, a.TokenCera, a.HappyTokenCera,
 		a.DeviceSecret, a.DeviceSecretLastRotated, a.LastLoginAt, a.LastLoginIP,
-		a.FailedLoginCount, a.LockoutUntil, a.CreatedAt, a.LastHeartbeat)
+		a.FailedLoginCount, a.LockoutUntil, a.CreatedAt, a.LastHeartbeat, a.S5A9Digest)
 	return err
 }
 
@@ -751,6 +769,62 @@ func (db *Database) UpdateAccountDeviceSecret(name, secret string, rotatedAt int
 		"UPDATE accounts SET device_secret = ?, device_secret_last_rotated = ? WHERE name = ?",
 		secret, rotatedAt, name)
 	return err
+}
+
+// EnsureS5A9Digest 读取或签发 S5A9（DNF95）服的登录 digest（2026-10-17 双服）。
+//
+// 为什么必须"签发一次、永久复用"：DNF95 服务端把 digest 当密码做 PBKDF2
+// 存储（AuthenticationService.VerifyOrCreateLogin，陌生账号还会自动建号），
+// **同一账号的 digest 每次必须一致**，否则服务端比对直接拒登。若透传玩家
+// 密码 MD5，玩家每改一次网关密码就会被 S5A9 后端永久锁在门外。
+// 因此 digest 与密码无关：首次登录该服时随机生成、落库，之后原样取用。
+//
+// 并发安全：两个登录同时发现空 digest 时，条件 UPDATE
+// （仅当为空才写）保证只有一个写入生效，其余调用方重新读回库里的现值 ——
+// 绝不会出现"两个不同 digest 都发出去"的分裂状态。
+//
+// 账号不存在返回 ("", nil)，由调用方决定如何处理（正常登录流程不会走到）。
+// 随机源失败返回 error：此时必须让登录失败，绝不能拿空 digest 拼启动参数
+// （客户端拿空 digest 必被 DNF95 服务端拒登，且现场极难排查）。
+func (db *Database) EnsureS5A9Digest(name string) (string, error) {
+	var current string
+	err := db.gatewayDB.QueryRow(
+		"SELECT s5a9_digest FROM accounts WHERE name = ?", name).Scan(&current)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	if current != "" {
+		return current, nil
+	}
+
+	buf := make([]byte, 16) // 16 字节 = 32 位 hex，与 DNF95 的 digest 长度一致
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("生成 S5A9 digest 失败: %w", err)
+	}
+	digest := hex.EncodeToString(buf)
+
+	// 条件 UPDATE：只在仍为空时落库。并发下只有一个 goroutine 写成功，
+	// 之后统一重新读取，保证所有调用方拿到同一个值。
+	res, err := db.gatewayDB.Exec(
+		"UPDATE accounts SET s5a9_digest = ?, updated_at = ? WHERE name = ? AND (s5a9_digest = '' OR s5a9_digest IS NULL)",
+		digest, NowUnix(), name)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return digest, nil
+	}
+
+	// 写失败（别人抢先签了）：读回胜者的值。
+	var winner string
+	if err := db.gatewayDB.QueryRow(
+		"SELECT s5a9_digest FROM accounts WHERE name = ?", name).Scan(&winner); err != nil {
+		return "", err
+	}
+	return winner, nil
 }
 
 // UpdateDeviceSecret 更新设备密钥和历史记录（使用 m_id）。
@@ -1456,7 +1530,11 @@ type Account struct {
 	DeviceSecretIssuedAt    string
 	DeviceHistory           string
 	DeviceSecretLastRotated int64
-	LastLoginAt             int64
+	// S5A9Digest 是 S5A9（DNF95）服的一次性登录凭证（32 位 hex）。
+	// 由网关按账号签发一次、之后每次登录复用（见 EnsureS5A9Digest）。
+	// S4A21 服的账号此列为空。
+	S5A9Digest  string
+	LastLoginAt int64
 	LastLoginIP             string
 	FailedLoginCount        int
 	LockoutUntil            int64

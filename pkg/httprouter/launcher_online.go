@@ -72,12 +72,17 @@ type launcherOnlinePlayer struct {
 //	② 「在玩哪个角色」—— 游戏库 characters.updated_at 最新的那个。
 //	   服务端不把在线状态落库，但每次角色数据变更都会刷新 updated_at，
 //	   所以同一账号名下最新的那条就是在玩的角色（见 database.OnlineRoleCandidate）。
+//
+// game 查询参数（2026-10-17 双服）：为空 = 全部服的汇总视图；
+// 带值 = 只看该服（GameServers[].Id）的在线玩家，payload 带 "game" 回显。
+// 两种视图的缓存分槽存放（见 Server.onlineCacheBody 注释），互不污染。
 func (s *Server) handleLauncherOnline(w http.ResponseWriter, r *http.Request) {
-	// 非强制刷新时先看缓存
+	game := strings.TrimSpace(r.URL.Query().Get("game"))
+
+	// 非强制刷新时先看缓存（按 game 分槽）
 	if r.URL.Query().Get("force") != "1" {
 		s.onlineCacheMu.Lock()
-		if len(s.onlineCacheBody) > 0 && time.Since(s.onlineCacheAt) < launcherOnlineCacheTTL {
-			body := s.onlineCacheBody
+		if body, ok := s.onlineCacheBody[game]; ok && len(body) > 0 && time.Since(s.onlineCacheAt[game]) < launcherOnlineCacheTTL {
 			s.onlineCacheMu.Unlock()
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
@@ -87,7 +92,7 @@ func (s *Server) handleLauncherOnline(w http.ResponseWriter, r *http.Request) {
 		s.onlineCacheMu.Unlock()
 	}
 
-	payload, err := s.buildLauncherOnline()
+	payload, err := s.buildLauncherOnline(game)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"ok": false, "error": err.Error(),
@@ -103,8 +108,14 @@ func (s *Server) handleLauncherOnline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.onlineCacheMu.Lock()
-	s.onlineCacheAt = time.Now()
-	s.onlineCacheBody = body
+	if s.onlineCacheAt == nil {
+		s.onlineCacheAt = make(map[string]time.Time)
+	}
+	if s.onlineCacheBody == nil {
+		s.onlineCacheBody = make(map[string][]byte)
+	}
+	s.onlineCacheAt[game] = time.Now()
+	s.onlineCacheBody[game] = body
 	s.onlineCacheMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -112,14 +123,32 @@ func (s *Server) handleLauncherOnline(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-func (s *Server) buildLauncherOnline() (map[string]interface{}, error) {
+// buildLauncherOnline 组装在线视图（2026-10-17 双服）。
+//
+// game 为空 = 汇总视图：players 含全部在线账号，另附 "games" 按服计数
+// （空 GameId 的老会话归入默认服键，由登录器识别）；
+// game 非空 = 单服视图：只统计该服在线账号，payload 回显 "game"。
+func (s *Server) buildLauncherOnline(game string) (map[string]interface{}, error) {
 	online, err := s.sessions.List()
 	if err != nil {
 		return nil, err
 	}
 
-	names := make([]string, 0, len(online))
-	for _, p := range online {
+	// 单服视图：先按 GameId 过滤。空 GameId 的会话（老登录器/默认服登录）
+	// 只在 game 也为空（或 game 为默认服 Id）时出现 —— 精确匹配空串会让
+	// 默认服玩家在选服界面里消失，那不是想要的行为。
+	filtered := online
+	if game != "" {
+		filtered = make([]OnlinePlayer, 0, len(online))
+		for _, p := range online {
+			if p.GameId == game {
+				filtered = append(filtered, p)
+			}
+		}
+	}
+
+	names := make([]string, 0, len(filtered))
+	for _, p := range filtered {
 		names = append(names, p.Account)
 	}
 
@@ -142,9 +171,13 @@ func (s *Server) buildLauncherOnline() (map[string]interface{}, error) {
 		}
 	}
 
-	players := make([]launcherOnlinePlayer, 0, len(online))
+	players := make([]launcherOnlinePlayer, 0, len(filtered))
 	roleTotal := 0
-	for _, p := range online {
+	// games 按服计数（汇总视图用）：GameId → 在线账号数。
+	// 用 map 而不是预定义服列表：网关配置里服的集合是运行时可变的，
+	// 硬编码列表会让新加的服在在线视图里"隐身"。
+	games := map[string]int{}
+	for _, p := range filtered {
 		item := launcherOnlinePlayer{
 			OnlineMinutes: p.OnlineMinutes,
 			LastHeartbeat: p.LastHeartbeat,
@@ -163,12 +196,13 @@ func (s *Server) buildLauncherOnline() (map[string]interface{}, error) {
 			}
 		}
 		players = append(players, item)
+		games[p.GameId]++
 	}
 
 	// 维持「在线时长倒序」：玩得久的排前面，观感上比按账号排稳定
 	sortOnlinePlayers(players)
 
-	return map[string]interface{}{
+	payload := map[string]interface{}{
 		"ok":          true,
 		"count":       len(players), // 在线账号数（= 在线角色数，一个账号同时只跑一个角色）
 		"role_count":  roleTotal,    // 关联到角色的数量；剩下的停在选人界面
@@ -176,7 +210,13 @@ func (s *Server) buildLauncherOnline() (map[string]interface{}, error) {
 		// precision 如实说明口径：在线是账号级，角色是按最近活动推定的
 		"precision": "account-session+character.updated_at",
 		"players":   players,
-	}, nil
+	}
+	if game != "" {
+		payload["game"] = game
+	} else {
+		payload["games"] = games
+	}
+	return payload, nil
 }
 
 // sortOnlinePlayers 按在线时长倒序（插入排序：在线人数很少，没必要引入 sort 依赖）。

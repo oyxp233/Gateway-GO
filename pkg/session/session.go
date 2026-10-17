@@ -38,7 +38,9 @@ func NewSessionManager(onFirstSession func(), onLastSessionRemoved func()) *Sess
 }
 
 // CreateSession 创建新会话。
-func (sm *SessionManager) CreateSession(account, mId, ip, deviceSecret string) (string, error) {
+//
+// gameId 是本次登录选服的 Id（2026-10-17 双服；空串 = 默认服）。
+func (sm *SessionManager) CreateSession(account, mId, ip, deviceSecret, gameId string) (string, error) {
 	token, err := security.GenerateToken()
 	if err != nil {
 		return "", err
@@ -51,6 +53,7 @@ func (sm *SessionManager) CreateSession(account, mId, ip, deviceSecret string) (
 		MId:                  mId,
 		ClientIP:             ip,
 		DeviceSecret:         deviceSecret,
+		GameId:               gameId,
 		CreatedAt:            now,
 		LastHeartbeat:        now,
 		BonusGranted:         0,
@@ -229,8 +232,12 @@ func (sm *SessionManager) FindSessionByMIdAndToken(mId, token string) (*models.S
 // 重复登录视为同一玩家继续在线，在线时长与泡点进度不清零
 // （历史版本每次登录都新建会话，重复登录后在线时长归零、泡点重新计算）。
 //
+// gameId 是本次登录选服的 Id（2026-10-17 双服；空串 = 默认服）。
+// 切服登录（S4A21 ⇄ S5A95）天然被单账号单令牌覆盖：旧会话连坐骑一起
+// 被踢，新会话带新服的 GameId。
+//
 // 返回新 token。旧会话挂着的代理连接会被逐个 Close（真断开）。
-func (sm *SessionManager) ReplaceAccountSessions(account, mId, ip, deviceSecret string, carryOver bool) (string, error) {
+func (sm *SessionManager) ReplaceAccountSessions(account, mId, ip, deviceSecret, gameId string, carryOver bool) (string, error) {
 	token, err := security.GenerateToken()
 	if err != nil {
 		return "", err
@@ -243,6 +250,7 @@ func (sm *SessionManager) ReplaceAccountSessions(account, mId, ip, deviceSecret 
 		MId:                  mId,
 		ClientIP:             ip,
 		DeviceSecret:         deviceSecret,
+		GameId:               gameId,
 		CreatedAt:            now,
 		LastHeartbeat:        now,
 		BonusGranted:         0,

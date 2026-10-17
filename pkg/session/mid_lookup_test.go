@@ -9,11 +9,11 @@ import "testing"
 func TestFindSessionByMId(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
-	tokA, err := sm.CreateSession("msp", "10038", "1.2.3.4", "dev")
+	tokA, err := sm.CreateSession("msp", "10038", "1.2.3.4", "dev", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokB, err := sm.CreateSession("msp2", "10039", "1.2.3.4", "dev")
+	tokB, err := sm.CreateSession("msp2", "10039", "1.2.3.4", "dev", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +41,8 @@ func TestFindSessionByMId(t *testing.T) {
 func TestFindSessionByMId_SameMIdKeepsEarliest(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
-	first, _ := sm.CreateSession("dup", "77777", "1.2.3.4", "d1")
-	second, _ := sm.CreateSession("dup", "77777", "5.6.7.8", "d2")
+	first, _ := sm.CreateSession("dup", "77777", "1.2.3.4", "d1", "")
+	second, _ := sm.CreateSession("dup", "77777", "5.6.7.8", "d2", "")
 
 	// CreateSession 用秒级时间戳，两条可能同秒；此时比较不稳定。
 	// 直接断言「命中的是这两个之一，且不会被第三次查询改变」——

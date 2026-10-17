@@ -78,6 +78,9 @@ type OnlinePlayer struct {
 	LastHeartbeat int64  `json:"last_heartbeat"`
 	BonusGranted  int64  `json:"bonus_granted"`
 	Cera          int64  `json:"cera"`
+	// GameId 是该会话选服的 Id（2026-10-17 双服）。
+	// 老会话为空串 = 默认服。空串在展示层归入默认服而不是"未知服"。
+	GameId string `json:"game_id"`
 }
 
 // SessionBackend 抽象网关内存里的会话表。
@@ -233,6 +236,7 @@ func (b *localSessionBackend) List() ([]OnlinePlayer, error) {
 			LastHeartbeat: s.LastHeartbeat,
 			BonusGranted:  s.BonusGranted,
 			Cera:          ceraMap[s.Account],
+			GameId:        s.GameId,
 		})
 	}
 	return players, nil

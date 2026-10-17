@@ -221,7 +221,7 @@ func TestRegisterLimit_DoesNotBlockExistingAccountLogin(t *testing.T) {
 	}
 
 	// 已有账号照常登录：限额只挂在注册口，不该连坐登录。
-	res := svc.Login("logincheck", regTestPwd, "", ip)
+	res := svc.Login("logincheck", regTestPwd, "", ip, "")
 	if res.ErrorCode != models.Err.Ok {
 		t.Fatalf("已有账号登录不该受注册限额影响: code=%d", res.ErrorCode)
 	}

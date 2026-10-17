@@ -1,6 +1,7 @@
 package httprouter
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
@@ -88,9 +89,13 @@ type Server struct {
 	//   ① 登录器每次切到「在线角色」页都打一次，没有缓存会把游戏库打成热点；
 	//   ② 缓存 5 秒对「谁在线」足够新鲜，同时把突发请求压成一次查询。
 	// 存的是已序列化好的 JSON 字节，命中时直接 Write，连再编码都省了。
+	//
+	// 2026-10-17 双服：缓存按 game 维度分槽（key = game 参数原值，空串 =
+	// 全部服的汇总视图）。共用一个槽会让「A 服视角的 body」返给不带 game
+	// 的请求（或反过来）—— 两边 count/players 完全不同，是可见的错误数据。
 	onlineCacheMu   sync.Mutex
-	onlineCacheAt   time.Time
-	onlineCacheBody []byte
+	onlineCacheAt   map[string]time.Time
+	onlineCacheBody map[string][]byte
 }
 
 // NewServer 创建 HTTP 服务器。
@@ -126,6 +131,8 @@ func NewServer(
 		adminSvc:         adminSvc,
 		banSvc:           banSvc,
 		pvfSvc:           pvfSvc,
+		onlineCacheAt:    make(map[string]time.Time),
+		onlineCacheBody:  make(map[string][]byte),
 		integritySvc:     integritySvc,
 		registerBonusSvc: registerBonusSvc,
 		bonusSvc:         bonusSvc,
@@ -491,6 +498,15 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/integrity/add", s.handleAdminIntegrityAdd).Methods("POST")
 	r.HandleFunc("/api/admin/integrity/remove", s.handleAdminIntegrityRemove).Methods("POST")
 	r.HandleFunc("/api/admin/integrity/allow", s.handleAdminIntegrityAllow).Methods("POST")
+
+	// 驱动白名单（2026-10-16）。
+	// 存放位置与完整性策略**同一个快照**（integrity_policy.json 的 driver_allow），
+	// 因而共用 revision / 热加载 / policy 下发链路；但上传走独立的验签链路
+	//（shell 里多一道"未签名或签名后被改过一律拒"，见 handleAdminDriversUpload）。
+	// ★ upload 路径必须与 bodylimit.go 的 uploadPaths 完全一致，否则会被 8 MiB 全局上限打死。
+	r.HandleFunc("/api/admin/drivers", s.handleAdminDrivers).Methods("GET")
+	r.HandleFunc("/api/admin/drivers/upload", s.handleAdminDriversUpload).Methods("POST")
+	r.HandleFunc("/api/admin/drivers/remove", s.handleAdminDriversRemove).Methods("POST")
 
 	// 账号管理
 	r.HandleFunc("/api/admin/accounts", s.handleAdminAccounts).Methods("GET")
@@ -1067,12 +1083,13 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 	whiteDigest := listDigest(snap.WhiteList)
 	blackDigest := listDigest(snap.BlackList)
 	allowedDigest := namesDigest(snap.AllowedModules)
+	drvDigest := driverDigest(snap.DriverAllow)
 	// G-2（2026-10-04 审查）：本端点是**免鉴权公开端点、每个登录器启动必打**。
 	// GetPvfInfo 在「PVF 文件在、但哈希失败」时会返回 nil（它把 RefreshCache 的
 	// error 吞掉后返回 s.info），直接解引用就是进程级 panic，重启后重复命中
 	// ⇒ 崩溃循环。composeFingerprint 已容忍 nil，下面的 pvfObj 也必须判空
 	// （同文件 handleAdminPvfHistory 就是先判空再取字段）。
-	fingerprint := composeFingerprint(snap.Revision, pvfInfo, whiteDigest, blackDigest, allowedDigest)
+	fingerprint := composeFingerprint(snap.Revision, pvfInfo, whiteDigest, blackDigest, allowedDigest, drvDigest)
 
 	changed := force || rev != fingerprint
 
@@ -1122,14 +1139,19 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 		"white_digest":   whiteDigest,
 		"black_digest":   blackDigest,
 		"allowed_digest": allowedDigest,
+		"driver_digest":  drvDigest,
 		"white_count":    len(snap.WhiteList),
 		"black_count":    len(snap.BlackList),
 		"allowed_count":  len(snap.AllowedModules),
+		"driver_count":   len(snap.DriverAllow),
 	}
 	if changed {
 		resp["white"] = snap.WhiteList
 		resp["black"] = snap.BlackList
 		resp["allowed"] = snap.AllowedModules
+		// 驱动白名单：只有 changed 时才全量下发（与 white/black 同口径）。
+		// 老登录器不认识这个键，多收一个数组不会有任何影响。
+		resp["driver"] = snap.DriverAllow
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1597,6 +1619,169 @@ func (s *Server) handleAdminIntegrityAllow(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "added": added, "rejected": rejected,
 		"revision": snap.Revision, "allowed_count": len(snap.AllowedModules),
+	})
+}
+
+// ==================== 驱动白名单（2026-10-16） ====================
+//
+// 需求来源：玩家被登录器内核驱动扫描拦下，而放行名单**硬编码在登录器里**
+// （Security/KernelThreatScanner.cs 的 DriverShaAllowList，3 条：完美世界 / KK / HWiNFO），
+// 加一个驱动就得重编 + 重分发 127 MB 的登录器。这里把名单搬到网关：
+// 后台上传 .sys → 服务端验签 + 算 SHA-256 → 随 /api/launcher/policy 下发 →
+// 登录器合并进运行期名单（网关条目为增量，硬编码那几条继续兜底）。
+//
+// ★★ 风险必须记账（与 2026-10-03 放行 HWiNFO 同一类决定，2026-10-16 再次拍板）：
+//   加白一个驱动 = 对**全网**放行该文件，而登录器**无法区分**「正常玩家在用」
+//   与「外挂借道这份原版签名驱动做内核读写」—— BYOVD 外挂用的正是原版签名驱动本身。
+//   因此：每条都必须填 reason（放行理由），后台列表常驻风险提示，新增/移除都写审计日志。
+//
+// ★ 能力边界：网关侧验签是**运营侧守门**（拒未签名、拒签名后被改过的文件），
+//   不做 PKCS#7 密码学验证与证书链信任判定；运行时安全边界在**客户端**——
+//   登录器只按「文件名 + SHA-256」精确匹配放行，加白的那份字节改一个即失效。
+//   详见 pkg/security/authenticode.go 头部说明。
+
+// maxDriverUploadBytes 单个驱动上传上限，与 security 侧的上限保持一致。
+const maxDriverUploadBytes = 64 << 20
+
+// handleAdminDrivers 列出驱动白名单。
+func (s *Server) handleAdminDrivers(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+	snap := s.integritySvc.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":         true,
+		"revision":   snap.Revision,
+		"updated_at": snap.UpdatedAt,
+		"count":      len(snap.DriverAllow),
+		"drivers":    snap.DriverAllow,
+	})
+}
+
+// handleAdminDriversUpload 上传驱动文件并登记白名单。
+//
+// 必须先过验签（未签名 / 签名后改过 → 拒），再算 SHA-256 入库。
+func (s *Server) handleAdminDriversUpload(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": err.Error()})
+		return
+	}
+	if r.MultipartForm == nil || len(r.MultipartForm.File) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok": false, "message": "请选择要上传的驱动文件（.sys）",
+		})
+		return
+	}
+
+	// 放行理由必填 —— 加白即对全网放行，没有理由的加白事后无从追溯。
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok": false,
+			"message": "必须填写放行理由：它会随条目入库并在后台展示，" +
+				"用于事后追溯「为什么放行这个驱动」",
+		})
+		return
+	}
+
+	entries := make([]models.DriverEntry, 0)
+	errs := make([]string, 0)
+	for _, files := range r.MultipartForm.File {
+		for _, f := range files {
+			// 不 defer Close：这是循环体，批量上传会把句柄全压在手里
+			//（同 handleAdminIntegrityUpload 的 G-14 教训）。
+			file, err := f.Open()
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Filename, err))
+				continue
+			}
+			// 多读 1 字节用于判超限：读满上限却看不出"超了"会把问题留到后面。
+			data, rerr := io.ReadAll(io.LimitReader(file, maxDriverUploadBytes+1))
+			file.Close()
+			if rerr != nil {
+				errs = append(errs, fmt.Sprintf("%s: 读取失败: %v", f.Filename, rerr))
+				continue
+			}
+			if len(data) > maxDriverUploadBytes {
+				errs = append(errs, fmt.Sprintf("%s: 超过 %d MiB 上限", f.Filename, maxDriverUploadBytes>>20))
+				continue
+			}
+
+			// ★ 验签闸门。
+			sig, verr := security.VerifyPEBytes(data)
+			if verr != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", f.Filename, verr))
+				s.logger.Warn(fmt.Sprintf("[驱动白名单] 拒绝上传 %s: %v", f.Filename, verr))
+				continue
+			}
+
+			hash, algo := security.ComputeFileFingerprint(bytes.NewReader(data))
+			if hash == "" {
+				errs = append(errs, fmt.Sprintf("%s: 指纹计算失败", f.Filename))
+				continue
+			}
+			entries = append(entries, models.DriverEntry{
+				FileName:  f.Filename,
+				Hash:      hash,
+				Algorithm: algo,
+				Size:      int64(len(data)),
+				Signer:    sig.Signer,
+				Reason:    reason,
+			})
+		}
+	}
+
+	added, rejected := 0, make([]string, 0)
+	if len(entries) > 0 {
+		added, rejected = s.integritySvc.AddDriverEntries(entries)
+	}
+	// 审计日志：加白驱动是安全决策，留痕（谁、什么文件、什么哈希、谁签的、什么理由）。
+	for _, e := range entries {
+		s.logger.Warn(fmt.Sprintf("[驱动白名单] 新增 %s sha256=%s size=%d signer=%q reason=%q —— 加白=对全网放行该文件",
+			e.FileName, e.Hash, e.Size, e.Signer, e.Reason))
+	}
+	for _, rj := range rejected {
+		s.logger.Warn("[驱动白名单] 未采纳: " + rj)
+	}
+
+	snap := s.integritySvc.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":          added > 0,
+		"added":       added,
+		"total_files": len(entries) + len(errs),
+		"errors":      errs,
+		"rejected":    rejected,
+		"revision":    snap.Revision,
+		"count":       len(snap.DriverAllow),
+	})
+}
+
+// handleAdminDriversRemove 从驱动白名单移除一条（文件名 + 指纹精确匹配）。
+func (s *Server) handleAdminDriversRemove(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	var req struct {
+		File *string `json:"file"`
+		Hash *string `json:"hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.File == nil || req.Hash == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "file/hash required"})
+		return
+	}
+
+	removed := s.integritySvc.RemoveDriverEntry(*req.File, *req.Hash)
+	if removed {
+		s.logger.Warn(fmt.Sprintf("[驱动白名单] 移除 %s sha256=%s —— 该文件的放行随之取消", *req.File, *req.Hash))
+	}
+	snap := s.integritySvc.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok": removed, "revision": snap.Revision, "count": len(snap.DriverAllow),
 	})
 }
 
@@ -3049,12 +3234,43 @@ func namesDigest(names []string) string {
 	return security.HashSHA256Str(fmt.Sprintf("%v", names))
 }
 
-func composeFingerprint(revision int, pvf *models.PvfInfo, white, black, allowed string) string {
+// driverDigest 计算驱动白名单的规范摘要。
+//
+// ★★ 口径必须与登录器侧 SecurityPolicy.DriverDigest **逐字节一致**。
+// 只覆盖 file 与 hash 两列 —— 参与安全判定的就这两列：
+// 每项拼 "file\thash"，项间用 "\n" 连接，取 SHA-256 小写十六进制；空名单为 "-"。
+//
+// 为什么不复用上面 listDigest 的 Go `%v` 口径：那会把结构体**每个字段**
+// （含展示名、放行理由、加入时间）都算进摘要 —— 以后往 DriverEntry 加一个纯展示
+// 字段就会改变摘要，客户端必须同步改、否则每次都判"缓存被改"而全量重拉。
+// 显式格式下，展示与审计字段完全不参与摘要。
+func driverDigest(entries []models.DriverEntry) string {
+	if len(entries) == 0 {
+		return "-"
+	}
+	var sb strings.Builder
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(e.FileName)
+		sb.WriteByte('\t')
+		sb.WriteString(e.Hash)
+	}
+	return security.HashSHA256Str(sb.String())
+}
+
+// composeFingerprint 合成组合指纹。
+//
+// 任何一段变了，登录器下次拉 policy 就会看到 changed=true 并全量重取 ——
+// 所以新增段（如 2026-10-16 的驱动名单 D%s）会让**全体客户端一次性全量重拉**，
+// 这是预期行为（它们必须拿到驱动名单才能正确判定），不是故障。
+func composeFingerprint(revision int, pvf *models.PvfInfo, white, black, allowed, driver string) string {
 	pvfHash := ""
 	if pvf != nil {
 		pvfHash = fmt.Sprintf("PSHA-256:%s:%d:%s", pvf.Hash, pvf.Size, pvf.ModifiedUtc)
 	}
-	return fmt.Sprintf("I%d;W%s;B%s;A%s;%s", revision, white, black, allowed, pvfHash)
+	return fmt.Sprintf("I%d;W%s;B%s;A%s;D%s;%s", revision, white, black, allowed, driver, pvfHash)
 }
 
 // ==================== 外挂检测处理函数 ====================

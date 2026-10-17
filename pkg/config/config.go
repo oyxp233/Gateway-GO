@@ -355,6 +355,29 @@ func (e *GameServerEntry) IsEnabled() bool {
 	return e.Enabled == nil || *e.Enabled
 }
 
+// FindGameServer 按 Id 找服（CMD_LOGIN 的 game 字段解析用，2026-10-17）。
+//
+// 返回 (entry, true) 表示找到；第二返回值表达"存在但停用"与"根本没有"
+// 两种失败，让调用方回报不同的错误码（停用=维护中，不存在=配置/客户端问题）。
+// 配置未经规范化时（测试直构字面量）按 Id 直比也能工作。
+func (c *GatewayConfig) FindGameServer(id string) (GameServerEntry, bool) {
+	if id == "" {
+		// 空 = 默认服（第一个启用服；没有就按旧 GameServer 段合成）。
+		// 永远返回 true：老登录器不带 game 字段必须照旧能登录。
+		return c.DefaultGameServerEntry(), true
+	}
+	for i := range c.GameServers {
+		if c.GameServers[i].Id == id {
+			return c.GameServers[i], true
+		}
+	}
+	// 未规范化且只配了旧 GameServer 段：默认服 Id 是 s4a21。
+	if len(c.GameServers) == 0 && id == ProtocolS4A21 {
+		return c.DefaultGameServerEntry(), true
+	}
+	return GameServerEntry{}, false
+}
+
 // DefaultGameServerEntry 返回规范后的默认服（第一个启用服）。
 //
 // 配置未经 NormalizeGameServers 规范化时（测试直接构造字面量等），
@@ -408,6 +431,18 @@ func (c *GatewayConfig) NormalizeGameServers() error {
 			}
 			if e.Protocol == "" {
 				e.Protocol = ProtocolS4A21
+			}
+			// LaunchArgsFormat 缺省按协议补权威模板（2026-10-17 双服）：
+			// S5A95 的 99?…{digest}… 与 S4A21 的 9?…{token}… 是两套格式，
+			// 运营只加 Id/Protocol 就应得到能用的模板，而不是空串 ——
+			// 空串会让登录器拿到空 LaunchArgs，表现为"登录成功但游戏起不来"。
+			if strings.TrimSpace(e.LaunchArgsFormat) == "" {
+				switch e.Protocol {
+				case ProtocolS5A95:
+					e.LaunchArgsFormat = DefaultS5A95LaunchArgsFormat
+				default:
+					e.LaunchArgsFormat = DefaultLaunchArgsFormat
+				}
 			}
 		}
 	}
@@ -813,6 +848,23 @@ type MaintenanceSection struct {
 // 不要照抄。写反的后果是游戏端拿到写死的常量当 token，
 // 表现为玩家「能登录但连不上游戏」，排查成本极高。改动前务必核对生产口径。
 const DefaultLaunchArgsFormat = "9?{ip}?{port}?{m_id}?{token}?1?0?6?0?2?1???0?0?0?9n2b1c8r3w7y?0?0?0?0?0?2?0?0?0?0?0?0?0?0?0?0?0?4D87"
+
+// DefaultS5A95LaunchArgsFormat 是 S5A9（DNF95 / ARAD.exe）启动参数模板的
+// **权威默认值**，与 S4A21 模板是两个世界的格式，不要混用：
+//
+//   - 首段是 99（S4A21 是 9）；
+//   - 第 5 段是 {digest} 而不是 {token} —— DNF95 客户端把这一段当登录凭证
+//     发给游戏服务端，服务端拿它与账号绑定的一次性 digest 比对
+//     （AuthenticationService.VerifyOrCreateLogin，PBKDF2）。
+//     网关为每个账号签发固定 32 位 hex digest（见 database.EnsureS5A9Digest），
+//     玩家改网关密码不会影响它 —— 透传密码 MD5 会让改过密码的账号被
+//     S5A9 后端永久拒登。
+//   - 尾部常量组 1?0?0?0?0?0?2?0?0?0?0 来自 `E:\DNF95\一键登录.cmd` 实测。
+//
+// ⚠️ {port} 段填的是**频道口**（GameServerEntry.ChannelListenerPort）：
+// DNF95 客户端先连频道口拿 Directory（频道 IP+端口表），与 S4A21 的
+// {port}=Gateway.ProxyPort 语义相同但值来自服的频道口配置。
+const DefaultS5A95LaunchArgsFormat = "99?{ip}?{port}?{m_id}?{digest}?1?0?0?0?0?0?2?0?0?0?0"
 
 // DefaultConfig 返回带有生产环境默认值的配置。
 func DefaultConfig() *GatewayConfig {

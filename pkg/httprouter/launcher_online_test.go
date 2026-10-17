@@ -135,7 +135,7 @@ func TestBuildLauncherOnlineResolvesCurrentRole(t *testing.T) {
 		{Account: "阿亮", IP: "10.0.0.2", OnlineMinutes: 40, LastHeartbeat: now},
 	})
 
-	payload, err := s.buildLauncherOnline()
+	payload, err := s.buildLauncherOnline("")
 	if err != nil {
 		t.Fatalf("buildLauncherOnline 失败: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestBuildLauncherOnlineWithoutGameAccount(t *testing.T) {
 		{Account: "查无此人", OnlineMinutes: 3},
 	})
 
-	payload, err := s.buildLauncherOnline()
+	payload, err := s.buildLauncherOnline("")
 	if err != nil {
 		t.Fatalf("buildLauncherOnline 失败: %v", err)
 	}

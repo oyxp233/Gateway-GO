@@ -21,7 +21,7 @@ import (
 // newSessionWith 建一个可指定 IP / device_secret 的会话。
 func newSessionWith(t *testing.T, sm *SessionManager, account, ip, secret string) *models.Session {
 	t.Helper()
-	token, err := sm.CreateSession(account, "10001", ip, secret)
+	token, err := sm.CreateSession(account, "10001", ip, secret, "")
 	if err != nil {
 		t.Fatalf("创建会话失败: %v", err)
 	}

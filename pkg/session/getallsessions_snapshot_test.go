@@ -14,7 +14,7 @@ import (
 // 本用例的第一个断言必然变红。
 func TestGetAllSessionsReturnsSnapshot(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
-	token, err := sm.ReplaceAccountSessions("alice", "10038", "1.2.3.4", "dev", false)
+	token, err := sm.ReplaceAccountSessions("alice", "10038", "1.2.3.4", "dev", "", false)
 	if err != nil {
 		t.Fatalf("创建会话失败: %v", err)
 	}

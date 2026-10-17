@@ -170,11 +170,11 @@ func TestGrantBonusOnlyGrantsSessionsInGame(t *testing.T) {
 	seedAccount(t, db, "10002", "idle")
 
 	sm := session.NewSessionManager(nil, nil)
-	tokenIn, err := sm.CreateSession("ingame", "10001", "10.0.0.1", "")
+	tokenIn, err := sm.CreateSession("ingame", "10001", "10.0.0.1", "", "")
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
-	tokenIdle, err := sm.CreateSession("idle", "10002", "10.0.0.2", "")
+	tokenIdle, err := sm.CreateSession("idle", "10002", "10.0.0.2", "", "")
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestGrantBonusStopsAfterSessionRemoved(t *testing.T) {
 	seedAccount(t, db, "10001", "alice")
 
 	sm := session.NewSessionManager(nil, nil)
-	token, err := sm.CreateSession("alice", "10001", "10.0.0.1", "")
+	token, err := sm.CreateSession("alice", "10001", "10.0.0.1", "", "")
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestGrantBonusLogsAccountNameWithoutPanic(t *testing.T) {
 	seedAccount(t, db, "10001", "显示名")
 
 	sm := session.NewSessionManager(nil, nil)
-	token, _ := sm.CreateSession("显示名", "10001", "10.0.0.1", "")
+	token, _ := sm.CreateSession("显示名", "10001", "10.0.0.1", "", "")
 	sess, _ := sm.ValidateToken(token)
 	sm.AddGameProxyConnection(sess, fakeConn{})
 	sess.BonusTickAt = time.Now().Unix() - 65

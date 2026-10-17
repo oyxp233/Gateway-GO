@@ -39,7 +39,7 @@ func TestLoginTimingEqualizedOnMissingAccount(t *testing.T) {
 
 	// (1) 密码错误：账号存在，走一次加盐哈希
 	calls = 0
-	wrong := svc.Login(name, strings.Repeat("f", 32), "", ip)
+	wrong := svc.Login(name, strings.Repeat("f", 32), "", ip, "")
 	if wrong.ErrorCode != models.Err.WrongPassword {
 		t.Fatalf("准备失败：错误密码应返回 %d，实际 %d", models.Err.WrongPassword, wrong.ErrorCode)
 	}
@@ -47,7 +47,7 @@ func TestLoginTimingEqualizedOnMissingAccount(t *testing.T) {
 
 	// (2) 账号不存在：修复后同样要算一次
 	calls = 0
-	missing := svc.Login("p2nosuchuser", pwd, "", ip)
+	missing := svc.Login("p2nosuchuser", pwd, "", ip, "")
 	if missing.ErrorCode != models.Err.AccountNotFound {
 		t.Fatalf("账号不存在应返回 %d，实际 %d", models.Err.AccountNotFound, missing.ErrorCode)
 	}
@@ -84,13 +84,13 @@ func TestEqualizeLoginTimingDoesNotAlterVerdict(t *testing.T) {
 		return "0b1d2f3a4c5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"
 	}
 
-	res := svc.Login("p2verdictuser", strings.Repeat("9", 32), "", "203.0.113.8")
+	res := svc.Login("p2verdictuser", strings.Repeat("9", 32), "", "203.0.113.8", "")
 	if res.ErrorCode != models.Err.WrongPassword {
 		t.Fatalf("抹平时延的哈希结果被用于判定：期望 %d，实际 %d",
 			models.Err.WrongPassword, res.ErrorCode)
 	}
 
-	missing := svc.Login("p2nosuchuser", pwd, "", "203.0.113.9")
+	missing := svc.Login("p2nosuchuser", pwd, "", "203.0.113.9", "")
 	if missing.ErrorCode != models.Err.AccountNotFound {
 		t.Fatalf("期望 %d，实际 %d", models.Err.AccountNotFound, missing.ErrorCode)
 	}

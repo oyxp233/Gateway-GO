@@ -27,7 +27,7 @@ const testInterval int64 = 60
 // newTestSession 建一个会话并返回会话指针（token 从 sess.Token 取）。
 func newTestSession(t *testing.T, sm *SessionManager, account string) *models.Session {
 	t.Helper()
-	token, err := sm.CreateSession(account, "10001", "127.0.0.1", "")
+	token, err := sm.CreateSession(account, "10001", "127.0.0.1", "", "")
 	if err != nil {
 		t.Fatalf("创建会话失败: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestReplaceAccountSessionsCarriesBonusRemainder(t *testing.T) {
 		t.Fatalf("旧会话应累计 25 秒，实际 %d", sess.GameOnlineSeconds)
 	}
 
-	newToken, err := sm.ReplaceAccountSessions("alice", "10002", "127.0.0.1", "", true)
+	newToken, err := sm.ReplaceAccountSessions("alice", "10002", "127.0.0.1", "", "", true)
 	if err != nil {
 		t.Fatalf("重复登录失败: %v", err)
 	}

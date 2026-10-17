@@ -243,7 +243,12 @@ func maskMachineID(id string) string {
 }
 
 // Login 登录账号。
-func (s *AccountService) Login(name, passwordMd5, deviceSecret, ip string) *models.LoginResult {
+//
+// gameId 是 CMD_LOGIN 的选服字段（GameServers[].Id，2026-10-17 双服）：
+// 空串 = 默认服（行为与改造前一致）；找不到或已停用返回对应错误码。
+// 选 S5A95（DNF95）服时会顺带签发/复用该账号的 S5A9 登录 digest，
+// 并替换启动参数模板里的 {digest} 占位符。
+func (s *AccountService) Login(name, passwordMd5, deviceSecret, ip, gameId string) *models.LoginResult {
 	name = utils.TrimSpace(name)
 	passwordMd5 = utils.TrimSpace(passwordMd5)
 
@@ -291,6 +296,37 @@ func (s *AccountService) Login(name, passwordMd5, deviceSecret, ip string) *mode
 	// 重置失败计数
 	s.db.UpdateAccountLogin(name, ip, 0, 0)
 
+	// ── 选服解析（2026-10-17 双服）────────────────────────────────────
+	//
+	// gameId 空 = 默认服（第一个启用服）：老登录器不带 game 字段，
+	// 走这条路径，行为与改造前逐字节等价。
+	profile, found := s.config.FindGameServer(gameId)
+	if !found {
+		return &models.LoginResult{ErrorCode: models.Err.GameNotFound}
+	}
+	if !profile.IsEnabled() {
+		return &models.LoginResult{ErrorCode: models.Err.GameDisabled}
+	}
+
+	// S5A95（DNF95）：签发/复用登录 digest。同一账号的 digest 必须每次
+	// 一致（服务端存的就是它的 PBKDF2 派生哈希），与网关密码无关。
+	// 签发失败（随机源故障等）必须拒登：空 digest 拼进启动参数，
+	// 玩家会带着必被拒的凭证进游戏，现场极难排查。
+	s5a9Digest := ""
+	if profile.Protocol == config.ProtocolS5A95 {
+		digest, err := s.db.EnsureS5A9Digest(name)
+		if err != nil {
+			s.logger.Error(fmt.Sprintf("签发 S5A9 digest 失败: 账号=%s 错误=%v", name, err))
+			return &models.LoginResult{ErrorCode: models.Err.DatabaseError}
+		}
+		if digest == "" {
+			// 账号行不存在（正常登录流程不会走到：前面已按名取到账号）。
+			s.logger.Error(fmt.Sprintf("签发 S5A9 digest 失败: 账号=%s 行不存在", name))
+			return &models.LoginResult{ErrorCode: models.Err.DatabaseError}
+		}
+		s5a9Digest = digest
+	}
+
 	// 设备凭证处理
 	deviceChanged := false
 	if s.config.Device.EnforceBinding {
@@ -320,8 +356,8 @@ func (s *AccountService) Login(name, passwordMd5, deviceSecret, ip string) *mode
 		return &models.LoginResult{ErrorCode: models.Err.DatabaseError}
 	}
 
-	// 拼装启动参数
-	launchArgs := s.buildLaunchArgs(account.MId, token)
+	// 拼装启动参数（按所选服的 Profile：ip/port/digest 都取它的）
+	launchArgs := s.buildLaunchArgs(profile, account.MId, token, s5a9Digest)
 
 	return &models.LoginResult{
 		ErrorCode:     models.Err.Ok,
@@ -564,7 +600,11 @@ func containsStr(list []string, s string) bool {
 }
 
 // SupportedLaunchArgsPlaceholders 支持的启动参数占位符。
-var SupportedLaunchArgsPlaceholders = []string{"{ip}", "{port}", "{m_id}", "{token}"}
+//
+// {digest} 只对 S5A95（DNF95）服的模板有意义：DNF95 客户端把第 5 段当
+// 登录凭证发给游戏服务端。S4A21 模板没有它，digest 传空串时
+// replaceAll 自然不命中任何文本。
+var SupportedLaunchArgsPlaceholders = []string{"{ip}", "{port}", "{m_id}", "{token}", "{digest}"}
 
 // DefaultLaunchArgsFormat 启动参数模板的代码默认值，转发自 config 包，
 // 保证“配置默认值”与“启动校验基准”只有一份真相。
@@ -574,17 +614,29 @@ var SupportedLaunchArgsPlaceholders = []string{"{ip}", "{port}", "{m_id}", "{tok
 // 表现为玩家登录成功但连不上游戏。
 const DefaultLaunchArgsFormat = config.DefaultLaunchArgsFormat
 
-func (s *AccountService) buildLaunchArgs(mId, token string) string {
-	format := s.config.GameServer.LaunchArgsFormat
-	// 替换占位符
-	ip := s.config.GameServer.PublicIP
-	port := fmt.Sprintf("%d", s.config.Gateway.ProxyPort)
+// buildLaunchArgs 按**服 Profile** 拼装启动参数（2026-10-17 双服改造）。
+//
+// 与旧版（读 s.config.GameServer 单一配置）的差别：
+//   - ip   = profile.PublicIP（每服独立的对外地址，可以不同）；
+//   - port = profile.ChannelListenerPort（频道口），为 0 时回落
+//     Gateway.ProxyPort —— 与 ProxyManager 里 ProxyServer.channelPort()
+//     同一口径：单服沿用 ProxyPort 的存量配置行为不变；
+//   - digest = 该服的 S5A9 登录凭证（S4A21 恒为空串，模板里没有
+//     {digest} 占位符，替换不生效）。
+func (s *AccountService) buildLaunchArgs(profile config.GameServerEntry, mId, token, digest string) string {
+	format := profile.LaunchArgsFormat
+	ip := profile.PublicIP
+	port := s.config.Gateway.ProxyPort
+	if profile.ChannelListenerPort > 0 {
+		port = profile.ChannelListenerPort
+	}
 
 	result := format
 	result = replaceAll(result, "{ip}", ip)
-	result = replaceAll(result, "{port}", port)
+	result = replaceAll(result, "{port}", fmt.Sprintf("%d", port))
 	result = replaceAll(result, "{m_id}", mId)
 	result = replaceAll(result, "{token}", token)
+	result = replaceAll(result, "{digest}", digest)
 
 	return result
 }
@@ -1815,6 +1867,7 @@ func NewIntegrityStore(configDir string, log *logger.ConsoleLogger) *IntegritySt
 			WhiteList:      make([]models.FingerprintEntry, 0),
 			BlackList:      make([]models.FingerprintEntry, 0),
 			AllowedModules: make([]string, 0),
+			DriverAllow:    make([]models.DriverEntry, 0),
 		},
 	}
 	if configDir != "" {
@@ -1873,12 +1926,17 @@ func (s *IntegrityStore) loadLocked() {
 	if snap.AllowedModules == nil {
 		snap.AllowedModules = make([]string, 0)
 	}
+	// 旧文件（2026-10-16 之前的 integrity_policy.json）没有 driver_allow 字段，
+	// json.Unmarshal 会留成 nil ⇒ 这里补空切片，免得调用方到处判空。
+	if snap.DriverAllow == nil {
+		snap.DriverAllow = make([]models.DriverEntry, 0)
+	}
 	if snap.Revision <= 0 {
 		snap.Revision = 1
 	}
 	s.snapshot = &snap
-	s.logInfo(fmt.Sprintf("[完整性策略] 已加载: rev=%d 白名单=%d 黑名单=%d 放行模块=%d",
-		snap.Revision, len(snap.WhiteList), len(snap.BlackList), len(snap.AllowedModules)))
+	s.logInfo(fmt.Sprintf("[完整性策略] 已加载: rev=%d 白名单=%d 黑名单=%d 放行模块=%d 驱动白名单=%d",
+		snap.Revision, len(snap.WhiteList), len(snap.BlackList), len(snap.AllowedModules), len(snap.DriverAllow)))
 }
 
 // statPolicy 读取策略文件当下的指纹；路径为空 / 文件不存在 / 不可读一律返回零值。
@@ -1983,6 +2041,8 @@ func cloneSnapshot(src *models.IntegritySnapshot) *models.IntegritySnapshot {
 	copy(dst.BlackList, src.BlackList)
 	dst.AllowedModules = make([]string, len(src.AllowedModules))
 	copy(dst.AllowedModules, src.AllowedModules)
+	dst.DriverAllow = make([]models.DriverEntry, len(src.DriverAllow))
+	copy(dst.DriverAllow, src.DriverAllow)
 	return dst
 }
 
@@ -2138,6 +2198,85 @@ func (s *IntegrityStore) RemoveAllowedModule(name string) bool {
 		}
 	}
 	s.snapshot.AllowedModules = newList
+	if removed {
+		s.snapshot.Revision++
+		s.snapshot.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		s.saveLocked()
+	}
+	return removed
+}
+
+// AddDriverEntries 追加驱动白名单条目（2026-10-16）。
+//
+// 去重口径 = **SHA-256**（不是文件名）：
+//   - 厂商更新驱动后文件名不变、哈希必变 ⇒ 新旧两版都能同时登记
+//     （登录器按「文件名 + 哈希」精确匹配，两版各自生效）；
+//   - 同一份文件换个名字重复上传没有意义（登录器最终只认哈希），直接判重复。
+//
+// 返回 (新增条数, 被拒条目说明)。rejected 存在的理由是后台要能把
+// 「为什么这条没生效」直接显示出来 —— 静默丢弃会让运营以为已经加上了。
+func (s *IntegrityStore) AddDriverEntries(entries []models.DriverEntry) (int, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	added := 0
+	rejected := make([]string, 0)
+	existing := make(map[string]bool, len(s.snapshot.DriverAllow))
+	for _, e := range s.snapshot.DriverAllow {
+		existing[strings.ToUpper(e.Hash)] = true
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, e := range entries {
+		name := utils.TrimSpace(e.FileName)
+		hash := strings.ToUpper(utils.TrimSpace(e.Hash))
+		// SHA-256 十六进制一定是 64 位；长度不符说明调用方没算过指纹，
+		// 宁可拒掉也不要把一条"永远匹配不上"的条目写进下发名单。
+		if name == "" || len(hash) != 64 {
+			rejected = append(rejected, fmt.Sprintf("%s（文件名或指纹不合法）", e.FileName))
+			continue
+		}
+		if existing[hash] {
+			rejected = append(rejected, fmt.Sprintf("%s（该指纹已在名单中）", name))
+			continue
+		}
+		e.FileName = name
+		e.Hash = hash
+		if e.Algorithm == "" {
+			e.Algorithm = security.FileFingerprintAlgo
+		}
+		e.Display = fmt.Sprintf("%s [%s]", name, shortHash(hash))
+		if e.AddedUtc == "" {
+			e.AddedUtc = now
+		}
+		s.snapshot.DriverAllow = append(s.snapshot.DriverAllow, e)
+		existing[hash] = true
+		added++
+	}
+
+	if added > 0 {
+		s.snapshot.Revision++
+		s.snapshot.UpdatedAt = now
+		s.saveLocked()
+	}
+	return added, rejected
+}
+
+// RemoveDriverEntry 从驱动白名单移除一条（文件名 + 指纹精确匹配）。
+func (s *IntegrityStore) RemoveDriverEntry(file, hash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	newList := make([]models.DriverEntry, 0, len(s.snapshot.DriverAllow))
+	removed := false
+	for _, e := range s.snapshot.DriverAllow {
+		if strings.EqualFold(e.FileName, file) && strings.EqualFold(e.Hash, hash) {
+			removed = true
+			continue
+		}
+		newList = append(newList, e)
+	}
+	s.snapshot.DriverAllow = newList
 	if removed {
 		s.snapshot.Revision++
 		s.snapshot.UpdatedAt = time.Now().UTC().Format(time.RFC3339)

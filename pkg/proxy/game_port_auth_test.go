@@ -303,7 +303,7 @@ func TestAdmitGameClientMatrix(t *testing.T) {
 	// withSession 建一个 mId 的会话并返回其 token。
 	withSession := func(t *testing.T, sm *session.SessionManager, ip string) string {
 		t.Helper()
-		tok, err := sm.CreateSession("acct", mId, ip, "")
+		tok, err := sm.CreateSession("acct", mId, ip, "", "")
 		if err != nil {
 			t.Fatalf("建会话失败: %v", err)
 		}
@@ -377,7 +377,7 @@ func TestAdmitGameClientMatrix(t *testing.T) {
 	t.Run("无会话_口令不符_观察模式按白名单", func(t *testing.T) {
 		srv, sm := newGameAuthFixture(t, &fakeGameVerifier{matched: map[string]bool{mId: false}}, nil)
 		// 同 IP 另有一个账号的会话 ⇒ 该 IP 在白名单里
-		if _, err := sm.CreateSession("other", "10039", otherIP, ""); err != nil {
+		if _, err := sm.CreateSession("other", "10039", otherIP, "", ""); err != nil {
 			t.Fatalf("建会话失败: %v", err)
 		}
 
@@ -390,7 +390,7 @@ func TestAdmitGameClientMatrix(t *testing.T) {
 	t.Run("无会话_口令不符_收紧模式拒绝", func(t *testing.T) {
 		srv, sm := newGameAuthFixture(t, &fakeGameVerifier{matched: map[string]bool{mId: false}},
 			func(c *config.GatewayConfig) { c.GameServer.GamePortAuth.RequireCredential = true })
-		if _, err := sm.CreateSession("other", "10039", otherIP, ""); err != nil {
+		if _, err := sm.CreateSession("other", "10039", otherIP, "", ""); err != nil {
 			t.Fatalf("建会话失败: %v", err)
 		}
 
@@ -528,7 +528,7 @@ func TestGameSlotByMId(t *testing.T) {
 func TestFindSessionByMIdAndToken(t *testing.T) {
 	sm := session.NewSessionManager(func() {}, func() {})
 
-	tok, err := sm.CreateSession("acct", "10038", "198.51.100.7", "")
+	tok, err := sm.CreateSession("acct", "10038", "198.51.100.7", "", "")
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
@@ -546,7 +546,7 @@ func TestFindSessionByMIdAndToken(t *testing.T) {
 	}
 
 	// 同 m_id 两个会话（stale reconnect 结转场景）：各自 token 都要能命中
-	tok2, err := sm.CreateSession("acct", "10038", "203.0.113.9", "")
+	tok2, err := sm.CreateSession("acct", "10038", "203.0.113.9", "", "")
 	if err != nil {
 		t.Fatalf("建第二个会话失败: %v", err)
 	}

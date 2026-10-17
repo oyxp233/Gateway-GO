@@ -5,10 +5,29 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"s4a21-gateway/pkg/config"
 )
+
+// ensureGatePolicyDir 把策略文件所在目录建出来（本文件自带，不依赖其它测试文件的 helper）。
+//
+// 为什么需要：newPvfDeltaTestServer 传的是 `filepath.Join(dir, "integrity")` 这个
+// **还不存在的**目录，写盘失败只在日志里留一条 ERROR，策略照旧"失忆"。
+// 自带一份是为了让本文件的用例在只检出部分文件时也能编译 —— 依赖别人测试文件里的
+// 私有 helper 会让"干净检出编译不过"这种坑在别处复现。
+func ensureGatePolicyDir(t *testing.T, s *Server) {
+	t.Helper()
+	p := s.integritySvc.ConfigPath()
+	if p == "" {
+		t.Fatal("策略存储没配持久化路径，本用例的前提不成立")
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // gatePolicyJSON 是 policy 响应里 gates 段的形状（与登录器 GateDto 逐字对齐）。
 type gatePolicyJSON struct {
@@ -70,7 +89,7 @@ func TestGateSwitchesForProtocol(t *testing.T) {
 func dualGamePolicyServer(t *testing.T) *Server {
 	t.Helper()
 	s, _, _ := newPvfDeltaTestServer(t)
-	ensurePolicyDir(t, s)
+	ensureGatePolicyDir(t, s)
 	s.config.GameServers = []config.GameServerEntry{
 		{Id: "s4a21", Name: "S4A21", Protocol: config.ProtocolS4A21},
 		{Id: "s5a95", Name: "DNF95", Protocol: config.ProtocolS5A95, ChannelListenerPort: 18002},

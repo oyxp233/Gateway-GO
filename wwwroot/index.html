@@ -857,6 +857,36 @@
                 <div id="integrityResult"></div>
             </div>
 
+            <!-- ==================== 驱动白名单（2026-10-16） ==================== -->
+            <div class="card">
+                <h3>驱动白名单（登录器内核驱动放行）<span class="tag tag-warn">加白即对全网生效</span></h3>
+                <p class="muted">
+                    上传 <code>.sys</code> 后，登录器会把「文件名 + SHA-256」并入内核驱动放行名单：
+                    该驱动再命中 BYOVD 三维判据时会被放行。<b>不用重编登录器</b>，保存后玩家下次拉策略即为新名单。
+                </p>
+                <p class="muted">
+                    <b>风险须知：</b>BYOVD 外挂借用的恰恰是<b>原版签名驱动本身</b> —— 登录器无法区分
+                    「玩家正常在用」与「外挂借道做内核读写」。加白等于接受这份风险，
+                    所以<b>放行理由必填</b>，且新增/移除都会写进网关日志备查。
+                    上传会先验签：<b>未签名、或签名之后被改过的文件一律拒收</b>。
+                </p>
+                <div class="row">
+                    <input type="file" id="driverFile" accept=".sys">
+                    <input type="text" id="driverReason" placeholder="放行理由（必填，如：玩家申诉 AMD Ryzen Master 组件）" style="width: 420px;">
+                    <button class="btn" onclick="uploadDriver()">上传并登记</button>
+                    <button class="btn" onclick="loadDrivers()">刷新</button>
+                    <span id="driverMeta" class="muted"></span>
+                </div>
+                <table>
+                    <thead><tr>
+                        <th>文件</th><th>签名者</th><th>放行理由</th><th>指纹</th>
+                        <th>大小</th><th>加入时间</th><th>操作</th>
+                    </tr></thead>
+                    <tbody id="driverTable"></tbody>
+                </table>
+                <div id="driverResult"></div>
+            </div>
+
             <div class="card">
                 <h3>PVF 指纹（客户端校验基准）</h3>
                 <p class="muted">网关侧保存的客户端基准 PVF：玩家校验与增量更新都以它为准。它与「服务端管理 → 服务端 PVF」是<b>两个不同文件</b>、各自独立版本。</p>
@@ -3169,6 +3199,9 @@
             renderFingerprintTable('whiteTable', 'white', integritySnapshot.white);
             renderFingerprintTable('blackTable', 'black', integritySnapshot.black);
             renderAllowTable(integritySnapshot.allowed);
+            // 驱动白名单与白/黑名单共用一个策略快照（同一个 revision），
+            // 一起刷新才不会出现"版本号是新的、驱动列表还是旧的"。
+            loadDrivers();
             loadPvfInfo();
         }
 
@@ -3286,6 +3319,89 @@
             if (!data) return;
             if (data.ok) loadIntegrity();
             else showResult('integrityResult', 'error', '未找到该模块');
+        }
+
+        // ==================== 驱动白名单（2026-10-16） ====================
+
+        let driverSnapshot = [];
+
+        async function loadDrivers() {
+            const data = await api('/api/admin/drivers');
+            if (!data) return;
+            driverSnapshot = data.drivers || [];
+            setText('driverMeta',
+                `策略版本 ${data.revision}，共 ${driverSnapshot.length} 条，更新于 ${fmtUtcText(data.updated_at)}`);
+            renderDriverTable(driverSnapshot);
+        }
+
+        function renderDriverTable(list) {
+            const tbody = document.getElementById('driverTable');
+            tbody.innerHTML = '';
+            if (!list || list.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无条目（没有登记任何驱动放行）</td></tr>';
+                return;
+            }
+            list.forEach(e => {
+                tbody.innerHTML += `<tr>
+                    <td>${esc(e.file)}</td>
+                    <td>${esc(e.signer || '-')}</td>
+                    <td>${esc(e.reason || '-')}</td>
+                    <td title="${escAttr(e.hash)}">${esc(truncHash(e.hash))}</td>
+                    <td>${esc(fmtSize(e.size))}</td>
+                    <td>${esc(fmtUtcText(e.added_utc))}</td>
+                    <td><button class="btn btn-danger btn-sm" data-act="del"
+                        data-file="${escAttr(e.file)}"
+                        data-hash="${escAttr(e.hash)}">移除</button></td>
+                </tr>`;
+            });
+            bindRowActions(tbody, 'data-act', {
+                del: (el) => removeDriver(el.dataset.file, el.dataset.hash)
+            });
+        }
+
+        async function uploadDriver() {
+            const input = document.getElementById('driverFile');
+            const reason = document.getElementById('driverReason').value.trim();
+            if (!input.files || input.files.length === 0) {
+                showResult('driverResult', 'error', '请先选择驱动文件（.sys）');
+                return;
+            }
+            if (!reason) {
+                showResult('driverResult', 'error',
+                    '放行理由必填：加白即对全网放行，事后要能追溯为什么放行这个驱动');
+                return;
+            }
+            const fd = new FormData();
+            fd.append('reason', reason);
+            fd.append('file', input.files[0], input.files[0].name);
+
+            showResult('driverResult', 'success', '正在上传并校验内嵌签名…');
+            const data = await upload('/api/admin/drivers/upload', fd);
+            if (!data) {
+                showResult('driverResult', 'error', '上传失败：接口返回异常（状态码见浏览器控制台）');
+                return;
+            }
+            input.value = '';
+            if (data.ok) {
+                document.getElementById('driverReason').value = '';
+                showResult('driverResult', 'success',
+                    `已登记，当前共 ${data.count} 条（本次新增 ${data.added}）`);
+                loadDrivers();
+                return;
+            }
+            const parts = [];
+            (data.errors || []).forEach(e => parts.push(e));
+            (data.rejected || []).forEach(e => parts.push(e));
+            showResult('driverResult', 'error',
+                (data.message || '登记失败') + (parts.length ? '：' + parts.join('；') : ''));
+        }
+
+        async function removeDriver(file, hash) {
+            if (!confirm(`取消「${file}」的驱动放行？\n该文件的放行随之对全网取消（玩家若仍加载它会被登录器拦下）。`)) return;
+            const data = await api('/api/admin/drivers/remove', 'POST', { file, hash });
+            if (!data) return;
+            if (data.ok) loadDrivers();
+            else showResult('driverResult', 'error', data.message || '未找到该条目');
         }
 
         async function loadPvfInfo() {

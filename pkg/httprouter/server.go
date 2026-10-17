@@ -1077,6 +1077,16 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 	rev := r.URL.Query().Get("rev")
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 
+	// 选服维度（2026-10-17）：登录器按选中的服拉策略，网关回该服的门禁开关。
+	// 空 = 默认服（改造前的老登录器不带这个参数，行为完全不变）。
+	gameID := strings.TrimSpace(r.URL.Query().Get("game"))
+	var profile config.GameServerEntry
+	var gameFound bool
+	if s.config != nil {
+		profile, gameFound = s.config.FindGameServer(gameID)
+	}
+	gates := gateSwitchesFor(profile, gameFound)
+
 	pvfInfo := s.pvfSvc.GetPvfInfo()
 	snap := s.integritySvc.Snapshot()
 
@@ -1144,6 +1154,15 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 		"black_count":    len(snap.BlackList),
 		"allowed_count":  len(snap.AllowedModules),
 		"driver_count":   len(snap.DriverAllow),
+
+		// ── 选服维度（2026-10-17）──────────────────────────────────
+		// ★ gates 与 game **恒返回**，不受 changed 短路影响。
+		//   原因：fingerprint 里不含 game，玩家从 S4A21 切到 S5A95 时 rev 仍是命中态
+		//   （changed=false），若把 gates 塞进 changed 分支，切服后登录器会继续按上一服的
+		//   门禁跑 —— 表现为"选了 DNF95 却被要求校验 S4A21 的 PVF"。
+		"game":       profile.Id,
+		"game_found": gameFound,
+		"gates":      gates,
 	}
 	if changed {
 		resp["white"] = snap.WhiteList

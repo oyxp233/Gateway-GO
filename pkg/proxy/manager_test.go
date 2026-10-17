@@ -264,18 +264,19 @@ func TestNewProxyServerS5A95ForcedSettings(t *testing.T) {
 		t.Fatalf("S5A95 应绑定频道口+游戏口两个适配器")
 	}
 
-	// 对照组：S4A21 不受影响（协议保持配置原值，适配器按开关绑定）
-	s4 := cfg.GameServers[0]
-	s4.ProxyProtocol = "v1"
-	srv4 := NewProxyServer(cfg, s4, nil, lg, nil, nil)
-	if srv4.profile.ProxyProtocol != "v1" {
-		t.Fatalf("S4A21 的 ProxyProtocol 不应被改动，实际 %q", srv4.profile.ProxyProtocol)
+	// 对照组：非 S5A95 协议不绑任何适配器（只透传），且不被强制改写 ProxyProtocol。
+	// S4A21 的频道列适配器已从本分支删除，配置里出现别的协议时行为是"能连但地址不改写"。
+	other := cfg.GameServers[0]
+	other.ProxyProtocol = "v1"
+	srvOther := NewProxyServer(cfg, other, nil, lg, nil, nil)
+	if srvOther.profile.ProxyProtocol != "v1" {
+		t.Fatalf("非 S5A95 服的 ProxyProtocol 不应被改动，实际 %q", srvOther.profile.ProxyProtocol)
 	}
-	if srv4.channelAdapter != nil {
-		t.Fatalf("RewriteChannelList 未开时 S4A21 不应绑频道适配器")
+	if srvOther.channelAdapter != nil {
+		t.Fatalf("非 S5A95 服不应绑频道适配器")
 	}
-	if srv4.gameAdapter != nil {
-		t.Fatalf("S4A21 不应绑游戏口适配器（它的地址全在频道列里）")
+	if srvOther.gameAdapter != nil {
+		t.Fatalf("非 S5A95 服不应绑游戏口适配器")
 	}
 }
 

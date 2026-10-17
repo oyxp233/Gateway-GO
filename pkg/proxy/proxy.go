@@ -142,7 +142,7 @@ type ProxyServer struct {
 	backendConnTimeout time.Duration
 
 	// channelAdapter / gameAdapter 是本服的下行适配器（按 profile.Protocol
-	// 在构造时绑定）。nil = 纯透传（S4A21 且 RewriteChannelList=false 时）。
+	// 在构造时绑定）。nil = 纯透传（协议不是 S5A95 时）。
 	channelAdapter DownlinkAdapter
 	gameAdapter    DownlinkAdapter
 
@@ -245,15 +245,21 @@ func NewProxyServer(
 	srv.ports.Store(initialView)
 
 	// 下行适配器按协议绑定（差异全部收在适配层，热路径无分支）。
+	//
+	// S5A9 独立分支（2026-10-17）：S4A21 的频道列适配器已随 S4A21 客户端一起
+	// 删除，本分支只认 ProtocolS5A95。其余协议一律不绑适配器 —— 转发仍是纯透传
+	// （能连、能登录，但频道列表里的地址不会被改写成网关公网值），并显式告警：
+	// 静默透传是以前"配错协议也能启动、进游戏才发现连不上"的根源。
 	switch profile.Protocol {
 	case config.ProtocolS5A95:
-		// S5A9 的地址下发只有改写一条路（Directory + Endpoint 两个包），
-		// RewriteChannelList 开关对它不适用 —— 置 false 只对 S4A21 有意义。
 		srv.channelAdapter = NewS5A95ChannelAdapter(profile.PublicIP, &srv.ports, logger)
 		srv.gameAdapter = NewS5A95GameAdapter(profile.PublicIP, &srv.ports, logger)
 	default:
-		if profile.RewriteChannelList {
-			srv.channelAdapter = NewS4A21ChannelAdapter(profile, &srv.ports, logger)
+		// logger 可为 nil（单测直构 ProxyServer 时不传），告警前先判空。
+		if logger != nil {
+			logger.Warn(fmt.Sprintf(
+				"游戏服 %q 协议 %q 无下行适配器（本分支只支持 %s）：频道列表地址将按原样透传，客户端会连到后端真实地址",
+				profile.Id, profile.Protocol, config.ProtocolS5A95))
 		}
 	}
 	return srv

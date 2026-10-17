@@ -250,7 +250,6 @@ type GameServerSection struct {
 	BackendChannelPort           int      `json:"BackendChannelPort"`
 	GamePorts                    []int    `json:"GamePorts"`
 	GamePortMap                  []string `json:"GamePortMap"`
-	RewriteChannelList           bool     `json:"RewriteChannelList"`
 	KeyTimeZoneOffsetHours       int      `json:"KeyTimeZoneOffsetHours"`
 	MaxConnectionsPerIP          int      `json:"MaxConnectionsPerIP"`
 	FirstReadTimeoutSeconds      int      `json:"FirstReadTimeoutSeconds"`
@@ -896,7 +895,6 @@ func DefaultConfig() *GatewayConfig {
 			BackendChannelPort:           7001,
 			GamePorts:                    []int{},
 			GamePortMap:                  []string{},
-			RewriteChannelList:           true,
 			KeyTimeZoneOffsetHours:       0,
 			MaxConnectionsPerIP:          4,
 			FirstReadTimeoutSeconds:      30,

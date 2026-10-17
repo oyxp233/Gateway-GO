@@ -316,15 +316,12 @@ func TestPortViewConcurrentReloadAndRead(t *testing.T) {
 	p.Start()
 	defer p.Stop()
 
-	// 频道列表明文在进入并发之前先造好（构造器里用了 t.Fatalf）
-	plain := buildTestChannelList(t,
-		[]string{"#ch.11", "#ch.12"},
-		[]int{10011, 10012},
-		"100.64.0.9")
-
+	// 并发读的对象就是 portView 快照本身。S4A21 频道列改写器已从本分支删除，
+	// 这里不再借它当"读负载发生器"——直接按热路径的真实读法读快照
+	// （backendToPublic 查表），并发不变量（快照不可变 + 原子替换）一条没少。
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	// 模拟多个玩家同时拉频道列表
+	// 模拟多个玩家同时拉频道列表（下行改写必然要查端口视图）
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -335,7 +332,9 @@ func TestPortViewConcurrentReloadAndRead(t *testing.T) {
 					return
 				default:
 				}
-				rewritePlaintextAndFilter(plain, "10.0.0.1", p.ports.Load())
+				v := p.ports.Load()
+				_ = v.backendToPublic[10011]
+				_ = v.backendToPublic[10012]
 			}
 		}()
 	}

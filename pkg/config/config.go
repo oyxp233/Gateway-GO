@@ -51,10 +51,10 @@ type SmtpSection struct {
 
 // GatewayConfig 是网关的全部配置。
 type GatewayConfig struct {
-	Smtp           SmtpSection           `json:"Smtp"`
-	Gateway        GatewaySection        `json:"Gateway"`
-	Database       DatabaseSection       `json:"Database"`
-	GameServer     GameServerSection     `json:"GameServer"`
+	Smtp       SmtpSection       `json:"Smtp"`
+	Gateway    GatewaySection    `json:"Gateway"`
+	Database   DatabaseSection   `json:"Database"`
+	GameServer GameServerSection `json:"GameServer"`
 	// GameServers 是多服模型（2026-10-16 双服改造）：一个网关同时带多个
 	// 游戏服（S4A21 / S5A9-DNF95 …），每个服一套后端地址、端口表、
 	// 频道列改写协议与启动参数模板。
@@ -64,7 +64,7 @@ type GatewayConfig struct {
 	//   规范化后 GameServer 被置为「默认服（第一个启用服）」的内嵌段，
 	//   作为**派生镜像**供老读取方（LaunchArgs 模板等）无缝工作。
 	//   新代码一律用 GameServers，不要读 GameServer。
-	GameServers []GameServerEntry `json:"GameServers"`
+	GameServers    []GameServerEntry     `json:"GameServers"`
 	Pvf            PvfSection            `json:"Pvf"`
 	Launcher       LauncherSection       `json:"Launcher"`
 	Admin          AdminSection          `json:"Admin"`
@@ -393,10 +393,10 @@ func (c *GatewayConfig) DefaultGameServerEntry() GameServerEntry {
 	}
 	// 未规范化：按旧段合成（Id/Protocol 取 legacy 口径）。
 	entry := GameServerEntry{
-		Id:                 ProtocolS4A21,
-		Name:               "S4A21",
-		Protocol:           ProtocolS4A21,
-		GameServerSection:  c.GameServer,
+		Id:                ProtocolS4A21,
+		Name:              "S4A21",
+		Protocol:          ProtocolS4A21,
+		GameServerSection: c.GameServer,
 	}
 	enabled := true
 	entry.Enabled = &enabled
@@ -921,16 +921,16 @@ func DefaultConfig() *GatewayConfig {
 			IdleTimeoutSeconds:           1800,
 			BackendConnectTimeoutSeconds: 10,
 			TcpKeepAliveSeconds:          60,
-		LaunchArgsFormat:             DefaultLaunchArgsFormat,
-		// 缺省关：服务端先具备识别能力后再显式改成 "v1"。
-		ProxyProtocol: "off",
-		// 方案 D 缺省开启、观察模式（凭证不符回退白名单，不新增拒绝路径）。
-		// 确认真实客户端凭证形态后，再把 RequireCredential 置 true 收紧。
-		GamePortAuth: GamePortAuthSection{
-			Enabled:           true,
-			RequireCredential: false,
+			LaunchArgsFormat:             DefaultLaunchArgsFormat,
+			// 缺省关：服务端先具备识别能力后再显式改成 "v1"。
+			ProxyProtocol: "off",
+			// 方案 D 缺省开启、观察模式（凭证不符回退白名单，不新增拒绝路径）。
+			// 确认真实客户端凭证形态后，再把 RequireCredential 置 true 收紧。
+			GamePortAuth: GamePortAuthSection{
+				Enabled:           true,
+				RequireCredential: false,
+			},
 		},
-	},
 		Pvf: PvfSection{
 			// 客户端基准（网关侧保存），相对网关运行目录 ⇒ 默认 /opt/gateway/Data/Pvf/Script.pvf。
 			// ★ 服务端那份在 Server.WorkDir 下（默认识别不到就由运维配 Server.PvfPath），
@@ -1130,7 +1130,17 @@ func (c *GatewayConfig) ShouldServeAdminInProcess() bool {
 }
 
 // SaveOverride 将变更的配置写入 appsettings.override.json。
-// 使用"读 -> 合并 -> 写临时文件 -> 原子替换"策略。
+// 使用"读 -> 深度合并 -> 写临时文件 -> 原子替换"策略。
+//
+// ★★ 必须是**深度**合并（2026-10-19 193 线上事故修复）：
+// 原实现只做顶层键替换（existing[k] = v），于是 updates={"Launcher":{MaxInstances:0}}
+// 会把整个 Launcher 段替换成只剩 MaxInstances —— 同段里这次没有提交的
+// MinVersion / DownloadUrl / UpdateNotice 被静默抹掉。193 生产因此在后台改一次
+// 多开限制后，override 变成 {"Launcher":{"MaxInstances":0}}；网关下次重启读回时
+// min_version 从 2.5.8 掉回主配置 2.0.5、公告被清空 —— 强制更新门槛被无声放松。
+//
+// 段内字段"各自可选"的后台接口（Launcher、RegisterLimit）全都依赖这条合并语义：
+// 后台只提交一个字段时，其余字段必须原样保留。
 func SaveOverride(dir string, updates map[string]interface{}) error {
 	overridePath := filepath.Join(dir, OverrideFileName)
 
@@ -1145,10 +1155,8 @@ func SaveOverride(dir string, updates map[string]interface{}) error {
 		existing = make(map[string]interface{})
 	}
 
-	// 合并
-	for k, v := range updates {
-		existing[k] = v
-	}
+	// 深度合并（段内字段保留，只有本次提交的键被覆盖）
+	mergeOverrideMap(existing, updates)
 
 	// 写临时文件
 	data, err := json.MarshalIndent(existing, "", "  ")
@@ -1163,6 +1171,23 @@ func SaveOverride(dir string, updates map[string]interface{}) error {
 
 	// 原子替换
 	return os.Rename(tmpPath, overridePath)
+}
+
+// mergeOverrideMap 把 src 深度合并进 dst：两边同为 map 的键递归合并，
+// 其余情况（新增键 / 类型不同 / 标量 / null）一律取 src 的值。
+//
+// 不处理数组的元素级合并（当前 override 没有这种用法，需要语义时由调用方
+// 传完整数组，等价于整体替换 —— 这正是期望行为）。
+func mergeOverrideMap(dst, src map[string]interface{}) {
+	for k, v := range src {
+		if sv, ok := v.(map[string]interface{}); ok {
+			if dv, ok := dst[k].(map[string]interface{}); ok {
+				mergeOverrideMap(dv, sv)
+				continue
+			}
+		}
+		dst[k] = v
+	}
 }
 
 // ResolveHttpListenAddress 返回 HTTP 端口的有效监听地址。

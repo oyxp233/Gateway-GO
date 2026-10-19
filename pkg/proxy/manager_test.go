@@ -264,19 +264,23 @@ func TestNewProxyServerS5A95ForcedSettings(t *testing.T) {
 		t.Fatalf("S5A95 应绑定频道口+游戏口两个适配器")
 	}
 
-	// 对照组：非 S5A95 协议不绑任何适配器（只透传），且不被强制改写 ProxyProtocol。
-	// S4A21 的频道列适配器已从本分支删除，配置里出现别的协议时行为是"能连但地址不改写"。
+	// 对照组：S4A21 只绑频道口适配器（0x12 频道列改写），游戏口纯透传。
+	//
+	// ★ 这里曾经断言"非 S5A9 一律不绑适配器"，是随 S5A9 独立分支删除 S4A21
+	// 适配器时一起写下的错误预期。后果：193 生产（S4A21 服）升级后频道列表
+	// 原样透传，客户端显示全部频道、点进去连后端真实地址全部失败。
+	// 协议不支持 ≠ 可以静默透传 —— 凡是本网关承载的协议都必须绑。
 	other := cfg.GameServers[0]
 	other.ProxyProtocol = "v1"
 	srvOther := NewProxyServer(cfg, other, nil, lg, nil, nil)
 	if srvOther.profile.ProxyProtocol != "v1" {
 		t.Fatalf("非 S5A95 服的 ProxyProtocol 不应被改动，实际 %q", srvOther.profile.ProxyProtocol)
 	}
-	if srvOther.channelAdapter != nil {
-		t.Fatalf("非 S5A95 服不应绑频道适配器")
+	if srvOther.channelAdapter == nil {
+		t.Fatalf("S4A21 服必须绑频道适配器（否则频道列表地址不被改写，玩家进不去频道）")
 	}
 	if srvOther.gameAdapter != nil {
-		t.Fatalf("非 S5A95 服不应绑游戏口适配器")
+		t.Fatalf("S4A21 游戏口无需适配器（游戏口纯透传）")
 	}
 }
 

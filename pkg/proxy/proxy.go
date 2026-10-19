@@ -246,11 +246,20 @@ func NewProxyServer(
 
 	// 下行适配器按协议绑定（差异全部收在适配层，热路径无分支）。
 	//
-	// S5A9 独立分支（2026-10-17）：S4A21 的频道列适配器已随 S4A21 客户端一起
-	// 删除，本分支只认 ProtocolS5A95。其余协议一律不绑适配器 —— 转发仍是纯透传
-	// （能连、能登录，但频道列表里的地址不会被改写成网关公网值），并显式告警：
+	// 两种协议都必须绑频道适配器：网关靠它把频道列表里的 IP/端口改写成
+	// 自己的公网值。没绑 = 明文透传后端真实地址 —— 客户端会显示「全部
+	// 频道」（后端整张表都在），但点进去连的是内网/非公开端口，一律失败。
+	//
+	//   S4A21（193 生产口径）：0x12 频道列，日密钥 + zlib + AES-128-ECB，
+	//     游戏口无需改写，只绑 channelAdapter。
+	//   S5A95：op18 Directory（固定密钥）+ 游戏口 LOGIN 内嵌 Endpoint，
+	//     两个适配器都要绑。
+	//
+	// 其余未知协议一律不绑 —— 转发仍是纯透传，并显式告警：
 	// 静默透传是以前"配错协议也能启动、进游戏才发现连不上"的根源。
 	switch profile.Protocol {
+	case config.ProtocolS4A21:
+		srv.channelAdapter = NewS4A21ChannelAdapter(profile, &srv.ports, logger)
 	case config.ProtocolS5A95:
 		srv.channelAdapter = NewS5A95ChannelAdapter(profile.PublicIP, &srv.ports, logger)
 		srv.gameAdapter = NewS5A95GameAdapter(profile.PublicIP, &srv.ports, logger)
@@ -258,8 +267,8 @@ func NewProxyServer(
 		// logger 可为 nil（单测直构 ProxyServer 时不传），告警前先判空。
 		if logger != nil {
 			logger.Warn(fmt.Sprintf(
-				"游戏服 %q 协议 %q 无下行适配器（本分支只支持 %s）：频道列表地址将按原样透传，客户端会连到后端真实地址",
-				profile.Id, profile.Protocol, config.ProtocolS5A95))
+				"游戏服 %q 协议 %q 无下行适配器（只支持 %s / %s）：频道列表地址将按原样透传，客户端会连到后端真实地址",
+				profile.Id, profile.Protocol, config.ProtocolS4A21, config.ProtocolS5A95))
 		}
 	}
 	return srv

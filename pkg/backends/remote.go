@@ -305,8 +305,8 @@ func (b *RemoteRuntimeConfigBackend) Launcher() (httprouter.LauncherView, error)
 	return resp.Launcher, nil
 }
 
-func (b *RemoteRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateNotice *string) (bool, error) {
-	if minVersion == nil && downloadURL == nil && updateNotice == nil {
+func (b *RemoteRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateNotice *string, maxInstances *int) (bool, error) {
+	if minVersion == nil && downloadURL == nil && updateNotice == nil && maxInstances == nil {
 		return false, nil
 	}
 	body := map[string]interface{}{
@@ -314,6 +314,7 @@ func (b *RemoteRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, update
 			"min_version":   minVersion,
 			"download_url":  downloadURL,
 			"update_notice": updateNotice,
+			"max_instances": maxInstances,
 		},
 	}
 	var resp struct {

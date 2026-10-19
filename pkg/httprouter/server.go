@@ -835,6 +835,7 @@ func (s *Server) handleInternalRuntimeConfigSet(w http.ResponseWriter, r *http.R
 			MinVersion   *string `json:"min_version"`
 			DownloadURL  *string `json:"download_url"`
 			UpdateNotice *string `json:"update_notice"`
+			MaxInstances *int    `json:"max_instances"`
 		} `json:"launcher"`
 		Maintenance *struct {
 			Enabled       *bool    `json:"enabled"`
@@ -857,7 +858,7 @@ func (s *Server) handleInternalRuntimeConfigSet(w http.ResponseWriter, r *http.R
 
 	changed := false
 	if body.Launcher != nil {
-		c, err := s.runtime.SetLauncher(body.Launcher.MinVersion, body.Launcher.DownloadURL, body.Launcher.UpdateNotice)
+		c, err := s.runtime.SetLauncher(body.Launcher.MinVersion, body.Launcher.DownloadURL, body.Launcher.UpdateNotice, body.Launcher.MaxInstances)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
 			return
@@ -2894,6 +2895,7 @@ func (s *Server) handleAdminLauncherConfigGet(w http.ResponseWriter, r *http.Req
 		"ok": true, "min_version": lv.MinVersion,
 		"download_url":  lv.DownloadURL,
 		"update_notice": lv.UpdateNotice,
+		"max_instances": lv.MaxInstances,
 		"override_file": config.OverrideFileName,
 	})
 }
@@ -2907,6 +2909,7 @@ func (s *Server) handleAdminLauncherConfigPost(w http.ResponseWriter, r *http.Re
 		MinVersion   *string `json:"min_version"`
 		DownloadUrl  *string `json:"download_url"`
 		UpdateNotice *string `json:"update_notice"`
+		MaxInstances *int    `json:"max_instances"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "参数错误"})
@@ -2915,11 +2918,17 @@ func (s *Server) handleAdminLauncherConfigPost(w http.ResponseWriter, r *http.Re
 
 	// 交给运行时配置后端：它负责"改内存 + 落盘 override"，且必须作用在
 	// **网关进程**的内存上（版本门禁由网关执行），否则后台改了不生效。
-	changed, err := s.runtime.SetLauncher(body.MinVersion, body.DownloadUrl, body.UpdateNotice)
+	changed, err := s.runtime.SetLauncher(body.MinVersion, body.DownloadUrl, body.UpdateNotice, body.MaxInstances)
 	if err != nil {
 		s.logger.Error(fmt.Sprintf("[Admin] Launcher 配置更新失败: %v", err))
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"ok": false, "message": "配置写入失败",
+		// 值域错误是**用户输入问题**，回 400 并原样透出原因（同 heartbeat / register-limit）。
+		// 后台按 400 才能在输入框旁提示"取值必须在 0~32 之间"，而不是弹一个含糊的失败。
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "取值必须在") {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]interface{}{
+			"ok": false, "message": err.Error(),
 		})
 		return
 	}

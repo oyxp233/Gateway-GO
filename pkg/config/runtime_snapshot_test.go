@@ -16,14 +16,14 @@ func cfgBoolPtr(b bool) *bool    { return &b }
 // 与「随后的写入」互不影响 —— 这正是"锁内拷出一份一致的值"的行为特征。
 func TestLauncherSnapshotIsIsolated(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.SetLauncherRuntime(cfgStrPtr("1.0.0"), cfgStrPtr("http://a/"), cfgStrPtr("notice-1"))
+	cfg.SetLauncherRuntime(cfgStrPtr("1.0.0"), cfgStrPtr("http://a/"), cfgStrPtr("notice-1"), nil)
 
 	snap := cfg.LauncherSnapshot()
 	if snap.MinVersion != "1.0.0" || snap.DownloadUrl != "http://a/" || snap.UpdateNotice != "notice-1" {
 		t.Fatalf("快照内容不符: %+v", snap)
 	}
 
-	cfg.SetLauncherRuntime(cfgStrPtr("2.0.0"), nil, nil)
+	cfg.SetLauncherRuntime(cfgStrPtr("2.0.0"), nil, nil, nil)
 	if snap.MinVersion != "1.0.0" {
 		t.Fatalf("已取出的快照被后续写入污染: %s", snap.MinVersion)
 	}
@@ -36,7 +36,7 @@ func TestLauncherSnapshotIsIsolated(t *testing.T) {
 	}
 
 	// 传 nil 不改动任何字段。
-	cfg.SetLauncherRuntime(nil, nil, nil)
+	cfg.SetLauncherRuntime(nil, nil, nil, nil)
 	if cfg.LauncherSnapshot().MinVersion != "2.0.0" {
 		t.Fatal("全 nil 调用不应改动配置")
 	}
@@ -86,7 +86,7 @@ func TestRuntimeConfigConcurrentAccess(t *testing.T) {
 				return
 			default:
 				cfg.SetMaintenanceRuntime(cfgBoolPtr(true), cfgStrPtr("m"), []string{"a", "b"})
-				cfg.SetLauncherRuntime(cfgStrPtr("9.9.9"), cfgStrPtr("u"), cfgStrPtr("n"))
+				cfg.SetLauncherRuntime(cfgStrPtr("9.9.9"), cfgStrPtr("u"), cfgStrPtr("n"), nil)
 			}
 		}
 	}()

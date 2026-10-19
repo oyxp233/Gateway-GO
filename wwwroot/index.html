@@ -1310,6 +1310,19 @@
                         placeholder="示例：&#10;· 9/25 02:00 停机更新版本，请提前下线&#10;· 国庆活动开启：双倍经验 + 掉落提升&#10;· 修复：组队进入副本偶发卡加载"></textarea>
                 </div>
 
+                <h3>多开限制</h3>
+                <p class="muted">
+                    限制<b>同一台机器</b>能同时开启几个登录器（按 Windows 会话计数，同机换用户再开也会计入）。
+                    执行发生在登录器启动时：实例数达到上限后，再打开的登录器会直接提示并退出。
+                    <b>填 0 或留空 = 不限制</b>（与未配置时行为一致）。
+                    上限调大立即生效；<b>上限调小只对之后启动的登录器生效</b>，已在运行的不受影响。
+                </p>
+                <div class="row">
+                    <label>单机登录器数量上限</label>
+                    <input type="number" id="maxInstances" min="0" max="32" step="1" placeholder="0" style="width: 100px;">
+                    <span class="muted">0 = 不限制，最大 32</span>
+                </div>
+
                 <div class="row">
                     <button class="btn" onclick="saveLauncherConfig()">保存</button>
                     <button class="btn" onclick="loadLauncherConfig()">刷新</button>
@@ -4763,16 +4776,31 @@
             document.getElementById('minVersion').value = data.min_version || '';
             document.getElementById('downloadUrl').value = data.download_url || '';
             document.getElementById('updateNotice').value = data.update_notice || '';
+            // 0 = 不限制。后端缺省就是 0，显示空串比显示 0 更贴近"没配"的语义。
+            document.getElementById('maxInstances').value =
+                (data.max_instances === undefined || data.max_instances === null || data.max_instances === 0)
+                    ? '' : data.max_instances;
             setText('launcherOverride', data.override_file ? `覆盖文件：${data.override_file}` : '');
         }
 
         async function saveLauncherConfig() {
             const notice = document.getElementById('updateNotice').value;
-            await api('/api/admin/launcher-config', 'POST', {
+            // 空串按 0 发送（= 不限制）；NaN/越界交给后端 400，这里不预清洗，
+            // 否则"输入了 99"会被悄悄存成 32，用户以为自己配上了。
+            const rawMax = document.getElementById('maxInstances').value.trim();
+            let maxInstances = 0;
+            if (rawMax !== '') {
+                maxInstances = Number(rawMax);
+                if (!Number.isInteger(maxInstances)) { alert('多开上限必须是整数（0 = 不限制）'); return; }
+            }
+            const data = await api('/api/admin/launcher-config', 'POST', {
                 min_version: document.getElementById('minVersion').value,
                 download_url: document.getElementById('downloadUrl').value,
-                update_notice: notice
+                update_notice: notice,
+                max_instances: maxInstances
             });
+            if (!data) return;
+            if (data.ok === false) { alert('保存失败：' + (data.message || '未知错误')); return; }
             alert(notice.trim()
                 ? '保存成功，登录器「更新内容」已同步'
                 : '保存成功（更新公告为空，登录器将显示「暂无更新公告」）');

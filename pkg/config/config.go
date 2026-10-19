@@ -113,7 +113,7 @@ func (c *GatewayConfig) MaintenanceSnapshot() MaintenanceSection {
 }
 
 // SetLauncherRuntime 在锁内更新 Launcher 段的运行时可变字段（传 nil = 不改该项）。
-func (c *GatewayConfig) SetLauncherRuntime(minVersion, downloadURL, updateNotice *string) {
+func (c *GatewayConfig) SetLauncherRuntime(minVersion, downloadURL, updateNotice *string, maxInstances *int) {
 	c.runtimeMu.Lock()
 	defer c.runtimeMu.Unlock()
 	if minVersion != nil {
@@ -124,6 +124,9 @@ func (c *GatewayConfig) SetLauncherRuntime(minVersion, downloadURL, updateNotice
 	}
 	if updateNotice != nil {
 		c.Launcher.UpdateNotice = *updateNotice
+	}
+	if maxInstances != nil {
+		c.Launcher.MaxInstances = *maxInstances
 	}
 }
 
@@ -665,6 +668,23 @@ type LauncherSection struct {
 	// 登录器据此跳过全部检查逻辑 —— 自更新出问题时的**一键回滚开关**，
 	// 改 appsettings.json + 重启即可，不动任何已分发文件。
 	UpdateEnabled *bool `json:"UpdateEnabled"`
+
+	// MaxInstances 是单台机器允许同时运行的登录器实例数上限（2026-10-19）。
+	//
+	// 执行方在**登录器侧**：每个实例启动时抢占一个命名互斥体槽位
+	// （Global\S4A21-Launcher-Slot-1..N），抢不到即弹窗退出。
+	//
+	// 语义边界（改动前务必读）：
+	//   - **0（缺省）= 不限制**。老 appsettings.json 没有这个键，Go 零值
+	//     就是 0 —— 未配置时行为与改造前完全一致，不误伤现有双开玩家；
+	//     管理员在后台填 N（1~32）才对之后启动的实例生效。
+	//   - 调大立即生效；**调小只对之后启动的实例生效**，运行中的实例不追溯
+	//     （实例数已在旧上限内合法启动，强退会误伤玩家）。
+	//   - 「单台机器」= 本机所有 Windows 会话/用户（Global\ 命名空间），
+	//     同机换用户再开一个也计数。
+	//   - 定位是**提高多开成本**，不是绝对封死：槽位机制对重命名 exe 无效
+	//     （槽名编译在登录器里），但改动过的登录器不在本文档覆盖范围内。
+	MaxInstances int `json:"MaxInstances"`
 }
 
 // LauncherUpdateEnabled 返回登录器自更新总开关的生效值（缺省视为开）。

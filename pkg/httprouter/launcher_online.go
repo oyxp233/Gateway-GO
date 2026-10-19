@@ -35,9 +35,12 @@ func (s *Server) handleLauncherNotice(w http.ResponseWriter, r *http.Request) {
 		"ok":            true,
 		"update_notice": notice,
 		// 一并带上版本策略，登录器可以只发一次请求拿到全部展示所需信息
-		"min_version":  lz.MinVersion,
+		"min_version": lz.MinVersion,
 		"download_url": lz.DownloadUrl,
-		"server_time":  time.Now().UTC().Unix(),
+		// 单机多开上限（2026-10-19）。0 = 不限制；键缺失（老网关）时登录器
+		// 同样按不限制处理 —— 与配置缺省语义一致。
+		"max_instances": lz.MaxInstances,
+		"server_time":   time.Now().UTC().Unix(),
 	})
 }
 

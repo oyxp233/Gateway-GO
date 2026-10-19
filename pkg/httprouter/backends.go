@@ -145,6 +145,9 @@ type LauncherView struct {
 	MinVersion   string `json:"min_version"`
 	DownloadURL  string `json:"download_url"`
 	UpdateNotice string `json:"update_notice"`
+	// MaxInstances 单机多开上限（0 = 不限制）。json tag 同时被内部 API 与
+	// 远端后端复用，加字段时只改这一处，不会出现「内部 API 返回了、远端没接」。
+	MaxInstances int `json:"max_instances"`
 }
 
 // RegisterLimitView 注册限额的当前状态（2026-10-13）。
@@ -181,7 +184,7 @@ type HeartbeatView struct {
 type RuntimeConfigBackend interface {
 	Launcher() (LauncherView, error)
 	// SetLauncher 更新登录器配置（nil 表示该字段不动），返回是否有变更。
-	SetLauncher(minVersion, downloadURL, updateNotice *string) (changed bool, err error)
+	SetLauncher(minVersion, downloadURL, updateNotice *string, maxInstances *int) (changed bool, err error)
 
 	Maintenance() (MaintenanceView, error)
 	// SetMaintenance 更新维护模式；开启时踢掉非管理员会话并返回被踢数量。
@@ -368,10 +371,11 @@ func (b *localRuntimeConfigBackend) Launcher() (LauncherView, error) {
 		MinVersion:   snap.MinVersion,
 		DownloadURL:  snap.DownloadUrl,
 		UpdateNotice: snap.UpdateNotice,
+		MaxInstances: snap.MaxInstances,
 	}, nil
 }
 
-func (b *localRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateNotice *string) (bool, error) {
+func (b *localRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateNotice *string, maxInstances *int) (bool, error) {
 	if b.cfg == nil {
 		return false, fmt.Errorf("配置未加载")
 	}
@@ -387,8 +391,19 @@ func (b *localRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateN
 	if updateNotice != nil {
 		launcherUpdates["UpdateNotice"] = *updateNotice
 	}
+	if maxInstances != nil {
+		launcherUpdates["MaxInstances"] = *maxInstances
+	}
 	if len(launcherUpdates) == 0 {
 		return false, nil
+	}
+
+	// ★ 值域校验放在落盘**之前**（同 SetRegisterLimit / SetHeartbeat 的理由）：
+	// 离谱的值一旦写进 override 文件，下次启动会被原样读回，重启也修不好。
+	// 0 是合法值（= 不限制）；上限 32 是因为登录器侧每个上限值对应一个
+	// 命名互斥体槽位，启动时要探测 1..N —— 32 已经是荒谬的多开数。
+	if maxInstances != nil && (*maxInstances < 0 || *maxInstances > 32) {
+		return false, fmt.Errorf("MaxInstances 取值必须在 0~32 之间（0 = 不限制）")
 	}
 
 	updates := map[string]interface{}{"Launcher": launcherUpdates}
@@ -401,7 +416,7 @@ func (b *localRuntimeConfigBackend) SetLauncher(minVersion, downloadURL, updateN
 	// 和 HTTP 侧（policy/notice）的并发读构成数据竞争。改走锁内原语。
 	// 顺序也调整为「先落盘、成功后再更新内存」—— 落盘失败时不留下"内存已改、
 	// 重启还原"的不一致状态。
-	b.cfg.SetLauncherRuntime(minVersion, downloadURL, updateNotice)
+	b.cfg.SetLauncherRuntime(minVersion, downloadURL, updateNotice, maxInstances)
 	return true, nil
 }
 
@@ -596,7 +611,7 @@ func NewUnavailableRuntimeConfigBackend(reason string) RuntimeConfigBackend {
 func (b *unavailableRuntimeConfigBackend) Launcher() (LauncherView, error) {
 	return LauncherView{}, fmt.Errorf("运行时配置不可用：%s", b.reason)
 }
-func (b *unavailableRuntimeConfigBackend) SetLauncher(*string, *string, *string) (bool, error) {
+func (b *unavailableRuntimeConfigBackend) SetLauncher(*string, *string, *string, *int) (bool, error) {
 	return false, fmt.Errorf("运行时配置不可用：%s", b.reason)
 }
 func (b *unavailableRuntimeConfigBackend) Maintenance() (MaintenanceView, error) {

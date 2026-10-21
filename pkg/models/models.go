@@ -81,6 +81,11 @@ type ErrorCode struct {
 	DecodeFailed           int
 	BodyTooLarge           int
 	DatabaseError          int
+	// AccountUpstream（5002）表示 S5A3 模式下"上游账号服务不可用"：
+	// 连不上 / 超时 / 返回体解析失败。与 DatabaseError 分开是因为
+	// 排查动作完全不同 —— 前者看 S5A3 的 DNFBRIDGE_ACCOUNT_API_LISTEN
+	// 与 /api/status，后者看网关自己的 SQLite。
+	AccountUpstream int
 	// ── QQ 号绑定（1024~1035，2026-09-24）─────────────────────────────
 	//
 	// 为什么分这么细：这些码是后台排查这类问题时的**唯一线索**。
@@ -162,6 +167,7 @@ var Err = ErrorCode{
 	DecodeFailed:             3005,
 	BodyTooLarge:             3009,
 	DatabaseError:            5001,
+	AccountUpstream:          5002,
 }
 
 // GatewayRequest 是 TCP 帧协议中的请求体。
@@ -169,6 +175,21 @@ type GatewayRequest struct {
 	Cmd             string  `json:"cmd"`
 	Account         *string `json:"account,omitempty"`
 	PasswordMd5     *string `json:"password_md5,omitempty"`
+	// Password 是**明文**密码，只有 S5A3 服使用（2026-10-22 S5A3 分支）。
+	//
+	// 为什么必须有第二条密码通道：S5A3 的账号 API
+	// （POST /api/account/login，{"account","password"}）收明文，
+	// 服务端自己 bcrypt；而网关只拿得到登录器上报的 32 位 MD5，
+	// MD5 不可逆，转不出明文。
+	//
+	// 所以 S5A3 模式的登录器必须发这个字段而不是 password_md5。
+	// S4A21 / S5A95 服**完全不读它** —— 那两个服的账号在网关 SQLite 里，
+	// 校验走 password_md5，多一个明文字段不会有任何行为变化。
+	//
+	// ★ 安全边界：明文密码只允许在 TLS 通道上传输（登录器侧
+	// LauncherTlsConfig 决定）。S5A3 模式下若走明文 TCP，密码在
+	// 网络上就是可读的 —— 部署到公网必须开 TLS。
+	Password        *string `json:"password,omitempty"`
 	OldPwdMd5       *string `json:"old_pwd_md5,omitempty"`
 	NewPwdMd5       *string `json:"new_pwd_md5,omitempty"`
 	Token           *string `json:"token,omitempty"`
@@ -235,6 +256,30 @@ type GatewayResponse struct {
 	// 登录成功时一并下发：登录器据此直接显示绑定状态，
 	// 不用为"查有没有绑"多发一次往返。
 	QQNumber *string `json:"qq_number,omitempty"`
+
+	// Gates 是本服该跑哪几道客户端门禁，**随登录成功一起下发**（2026-10-21）。
+	//
+	// 为什么不复用 /api/launcher/policy 的 gates：那条链路要求"策略拉取成功"，
+	// 而策略拉取失败在登录器里是**直接阻止启动**的。S5A3 这种一道门禁都不跑的服，
+	// 却因为拉不到一份用不上的白名单而进不去游戏，纯属自伤。挂在这里之后，
+	// 登录器拿到登录响应就知道该跳过哪些门禁，策略请求可以按需省略。
+	//
+	// 缺省（字段不出现）= 老网关，登录器按"全开"处理（fail-closed）。
+	Gates *GateBlock `json:"gates,omitempty"`
+}
+
+// GateBlock 是登录响应里的门禁开关（与 /api/launcher/policy 的 gates 段同形）。
+type GateBlock struct {
+	// Policy 拉安全策略（黑白名单 + 驱动白名单）。
+	Policy bool `json:"policy"`
+	// Pvf 整文件 PVF 校验 + 增量更新 + 运行期锁。
+	Pvf bool `json:"pvf"`
+	// Plugins 受管插件同步（DLL 强管控）。
+	Plugins bool `json:"plugins"`
+	// Integrity 客户端完整性扫描。
+	Integrity bool `json:"integrity"`
+	// Kernel 内核 / 易语言环境扫描。
+	Kernel bool `json:"kernel"`
 }
 
 // RoleInfo 表示游戏角色的简要信息。

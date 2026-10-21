@@ -183,6 +183,17 @@ func main() {
 	}
 	log.Info(fmt.Sprintf("[Proxy] 多服代理已启动: %s", proxyMgr.Summary()))
 
+	// S5A3 组队 UDP 中继（2026-10-21）。
+	//
+	// 只对 Protocol=s5a3 且显式配了 PartyUDPPorts 的服生效；其余服
+	// 一条监听都不开，行为与改造前完全一致。S5A3 服务端按"观察到的
+	// 源地址"记玩家端点，所以网关必须为每个客户端单独开一个后端
+	// socket（详见 pkg/proxy/udp_relay.go 文件头）。
+	udpRelays := proxy.StartUDPRelays(cfg, log)
+	if udpRelays.Count() > 0 {
+		log.Info(fmt.Sprintf("[UDP] 组队中继共启用 %d 个服", udpRelays.Count()))
+	}
+
 	// HTTP 服务器
 	//
 	// 后端注入：网关进程用 local 实现 —— 直接操作本进程的内存
@@ -272,6 +283,7 @@ func main() {
 	log.Info(fmt.Sprintf("收到信号 %v，正在关闭...", sig))
 
 	close(done)
+	udpRelays.Stop()
 	proxyMgr.Stop()
 	authServer.Stop()
 	log.Close()

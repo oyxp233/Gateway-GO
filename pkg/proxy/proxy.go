@@ -192,6 +192,18 @@ func NewProxyServer(
 		profile.GamePortAuth.Enabled = false
 	}
 
+	// S5A3（DNF90 / ServerS5A3）同理，但原因不同：
+	//  1. PROXY protocol 关 —— S5A3 服务端按自己的 class0/class1 包头解析，
+	//     不认 PROXY 头，发了会让所有玩家在首包就被判成垃圾帧；
+	//  2. 方案 D 首包凭证关 —— parseGameLoginPacket 解的是 S4A21 的
+	//     14 字节 GamePacketHeader，S5A3 的登录包是 13+602 字节的
+	//     class1/op1，形状完全不同。S5A3 的准入由服务端自己用
+	//     de509f65 令牌校验，网关不再插一道。
+	if profile.Protocol == config.ProtocolS5A3 {
+		profile.ProxyProtocol = "off"
+		profile.GamePortAuth.Enabled = false
+	}
+
 	// 初始视图先按 appsettings 建好；Start() 会用端口表覆盖它。
 	// 这样即使退回 appsettings 分支，频道列表过滤也有正确判据。
 	initialView := buildPortViewFromResolved(gamePortMap)
@@ -263,6 +275,13 @@ func NewProxyServer(
 	case config.ProtocolS5A95:
 		srv.channelAdapter = NewS5A95ChannelAdapter(profile.PublicIP, &srv.ports, logger)
 		srv.gameAdapter = NewS5A95GameAdapter(profile.PublicIP, &srv.ports, logger)
+	case config.ProtocolS5A3:
+		// S5A3 绑一个"什么都不改"的适配器，而不是不绑。
+		//
+		// 不绑会让下面的 default 分支打出"无下行适配器"的告警，而 S5A3
+		// 恰恰是**不需要**改写的协议（频道表由服务端下发，见
+		// adapter_s5a3.go）。绑一个显式的透传实现，日志语义才正确。
+		srv.channelAdapter = NewS5A3PassthroughAdapter()
 	default:
 		// logger 可为 nil（单测直构 ProxyServer 时不传），告警前先判空。
 		if logger != nil {

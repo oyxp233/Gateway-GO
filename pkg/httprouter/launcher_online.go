@@ -23,6 +23,42 @@ import (
 // launcherOnlineCacheTTL 是在线角色响应的缓存窗口。
 const launcherOnlineCacheTTL = 5 * time.Second
 
+// launcherServerInfo 是公开接口下发的服清单条目。
+//
+// 只给 id / name / protocol 三个字段：
+//   - id      登录器把它和自己配置里的 GameProfile.Id 对齐；
+//   - name    界面展示（运营改名不用发登录器）；
+//   - protocol  登录器**发密码前**必须知道的事（见下）。
+//
+// ★ 为什么要公开 protocol（2026-10-21）：
+// S5A3 的账号 API 收**明文密码**，S4A21/S5A95 只收 MD5。登录器不能对所有服
+// 都发明文（那等于给老服降级），也不能都不发（S5A3 登不进去）。它必须在发
+// 登录请求之前就知道这一服的协议，而此刻它还没有 token、拿不到 policy。
+// 所以把协议放进这个免鉴权的公告响应里 —— 登录器启动时本来就拉它。
+type launcherServerInfo struct {
+	Id       string `json:"id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+}
+
+// launcherServers 返回启用服清单（保持配置顺序）。
+//
+// 只列**启用**的服：停用服登录会被 1039 拒，没必要让玩家在列表里选到它。
+func (s *Server) launcherServers() []launcherServerInfo {
+	out := make([]launcherServerInfo, 0, len(s.config.GameServers))
+	for _, entry := range s.config.GameServers {
+		if !entry.IsEnabled() {
+			continue
+		}
+		out = append(out, launcherServerInfo{
+			Id:       entry.Id,
+			Name:     entry.Name,
+			Protocol: entry.Protocol,
+		})
+	}
+	return out
+}
+
 // handleLauncherNotice 下发登录器「更新内容」区展示的更新公告。
 //
 // 配置源是网关进程内存里的 config.Launcher.UpdateNotice（管理后台「客户端配置」页维护），
@@ -40,7 +76,9 @@ func (s *Server) handleLauncherNotice(w http.ResponseWriter, r *http.Request) {
 		// 单机多开上限（2026-10-19）。0 = 不限制；键缺失（老网关）时登录器
 		// 同样按不限制处理 —— 与配置缺省语义一致。
 		"max_instances": lz.MaxInstances,
-		"server_time":   time.Now().UTC().Unix(),
+		// 启用服清单（含协议）：登录器据此决定用明文还是 MD5 上报密码。
+		"servers":     s.launcherServers(),
+		"server_time": time.Now().UTC().Unix(),
 	})
 }
 

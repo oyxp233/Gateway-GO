@@ -604,7 +604,10 @@ func containsStr(list []string, s string) bool {
 // {digest} 只对 S5A95（DNF95）服的模板有意义：DNF95 客户端把第 5 段当
 // 登录凭证发给游戏服务端。S4A21 模板没有它，digest 传空串时
 // replaceAll 自然不命中任何文本。
-var SupportedLaunchArgsPlaceholders = []string{"{ip}", "{port}", "{m_id}", "{token}", "{digest}"}
+//
+// {initial_game_port} 只对 S5A3 服的模板有意义（启动串第 4 段）。
+// 其余模板没有它，替换同样不命中。
+var SupportedLaunchArgsPlaceholders = []string{"{ip}", "{port}", "{m_id}", "{token}", "{digest}", "{initial_game_port}"}
 
 // DefaultLaunchArgsFormat 启动参数模板的代码默认值，转发自 config 包，
 // 保证“配置默认值”与“启动校验基准”只有一份真相。
@@ -637,6 +640,9 @@ func (s *AccountService) buildLaunchArgs(profile config.GameServerEntry, mId, to
 	result = replaceAll(result, "{m_id}", mId)
 	result = replaceAll(result, "{token}", token)
 	result = replaceAll(result, "{digest}", digest)
+	// S5A3 启动串第 4 段。0 = 让客户端自己从 CHANNELINFO 挑频道端口，
+	// 与 S5A3 本地一键端（deploy/windows/local_client.py 填 0）一致。
+	result = replaceAll(result, "{initial_game_port}", fmt.Sprintf("%d", profile.InitialGamePort))
 
 	return result
 }

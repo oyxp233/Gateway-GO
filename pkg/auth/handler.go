@@ -100,10 +100,35 @@ func (h *Handler) Handle(req *models.GatewayRequest, clientIP string) (*models.G
 func (h *Handler) handleRegister(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
 	account := deref(req.Account, "")
 	passwordMd5 := deref(req.PasswordMd5, "")
+	gameId := strings.TrimSpace(deref(req.Game, ""))
 
 	if clientIP == "" {
 		clientIP = "unknown"
 	}
+
+	// S5A3 服：账号在服务端 MySQL，注册直接转给它的 HTTP 账号 API。
+	// 见 pkg/service/s5a3_account.go 的 RegisterS5A3。
+	if h.isS5A3Server(gameId) {
+		password := deref(req.Password, "")
+		// 明文密码字段只有认识 S5A3 的登录器才会填（见 launcher 的
+		// ServerProtocols）。空值说明是旧登录器，给出可执行的提示，
+		// 而不是让它带着空密码去撞服务端、最后回报"密码错误"。
+		if password == "" {
+			return failureResponse(req.Cmd, models.Err.AccountUpstream,
+				"该服要求登录器上报明文密码，请使用支持 S5A3 的登录器版本")
+		}
+		code, msg := h.accountSvc.RegisterS5A3(account, password, gameId)
+		if code == models.Err.Ok {
+			// 注册奖励由 S5A3 自己在同一事务里落库
+			// （signupbenefits.CaptureSignup），网关再发一份就是双发。
+			return successResponse(req.Cmd, "注册成功")
+		}
+		if msg == "" {
+			msg = errorMessages[code]
+		}
+		return failureResponse(req.Cmd, code, msg)
+	}
+
 	// 机器码来自登录器上报（首个物理网卡 MAC）。老登录器不带 ⇒ 空串 ⇒
 	// 注册限额跳过机器维度，只按 IP 判。见 models.GatewayRequest.MachineId。
 	machineID := deref(req.MachineId, "")
@@ -120,6 +145,18 @@ func (h *Handler) handleRegister(req *models.GatewayRequest, clientIP string) *m
 	return failureResponse(req.Cmd, code, msg)
 }
 
+// isS5A3Server 判断选中的服是不是 S5A3（Protocol == s5a3）。
+//
+// 空 gameId = 默认服，所以单服部署时把唯一那个服配成 s5a3 即可，
+// 老登录器不带 game 字段也能正确路由。
+func (h *Handler) isS5A3Server(gameId string) bool {
+	if h.config == nil {
+		return false
+	}
+	profile, found := h.config.FindGameServer(gameId)
+	return found && profile.Protocol == config.ProtocolS5A3
+}
+
 func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *models.GatewayResponse {
 	account := deref(req.Account, "")
 	passwordMd5 := deref(req.PasswordMd5, "")
@@ -129,6 +166,12 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 
 	if clientIP == "" {
 		clientIP = "unknown"
+	}
+
+	// S5A3 服走独立分支：账号校验与启动令牌都由服务端负责，
+	// 网关只做翻译与会话登记。见 handleLoginS5A3。
+	if h.isS5A3Server(gameId) {
+		return h.handleLoginS5A3(req, clientIP, gameId)
 	}
 
 	// ★ QQ 号识别（2026-09-24）：登录框「账号名 / QQ 号」两个都能进。
@@ -216,6 +259,7 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	resp.DeviceSecret = strPtr(result.DeviceSecret)
 	resp.DeviceChanged = boolPtr(result.DeviceChanged)
 	resp.LaunchArgs = strPtr(result.LaunchArgs)
+	resp.Gates = h.gatesFor(gameId)
 	// 已绑定的 QQ 号一并下发：登录器据此直接显示绑定状态，不用多一次往返。
 	// 注意这里的 account 已经是翻译后的**真实账号名**。
 	if h.qqBindSvc != nil {
@@ -226,10 +270,73 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	return resp
 }
 
+// handleLoginS5A3 是 S5A3 服的登录分支。
+//
+// 与 S4A21 路径的三点差别：
+//
+//  1. 密码走**明文** `password` 字段（S5A3 账号 API 收明文），不是 password_md5；
+//  2. 启动令牌由 S5A3 签发，原样进 launch_args —— 网关自己的
+//     GenerateToken() 结果不能替代（服务端会拒）；
+//  3. 不做 QQ 号翻译、设备绑定、封禁检查：这些数据都在网关 SQLite 里，
+//     S5A3 账号在那边没有行。S5A3 侧的封禁/限流由服务端自己负责。
+//
+// 会话仍然登记在网关内存里（心跳、后台在线统计要用），但用的是网关自己的
+// 会话令牌，与启动串里的 S5A3 令牌是两个东西 —— 与 S4A21 的现状一致。
+func (h *Handler) handleLoginS5A3(req *models.GatewayRequest, clientIP, gameId string) *models.GatewayResponse {
+	account := deref(req.Account, "")
+	password := deref(req.Password, "")
+
+	// 与注册同理：空明文密码 = 旧登录器。直接说清原因，别让玩家以为号被盗了。
+	if password == "" {
+		return failureResponse(req.Cmd, models.Err.AccountUpstream,
+			"该服要求登录器上报明文密码，请使用支持 S5A3 的登录器版本")
+	}
+
+	result := h.accountSvc.LoginS5A3(account, password, gameId)
+	if result.ErrorCode != models.Err.Ok {
+		msg := errorMessages[result.ErrorCode]
+		if result.Message != nil && *result.Message != "" {
+			msg = *result.Message
+		}
+		return failureResponse(req.Cmd, result.ErrorCode, msg)
+	}
+
+	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, "", gameId, false)
+	if err != nil {
+		h.logger.Error(fmt.Sprintf("S5A3 登录创建会话失败: 账号=%s IP=%s: %v", account, clientIP, err))
+		return failureResponse(req.Cmd, models.Err.DatabaseError, "服务器内部错误，请稍后重试")
+	}
+
+	resp := successResponse(req.Cmd)
+	resp.Token = strPtr(token)
+	resp.MId = strPtr(result.MId)
+	resp.LaunchArgs = strPtr(result.LaunchArgs)
+	resp.Gates = h.gatesFor(gameId)
+	return resp
+}
+
+// gatesFor 返回本服该跑哪几道门禁（随登录响应下发）。
+//
+// 判定本体在 config.GateSwitchesFor，与 /api/launcher/policy 共用 ——
+// 两个出口给出不同答案会让登录器行为随"先拉到哪个"而变。
+func (h *Handler) gatesFor(gameId string) *models.GateBlock {
+	profile, found := h.config.FindGameServer(gameId)
+	gates := config.GateSwitchesFor(profile, found)
+	return &gates
+}
+
 func (h *Handler) handleChangePassword(req *models.GatewayRequest) *models.GatewayResponse {
 	account := deref(req.Account, "")
 	oldPwdMd5 := deref(req.OldPwdMd5, "")
 	newPwdMd5 := deref(req.NewPwdMd5, "")
+
+	// S5A3 的账号 API 没有改密接口（只有 register / login / status）。
+	// 这里必须显式拒绝：网关 SQLite 里没有该账号的行，往下走会命中
+	// "账号不存在"，把玩家引向完全错误的方向（以为号没了）。
+	if h.isS5A3Server(strings.TrimSpace(deref(req.Game, ""))) {
+		return failureResponse(req.Cmd, models.Err.AccountUpstream,
+			"S5A3 服的账号密码由服务端管理，请通过服务端控制台或管理接口修改")
+	}
 
 	code := h.accountSvc.ChangePassword(account, oldPwdMd5, newPwdMd5)
 	if code == models.Err.Ok {

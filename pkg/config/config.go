@@ -280,6 +280,34 @@ type GameServerSection struct {
 
 	LaunchArgsFormat string `json:"LaunchArgsFormat"`
 
+	// ── 以下四项只对 ProtocolS5A3 有意义，其余协议忽略 ──────────────────
+
+	// InitialGamePort 是 S5A3 启动串第 4 段（客户端首个游戏口）。
+	// 0 = 让客户端自己从 CHANNELINFO 里挑，与 S5A3 本地一键端
+	// （deploy/windows/local_client.py 填 0）口径一致。建议保持 0。
+	InitialGamePort int `json:"InitialGamePort"`
+
+	// AccountApiUrl 是 S5A3 服务端账号 API 的基址，形如
+	// `http://127.0.0.1:17002`（DNFBRIDGE_ACCOUNT_API_LISTEN 的地址）。
+	//
+	// 该 API 由服务端提供（internal/services/dnfbridge/account_api.go）：
+	//   POST /api/account/register {"account","password"}
+	//   POST /api/account/login    {"account","password"} → {"ok","account_id","token","message"}
+	//   GET  /api/status
+	// 密码是**明文**（服务端自己 bcrypt），不是 MD5 —— 所以 S5A3 模式下
+	// 登录器必须发明文，见 pkg/service/s5a3_account.go。
+	AccountApiUrl string `json:"AccountApiUrl"`
+	// AccountApiTimeoutSeconds 是调用上面三个接口的超时，0 = 8 秒。
+	AccountApiTimeoutSeconds int `json:"AccountApiTimeoutSeconds"`
+
+	// PartyUDPPorts 是 S5A3 组队 UDP 中继端口段（服务端
+	// party_udp_relay_port_start/count，默认 30000 起 64 个）。
+	//
+	// 留空 = 不做 UDP 中继（组队时客户端会尝试直连服务端 UDP 端口，
+	// 只有服务端 UDP 端口对外可达时才可用）。填了才启用 1:1 UDP 透传，
+	// 见 pkg/proxy/udp_relay.go。
+	PartyUDPPorts []int `json:"PartyUDPPorts"`
+
 	// ProxyProtocol 控制是否在转发任何客户端字节**之前**，先向后端写一行
 	// PROXY protocol v1 头：
 	//
@@ -328,6 +356,17 @@ const (
 	// （AES-ECB 固定密钥 + zlib，条目 64B、IP@28、端口@60），
 	// 游戏口 LOGIN 回复内嵌 Endpoint(地址, 端口)。
 	ProtocolS5A95 = "s5a95"
+	// ProtocolS5A3 是 S5A3（DNF90 / ServerS5A3）游戏协议。
+	//
+	// 与上面两个**根本不同**：S5A3 的频道表不是"网关改写出来的"，而是
+	// 服务端自己在 class0/op1 CHANNELINFO 里下发的（body 经 rotr2^0xB5 编码的
+	// protobuf，字段 12 = serverIP、各频道条目自带端口）。客户端拿到的地址
+	// 完全由服务端的 DNFBRIDGE_SERVER_IP 决定，网关**没有可改写的中间层**。
+	//
+	// 因此 S5A3 的代理形态是**1:1 端口透传**：网关监听与后端相同的端口号，
+	// 服务端把 DNFBRIDGE_SERVER_IP 配成网关的对外地址，CHANNELINFO 里就
+	// 天然是网关地址，不需要任何下行改写。见 pkg/proxy/adapter_s5a3.go。
+	ProtocolS5A3 = "s5a3"
 )
 
 // GameServerEntry 是一个游戏服的完整配置。
@@ -442,6 +481,8 @@ func (c *GatewayConfig) NormalizeGameServers() error {
 				switch e.Protocol {
 				case ProtocolS5A95:
 					e.LaunchArgsFormat = DefaultS5A95LaunchArgsFormat
+				case ProtocolS5A3:
+					e.LaunchArgsFormat = DefaultS5A3LaunchArgsFormat
 				default:
 					e.LaunchArgsFormat = DefaultLaunchArgsFormat
 				}
@@ -515,10 +556,10 @@ func (c *GatewayConfig) ValidateGameServers() error {
 		}
 
 		switch e.Protocol {
-		case ProtocolS4A21, ProtocolS5A95:
+		case ProtocolS4A21, ProtocolS5A95, ProtocolS5A3:
 		default:
-			return fmt.Errorf("GameServers[%s]: 未知 Protocol %q（可选 %s / %s）",
-				e.Id, e.Protocol, ProtocolS4A21, ProtocolS5A95)
+			return fmt.Errorf("GameServers[%s]: 未知 Protocol %q（可选 %s / %s / %s）",
+				e.Id, e.Protocol, ProtocolS4A21, ProtocolS5A95, ProtocolS5A3)
 		}
 
 		channelPort := e.ChannelListenerPort
@@ -884,6 +925,29 @@ const DefaultLaunchArgsFormat = "9?{ip}?{port}?{m_id}?{token}?1?0?6?0?2?1???0?0?
 // DNF95 客户端先连频道口拿 Directory（频道 IP+端口表），与 S4A21 的
 // {port}=Gateway.ProxyPort 语义相同但值来自服的频道口配置。
 const DefaultS5A95LaunchArgsFormat = "99?{ip}?{port}?{m_id}?{digest}?1?0?0?0?0?0?2?0?0?0?0"
+
+// DefaultS5A3LaunchArgsFormat 是 S5A3（DNF90 / ServerS5A3）启动参数模板。
+//
+// 权威来源是服务端自己的控制面：`cmd/server/control/controller.go`
+// 的 clientLaunchArgument()，逐段含义：
+//
+//	99 ? {ip} ? {port} ? {initial_game_port} ? {token} ? 01 ? 1 ? 0 ? 0 ? 0 ? 0 ? 1
+//	   ? 9n2b1c8r3w7y ? 0 ? 0 ? 19847
+//
+//   - 首段 99（S4A21 是 9，S5A9 也是 99）；
+//   - 第 2 段是频道引导地址（服务端 ChannelListen 的 host）；
+//   - 第 3 段是频道引导端口（服务端 ChannelListen 的 port，默认 7001）；
+//   - 第 4 段是 Client.InitialGamePort。S5A3 的本地一键端把它填 0
+//     （见 deploy/windows/local_client.py），客户端会自行从 CHANNELINFO
+//     里取频道端口，所以这里默认也用 0；
+//   - 第 5 段 {token} 是**服务端签发**的登录令牌，必须是
+//     `de509f65` + 24 位小写十六进制（Protocol.GameOuterToken 的形态）。
+//     网关不能自己随机生成 —— 见 pkg/service/s5a3_account.go 的说明；
+//   - 尾部 `9n2b1c8r3w7y?0?0?19847` 是客户端校验用的常量组，原样照抄。
+//
+// ⚠️ 与 S4A21 模板的关键差异：这里没有 {m_id}。S5A3 的账号由服务端
+// MySQL 管理、令牌即身份，客户端启动串里根本不带 m_id。
+const DefaultS5A3LaunchArgsFormat = "99?{ip}?{port}?{initial_game_port}?{token}?01?1?0?0?0?0?1?9n2b1c8r3w7y?0?0?19847"
 
 // DefaultConfig 返回带有生产环境默认值的配置。
 func DefaultConfig() *GatewayConfig {

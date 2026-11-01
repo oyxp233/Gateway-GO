@@ -369,6 +369,15 @@
         .tag-off { background: var(--bg-tag-off); border: 1px solid var(--danger); }
         .tag-warn { background: var(--bg-th); border: 1px solid #f59e0b; color: #f59e0b; }
         .tag-neutral { background: var(--bg-th); border: 1px solid var(--border); color: var(--text-muted); }
+        /* 邀请码（2026-10-24）：等宽字体 + 稍宽字距，便于人工核对 */
+        .invite-codes { display: flex; flex-wrap: wrap; gap: 8px; }
+        .invite-code {
+            display: inline-block; padding: 4px 10px; border-radius: 5px;
+            background: var(--bg-pre); border: 1px solid var(--border);
+            font-family: Consolas, Monaco, monospace; font-size: 13px;
+            letter-spacing: 1px; user-select: all;
+        }
+        .invite-code:hover { border-color: var(--accent); }
         .stack > div + div { margin-top: 3px; }
         .pre {
             background: var(--bg-pre); border: 1px solid var(--border);
@@ -382,6 +391,8 @@
         .alert { padding: 10px 14px; border-radius: 5px; margin-bottom: 10px; color: #fff; font-size: 13px; }
         .alert-success { background: var(--bg-success); border: 1px solid var(--success); }
         .alert-error { background: var(--bg-danger); border: 1px solid var(--danger); }
+        /* warn：操作部分成功（有失败/跳过的项）—— 用错误色但语气是"要处理"，不是"失败" */
+        .alert-warn { background: var(--bg-danger); border: 1px solid var(--warning, #f0b45a); }
         .role-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 0 2px; }
         .role-toolbar input, .role-toolbar select { margin-right: 0; }
         .role-toolbar input[type="number"] { width: 110px; }
@@ -553,6 +564,9 @@
                     <div class="sidebar-item" data-tab="registerlimit">
                         <span class="sidebar-item-icon">🔒</span> 注册限制
                     </div>
+                    <div class="sidebar-item" data-tab="invite">
+                        <span class="sidebar-item-icon">🎟️</span> 邀请码
+                    </div>
                 </div>
                 <!-- 发放与公告 -->
                 <div class="sidebar-group">
@@ -680,6 +694,7 @@
                         <ul class="status-list">
                             <li><span>登录器最低版本</span><span id="dashLauncherMinVer" class="muted">-</span></li>
                             <li><span>当前分发版本</span><span id="dashLauncherCurVer" class="muted">-</span></li>
+                            <li><span>DNF.EXE 分发版本</span><span id="dashDnfExeVer" class="muted">-</span></li>
                             <li><span>插件下发状态</span><span id="dashPluginStatus" class="muted">-</span></li>
                             <li><span>PVF 指纹</span><span id="dashPvfHash" class="muted">-</span></li>
                             <li><span>端口监听数</span><span id="dashPortCount" class="muted">-</span></li>
@@ -729,6 +744,7 @@
                     一个输入框搜四个字段：账号名 / MID（模糊），角色名（模糊），角色ID（精确）。
                     按注册时间正序排列（老账号在前）；点「查看角色」在账号行下方展开。
                 </div>
+                <div id="accountBackendHint" class="alert alert-warn" style="display:none;margin-bottom:8px;"></div>
                 <table>
                     <thead><tr>
                         <th>帐号</th><th>MID</th><th>点券</th><th>注册时间</th>
@@ -803,7 +819,12 @@
                 <div class="row" style="margin-top:10px;">
                     <button class="btn" onclick="addBcItem()">+ 添加一行</button>
                     <button class="btn btn-success" onclick="submitBroadcast()">发送</button>
+                    <button class="btn" id="bcRetryBtn" onclick="retryBroadcast()" style="display:none;">重试未成功的</button>
                 </div>
+                <p class="muted" style="margin-top:8px;">
+                    同一批次重试只会补发<b>未成功</b>的角色（已收到的不会再收一封）。
+                    S5A3 的邮箱在玩家退出时由服务端整箱重写，<b>在线角色会被跳过</b>，请等玩家下线后点「重试未成功的」。
+                </p>
                 <div id="bcResult"></div>
             </div>
         </div>
@@ -947,6 +968,32 @@
                 <p class="muted">回退走完整替换链路：在回退前版本上的玩家，下次启动登录器会自动增量降到回退版。
                     历史默认保留最近 4 版（磁盘考虑，每版约 128 MiB）。</p>
                 <div id="launcherHistory"></div>
+            </div>
+
+            <div class="card">
+                <h3>DNF.EXE 版本（增量更新分发）</h3>
+                <p class="muted">上传新版 <b>DNF.EXE</b>（游戏客户端主程序），登录器检测到新版后会<b>自动增量更新</b>
+                    —— 只下载变化的区块（通常几百 KB），而非约 20 MiB 全量。
+                    与上面的登录器自更新是两套独立的分发目录，互不影响。</p>
+                <div class="row">
+                    <button class="btn" onclick="loadDnfExeVersions()">刷新信息</button>
+                    <span id="dnfExeUpdateFlag" class="muted"></span>
+                </div>
+                <div id="dnfExeUpdateInfo"></div>
+
+                <h3>上传新版本</h3>
+                <div class="row">
+                    <input type="file" id="dnfExeFile" accept=".exe">
+                    <input type="text" id="dnfExeVersion" placeholder="版本号（如 1.0.3，选填）" style="width: 200px;">
+                    <input type="text" id="dnfExeName" placeholder="备注（选填）" style="width: 200px;">
+                    <button class="btn" onclick="uploadDnfExe()">上传</button>
+                </div>
+                <div id="dnfExeUpdateResult"></div>
+
+                <h3>版本历史（可回退）</h3>
+                <p class="muted">回退走完整替换链路：在回退前版本上的玩家，下次启动会自动增量降到回退版。
+                    历史默认保留最近 8 版（每版约 20 MiB）。</p>
+                <div id="dnfExeHistory"></div>
             </div>
         </div>
 
@@ -1477,6 +1524,15 @@
                     <button class="btn" onclick="saveMaintenance()">保存</button>
                     <button class="btn" onclick="loadMaintenance()">刷新</button>
                 </div>
+                <p class="muted">
+                    开启/关闭<b>立即生效</b>，并写入 <b>appsettings.override.json</b> ——
+                    <b>网关重启后仍保持</b>，必须回到本页手动关闭，不会随重启复位。
+                </p>
+                <p class="muted">
+                    标准发版流程：<b>开维护 → 换二进制重启网关 → 更新完成并验证 → 回本页关闭</b>。
+                    这样重启期间（以及更新失败时）玩家无法登录。
+                    开启的瞬间会把<b>非放行名单</b>的在线会话踢下线。
+                </p>
             </div>
         </div>
 
@@ -1559,6 +1615,68 @@
             </div>
         </div>
 
+        <!-- ==================== 邀请码（2026-10-24） ==================== -->
+        <div id="invite" class="tab-content">
+            <div class="card">
+                <h3>生成邀请码</h3>
+                <p class="muted">
+                    开启「注册需要邀请码」后（<code>Register.RequireInvite</code>，<b>默认开启</b>），
+                    玩家注册必须带一个这里生成的码。<b>一码一用</b>：用过即失效，不能复用。
+                    <br>
+                    ⚠️ 该开关默认开启 —— 升级后如果这里一个码都没有，<b>没人能注册</b>。请先生成一批。
+                </p>
+                <div class="row">
+                    <label>数量</label>
+                    <input type="number" id="invCount" value="10" min="1" max="500" step="1" style="width: 90px;">
+                    <label style="margin-left:14px;">有效期（小时）</label>
+                    <input type="number" id="invExpires" value="0" min="0" step="1" style="width: 100px;">
+                    <span class="muted">0 = 永不过期</span>
+                </div>
+                <div class="row">
+                    <label>备注</label>
+                    <input type="text" id="invNote" placeholder="如：十月批次 / 发给某群" style="width: 320px;">
+                </div>
+                <div class="row">
+                    <button class="btn" onclick="generateInvites()">生成</button>
+                    <button class="btn" onclick="exportInvites()">导出全部可用码</button>
+                    <span id="invUnused" class="muted"></span>
+                </div>
+                <div class="row" id="invGenResult" style="display:none;">
+                    <div style="width:100%;">
+                        <div class="muted" style="margin-bottom:6px;">刚生成的码（点击可复制）：</div>
+                        <div id="invGenList" class="invite-codes"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>邀请码列表</h3>
+                <div class="row">
+                    <select id="invStatus" onchange="loadInvites()">
+                        <option value="">全部状态</option>
+                        <option value="unused">未使用</option>
+                        <option value="used">已使用</option>
+                        <option value="expired">已过期</option>
+                        <option value="disabled">已作废</option>
+                    </select>
+                    <input type="text" id="invKeyword" placeholder="搜码 / 备注 / 使用者账号" style="width: 240px;">
+                    <button class="btn" onclick="loadInvites()">查询</button>
+                </div>
+                <table>
+                    <thead><tr>
+                        <th>邀请码</th><th>备注</th><th>状态</th><th>使用者</th>
+                        <th>生成时间</th><th>过期时间</th><th>操作</th>
+                    </tr></thead>
+                    <tbody id="invTable"></tbody>
+                </table>
+                <div class="row" style="margin-top:12px;">
+                    <button class="btn" onclick="invitePage(-1)">上一页</button>
+                    <span id="invPageInfo" class="muted"></span>
+                    <button class="btn" onclick="invitePage(1)">下一页</button>
+                </div>
+            </div>
+        </div>
+
         <!-- ==================== 公告管理 ==================== -->
         <div id="announce" class="tab-content">
             <div class="card">
@@ -1635,6 +1753,16 @@
                     <textarea id="anTplIncomplete" rows="2"></textarea></div>
                 <div class="row"><label style="width: 90px;">拾取</label>
                     <textarea id="anTplPickup" rows="2"></textarea></div>
+                <p class="muted" style="margin-top: 10px;">
+                    <b>消息样式</b>决定这条公告在客户端<b>长什么样</b>（游戏内 NOTI12 的 type 字节），
+                    与上面的文案模板是两件事。选「不指定」时用服务端默认值（56 顶部黑色「通知」横幅）。
+                    改完保存，服务端 3 秒内自动拉取生效，<b>不用重启</b>。
+                </p>
+                <div class="row"><label style="width: 90px;">通关样式</label>
+                    <select id="anStyleCleared" style="width: 380px;"></select></div>
+                <div class="row"><label style="width: 90px;">未通关样式</label>
+                    <select id="anStyleIncomplete" style="width: 380px;"></select>
+                    <span class="muted">留「不指定」时跟随通关样式</span></div>
                 <div class="row">
                     <button class="btn btn-success" onclick="saveAnnounceConfig()">保存并热重载</button>
                     <button class="btn" onclick="loadAnnounceConfig()">放弃修改</button>
@@ -2069,7 +2197,17 @@
                     setText('dashLauncherCurVer', 'v' + (lvData.current.version || '?'));
                 }
             } catch(e) {}
-
+            // DNF.EXE 分发版本（2026-10-25）。未上传过就显示 '-' ——
+            // 不要套用上面登录器那句 'v' + (version || '?')，否则空部署会显示成 "v?"。
+            try {
+                const deData = await api('/api/admin/dnfexe/versions');
+                if (deData && deData.current) {
+                    const c = deData.current;
+                    setText('dashDnfExeVer', c.hash
+                        ? (c.version ? 'v' + c.version : truncHash(c.hash))
+                        : '-');
+                }
+            } catch(e) {}
             // 插件状态
             try {
                 const pluginData = await api('/api/admin/plugins');
@@ -2495,7 +2633,7 @@
             online: () => loadOnline(),
             accounts: () => loadAccounts(1),
             bans: () => loadBans(),
-            integrity: () => loadIntegrity(),
+            integrity: () => { loadIntegrity(); loadLauncherVersions(); loadDnfExeVersions(); },
             server: () => { loadServerStatus(); loadBackupTargets(); loadBackups(); loadServerPvfInfo(); loadRegisterBonus(); loadBonusConfig(); loadGameEvents(); },
             gateway: () => loadGatewayStatus(),
             ports: () => loadGamePorts(),
@@ -2505,6 +2643,7 @@
             maintenance: () => loadMaintenance(),
             heartbeat: () => loadHeartbeat(),
             registerlimit: () => loadRegisterLimit(),
+            invite: () => loadInvites(),
             announce: () => { loadAnnounceConfig(); loadAnnouncePopups(1); loadAnnounceEvents(1); }
         };
 
@@ -2625,8 +2764,48 @@
                 `<div class="muted" title="该账号绑定的 QQ 号，可用于登录">QQ ${esc(a.qq_number)}</div></div>`;
         }
 
+        // ==================== 运行时能力（后端类型决定哪些按钮可用）====================
+
+        // runtimeCaps 是后端能力快照，由 /api/admin/runtime 填充。
+        //
+        // 为什么要有：S5A3 与 S4A21 的游戏库不是同一个东西，部分功能在 S5A3 下
+        // **不该提供入口**（最典型是「删除账号」——网关只能删服务端账号表一行，
+        // 会留下角色存档/邮件/金库孤儿数据，而 account_id 自增复用会让下一个人
+        // 继承前任存档）。与其让运维点了才看到报错，不如提前隐藏。
+        //
+        // 默认值全 true（S4A21 行为），拉取失败也不改变任何按钮 ——
+        // 宁可多显示一个会报错的按钮，也不要因为一次接口抖动把功能藏起来。
+        let runtimeCaps = {
+            delete_account: true, reset_password: true, password_plain: false,
+            account_sync: true, device_binding: true, game_events: true, register_limit: true
+        };
+        let runtimeCapsLoaded = false;
+
+        async function ensureRuntimeCaps() {
+            if (runtimeCapsLoaded) return runtimeCaps;
+            const data = await api('/api/admin/runtime');
+            if (data && data.capabilities) {
+                runtimeCaps = Object.assign({}, runtimeCaps, data.capabilities);
+                runtimeCapsLoaded = true;
+                // S5A3 的说明挂到账号页顶部，运维一眼知道这台网关连的是哪种库。
+                const hint = document.getElementById('accountBackendHint');
+                if (hint) {
+                    if (data.game_backend === 's5a3') {
+                        hint.innerHTML = '<b>S5A3（服务端 MariaDB）</b>：账号由服务端管理，' +
+                            '「删除账号」不可用（会留孤儿存档）；改密直接写服务端 bcrypt。';
+                        hint.style.display = '';
+                    } else {
+                        hint.style.display = 'none';
+                    }
+                }
+            }
+            return runtimeCaps;
+        }
+
         async function loadAccounts(page) {
             accountPage = Math.max(1, page || 1);
+            await ensureRuntimeCaps();
+            const caps = runtimeCaps;
             const keyword = document.getElementById('accountKeyword').value;
             const data = await api(`/api/admin/accounts?keyword=${encodeURIComponent(keyword)}&page=${accountPage}&page_size=${accountPageSize}`);
             if (!data) return;
@@ -2655,10 +2834,10 @@
                     <td class="td-actions">
                         <button class="btn btn-sm" data-act="roles" data-account="${escAttr(a.name)}">查看角色</button>
                         <button class="btn btn-sm" data-act="pwd" data-account="${escAttr(a.name)}">改密</button>
-                        <button class="btn btn-sm" data-act="device" data-account="${escAttr(a.name)}">解绑设备</button>
+                        ${caps.device_binding ? `<button class="btn btn-sm" data-act="device" data-account="${escAttr(a.name)}">解绑设备</button>` : ''}
                         ${qqBtn}
                         ${banBtn}
-                        <button class="btn btn-sm btn-danger" data-act="del" data-account="${escAttr(a.name)}">删除</button>
+                        ${caps.delete_account ? `<button class="btn btn-sm btn-danger" data-act="del" data-account="${escAttr(a.name)}">删除</button>` : ''}
                         ${a.locked ? `<button class="btn btn-sm" data-act="unlock" data-account="${escAttr(a.name)}">解锁</button>` : ''}
                     </td>
                 </tr>`;
@@ -2683,19 +2862,39 @@
         }
 
         async function syncAccounts() {
+            await ensureRuntimeCaps();
+            // S5A3 的"同步"只同步账号身份（m_id + 名字），不同步密码 ——
+            // 密码是服务端 bcrypt，不可互转（三服合一评估文档限制 #6）。
+            // 这个差别必须让运维看到，否则会以为"同步了密码就能在网关侧验密"。
+            if (runtimeCaps.password_plain) {
+                if (!confirm('S5A3 服：只同步账号身份（MID + 账号名），不同步密码。\n\n' +
+                    '用途是让后台列表/账号事件/封禁能对上号。继续？')) return;
+            }
             const data = await api('/api/admin/sync-game-accounts', 'POST');
             if (data) {
-                alert(data.message || '同步完成');
+                let msg = data.message || '同步完成';
+                if (data.conflicts && data.conflicts.length) {
+                    msg += `\n\n同名但 MID 不同（已跳过，需人工处理）：\n${data.conflicts.join('、')}`;
+                }
+                if (data.failed_items && data.failed_items.length) {
+                    msg += `\n\n失败：\n${data.failed_items.slice(0, 10).join('\n')}`;
+                }
+                alert(msg);
                 loadAccounts(accountPage);
             }
         }
 
         async function resetPassword(account) {
-            // 明文输入两次，前端确认一致后提交明文，由服务端计算 MD5
-            //（历史版本要求管理员自己算 32 位 MD5，谁都不会算）。
-            const pwd = prompt(`重置「${account}」的密码。\n请输入新密码（6-32 位）：`);
+            await ensureRuntimeCaps();
+            // 明文输入两次，前端确认一致后提交明文。
+            //
+            // S4A21：服务端把明文转 MD5 存网关库（长度 6-32）。
+            // S5A3 ：服务端是 bcrypt，网关必须拿明文才能算出能被校验的哈希
+            //        （长度 6-64，与服务端 account_api 的规则一致）。
+            const maxLen = runtimeCaps.password_plain ? 64 : 32;
+            const pwd = prompt(`重置「${account}」的密码。\n请输入新密码（6-${maxLen} 位）：`);
             if (pwd === null) return;
-            if (pwd.length < 6 || pwd.length > 32) { showToast('error', '', '密码长度需为 6-32 位'); return; }
+            if (pwd.length < 6 || pwd.length > maxLen) { showToast('error', '', `密码长度需为 6-${maxLen} 位`); return; }
             const pwd2 = prompt('请再次输入新密码确认：');
             if (pwd2 === null) return;
             if (pwd !== pwd2) { showToast('error', '', '两次输入的密码不一致'); return; }
@@ -3004,9 +3203,12 @@
         // 明文输入两次（前端先比一致性），MD5 由服务端算 —— 历史版本要求管理员
         // 自己算 32 位 MD5，没人算得出来。后端另外保留了「直接给 MD5」的入口给脚本调用。
         async function resetAllPasswords(dryRun) {
+            await ensureRuntimeCaps();
+            // S4A21 服务端转 MD5（6-32）；S5A3 服务端 bcrypt（6-64）。
+            const maxLen = runtimeCaps.password_plain ? 64 : 32;
             const pwd = document.getElementById('allPwd1').value;
             const pwd2 = document.getElementById('allPwd2').value;
-            if (pwd.length < 6 || pwd.length > 32) { showToast('error', '', '密码长度需为 6-32 位'); return; }
+            if (pwd.length < 6 || pwd.length > maxLen) { showToast('error', '', `密码长度需为 6-${maxLen} 位`); return; }
             if (pwd !== pwd2) { showToast('error', '', '两次输入的密码不一致'); return; }
 
             if (!dryRun) {
@@ -3016,6 +3218,9 @@
                     '影响范围：全部账号（含离线玩家）',
                     '后果：改完全体玩家需要用新密码重新登录，不可撤销。'
                 ];
+                if (runtimeCaps.password_plain) {
+                    lines.push('', 'S5A3：逐个账号计算 bcrypt，账号多时需要几十秒，请勿关闭页面。');
+                }
                 if (!confirm(lines.join('\n'))) return;
             }
 
@@ -3171,6 +3376,10 @@
             return items;
         }
 
+        // 当前批次：发送成功后记住它，重试时带同一个 batch_id，
+        // 服务端据此跳过已成功投递的角色（幂等键）。
+        let bcLastBatch = null;
+
         async function submitBroadcast() {
             const items = collectBcItems();
             if (items.length === 0) { showResult('bcResult', 'error', '至少需要一个有效物品 ID'); return; }
@@ -3191,9 +3400,62 @@
 
             const data = await api('/api/admin/broadcast', 'POST', body);
             if (!data) return;
+            handleBroadcastResult(data);
+        }
+
+        // retryBroadcast 用上一次的 batch_id 重发同一批：
+        // 服务端跳过已成功投递的角色，只补发失败/在线被跳过的那些。
+        async function retryBroadcast() {
+            if (!bcLastBatch) { showResult('bcResult', 'error', '还没有可重试的批次'); return; }
+            const items = collectBcItems();
+            if (items.length === 0) { showResult('bcResult', 'error', '道具列表已清空，无法重试'); return; }
+            const body = { items, batch_id: bcLastBatch };
+            const charId = document.getElementById('bcCharId').value.trim();
+            const accId = document.getElementById('bcAccId').value.trim();
+            const expire = document.getElementById('bcExpire').value.trim();
+            const subject = document.getElementById('bcSubject').value.trim();
+            const text = document.getElementById('bcBody').value.trim();
+            if (charId) body.target_character_id = parseInt(charId, 10);
+            if (accId) body.target_account_id = parseInt(accId, 10);
+            if (expire) body.expire_hours = parseInt(expire, 10);
+            if (subject) body.subject = subject;
+            if (text) body.body = text;
+
+            if (!confirm(`重试批次 ${bcLastBatch}？已收到的角色不会重复发放。`)) return;
+            const data = await api('/api/admin/broadcast', 'POST', body);
+            if (!data) return;
+            handleBroadcastResult(data);
+        }
+
+        // handleBroadcastResult 统一渲染发送/重试结果，并把 batch_id 记下来。
+        function handleBroadcastResult(data) {
             const ok = data.success !== false && data.ok !== false;
-            showResult('bcResult', ok ? 'success' : 'error',
-                data.message || (ok ? '发放完成' : '发放失败'));
+            if (!ok) {
+                showResult('bcResult', 'error', data.error || data.message || '发放失败');
+                return;
+            }
+            if (data.batch_id) {
+                bcLastBatch = data.batch_id;
+                const btn = document.getElementById('bcRetryBtn');
+                if (btn) btn.style.display = '';
+            }
+            // 有失败/跳过时用 warn 色，别让运维以为全成功了。
+            const pending = (data.failed || 0) + (data.skipped || 0);
+            const parts = [
+                `批次 ${data.batch_id || '-'}`,
+                `目标 ${data.total || 0} 个角色`,
+                `成功 ${data.sent || 0}`,
+            ];
+            if (data.already_delivered) parts.push(`此前已发 ${data.already_delivered}`);
+            if (data.skipped) parts.push(`在线跳过 ${data.skipped}`);
+            if (data.failed) parts.push(`失败 ${data.failed}`);
+            const text = parts.join(' · ');
+            // showResult 会 esc 转义，所以错误明细用「；」拼成单行，不用换行符。
+            const extra = (data.errors && data.errors.length)
+                ? ' —— ' + data.errors.slice(0, 5).join('；') +
+                  (data.errors.length > 5 ? ` 等 ${data.errors.length} 条` : '')
+                : '';
+            showResult('bcResult', pending > 0 ? 'warn' : 'success', text + extra);
         }
 
         // ==================== 客户端校验 ====================
@@ -3634,6 +3896,110 @@
                 loadLauncherVersions();
             } else {
                 showResult('launcherUpdateResult', 'error', data.message || data.error || '回退失败');
+            }
+        }
+
+        // ==================== DNF.EXE 版本（增量更新分发，2026-10-25） ====================
+        //
+        // 与登录器版本面板同构：清单/上传/回退三个动作，接口换成 /api/admin/dnfexe/*。
+        // 与登录器自更新的区别只有两点：DNF.EXE 约 20 MiB（上传快得多）、
+        // 版本号选填（登录器强更判据只认 hash，版本号仅用于展示）。
+
+        async function loadDnfExeVersions() {
+            const info = document.getElementById('dnfExeUpdateInfo');
+            const box = document.getElementById('dnfExeHistory');
+            const flag = document.getElementById('dnfExeUpdateFlag');
+            if (!info || !box || !flag) return;
+            const data = await api('/api/admin/dnfexe/versions');
+            if (!data) return;
+            flag.innerText = data.enabled ? '' : '⚠ DNF.EXE 增量更新开关已关闭（appsettings.json → DnfExe.UpdateEnabled）';
+            const cur = data.current || {};
+            if (cur && cur.hash) {
+                info.className = '';
+                info.innerHTML = '当前分发版：<b>' + (cur.version ? 'v' + esc(cur.version) : '（版本号未登记）') + '</b>　' +
+                    '<span title="' + escAttr(cur.hash) + '">' + esc(truncHash(cur.hash)) + '</span>　' +
+                    fmtSize(cur.size) +
+                    (cur.name ? '　<span class="muted">' + esc(cur.name) + '</span>' : '');
+            } else {
+                info.className = 'muted';
+                info.innerText = '尚未上传过任何 DNF.EXE 版本 —— 上传后，登录器才会对客户端主程序做增量更新。';
+            }
+
+            const entries = data.entries || [];
+            if (entries.length === 0) {
+                box.className = 'muted';
+                box.innerText = '暂无历史版本';
+                return;
+            }
+            let html = '<table class="table"><thead><tr>' +
+                '<th>入史时间</th><th>版本</th><th>备注</th><th>指纹</th><th>大小</th><th>状态</th><th>操作</th>' +
+                '</tr></thead><tbody>';
+            for (const e of entries) {
+                const isCur = e.is_current;
+                html += '<tr>' +
+                    '<td>' + esc(fmtUtcText(e.stored_utc)) + '</td>' +
+                    '<td><b>' + (e.version ? 'v' + esc(e.version) : '?') + '</b></td>' +
+                    '<td>' + esc(e.name || '-') + (e.filename ? ' <span class="muted">(' + esc(e.filename) + ')</span>' : '') + '</td>' +
+                    '<td title="' + escAttr(e.hash) + '">' + esc(truncHash(e.hash)) + '</td>' +
+                    '<td>' + fmtSize(e.size) + '</td>' +
+                    '<td>' + (isCur ? '<b>当前版</b>' : '-') + '</td>' +
+                    '<td>' + (isCur ? '-' :
+                        '<button class="btn btn-danger" data-act="rollback" data-hash="' + escAttr(e.hash) + '">回退</button>') + '</td>' +
+                    '</tr>';
+            }
+            html += '</tbody></table>';
+            box.className = '';
+            box.innerHTML = html;
+            bindRowActions(box, 'data-act', {
+                rollback: (el) => rollbackDnfExe(el.getAttribute('data-hash'), el)
+            });
+        }
+
+        async function uploadDnfExe() {
+            const input = document.getElementById('dnfExeFile');
+            const version = document.getElementById('dnfExeVersion').value.trim();
+            if (!input.files || input.files.length === 0) { showResult('dnfExeUpdateResult', 'error', '请先选择 DNF.EXE 文件'); return; }
+            // 版本号选填，但填了就必须是 x.y.z —— 与后端口径一致，避免写进去一个没法比较的值
+            if (version && !/^\d+\.\d+\.\d+$/.test(version)) {
+                showResult('dnfExeUpdateResult', 'error', '版本号留空或使用 x.y.z 格式（如 1.0.3）'); return;
+            }
+            if (!confirm('确认上传' + (version ? ' v' + version : '') + ' 作为新的 DNF.EXE 分发版本？\n' +
+                '· 上传后，登录器检测到该版会对客户端做增量更新\n' +
+                '· 文件约 20 MiB，上传耗时数十秒')) return;
+            const fd = new FormData();
+            fd.append('file', input.files[0], input.files[0].name);
+            if (version) fd.append('version', version);
+            fd.append('name', document.getElementById('dnfExeName').value.trim());
+            showResult('dnfExeUpdateResult', 'success', '正在上传（约 20 MiB，请勿关闭页面）…');
+            const data = await upload('/api/admin/dnfexe/upload', fd);
+            if (!data) return;
+            input.value = '';
+            if (data.ok) {
+                showResult('dnfExeUpdateResult', 'success',
+                    `已发布${data.version ? ' v' + data.version : ''}（${truncHash(data.hash)}，${fmtSize(data.size)}）`);
+                loadDnfExeVersions();
+            } else {
+                showResult('dnfExeUpdateResult', 'error', data.message || data.error || '上传失败');
+            }
+        }
+
+        async function rollbackDnfExe(hash, el) {
+            let label = truncHash(hash);
+            const row = el ? el.closest('tr') : null;
+            if (row && row.children[1]) label = row.children[1].textContent.trim() + '（' + label + '）';
+            if (!confirm('确认把 DNF.EXE 分发版回退到 ' + label + ' ？\n' +
+                '· 在当前版上的玩家，下次启动登录器会增量降到回退版\n' +
+                '· 回退前版本会自动入历史，可再回退回来')) return;
+            if (el) el.disabled = true;
+            const data = await api('/api/admin/dnfexe/rollback', 'POST', { hash });
+            if (el) el.disabled = false;
+            if (!data) return;
+            if (data.ok) {
+                showResult('dnfExeUpdateResult', 'success',
+                    `已回退到${data.version ? ' v' + data.version : ''}（${truncHash(data.hash)}）`);
+                loadDnfExeVersions();
+            } else {
+                showResult('dnfExeUpdateResult', 'error', data.message || data.error || '回退失败');
             }
         }
 
@@ -4936,6 +5302,184 @@
             </tr>`).join('');
         }
 
+        // ==================== 邀请码（2026-10-24） ====================
+
+        let invitePageNo = 1;
+        const INVITE_PAGE_SIZE = 50;
+
+        async function loadInvites() {
+            const status = document.getElementById('invStatus').value;
+            const keyword = document.getElementById('invKeyword').value.trim();
+            const qs = new URLSearchParams({
+                page: String(invitePageNo),
+                page_size: String(INVITE_PAGE_SIZE)
+            });
+            if (status) qs.set('status', status);
+            if (keyword) qs.set('keyword', keyword);
+
+            const data = await api('/api/admin/invite/list?' + qs.toString());
+            const tbody = document.getElementById('invTable');
+            if (!data || data.ok === false) {
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">读取失败</td></tr>';
+                return;
+            }
+
+            setText('invUnused', `当前可用：${data.unused ?? 0} 个`);
+            const rows = data.rows || [];
+            if (!rows.length) {
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">没有邀请码。点上方「生成」创建一批。</td></tr>';
+            } else {
+                tbody.innerHTML = rows.map(r => `<tr>
+                    <td><code class="invite-code" title="点击复制">${esc(r.code)}</code></td>
+                    <td>${esc(r.note || '-')}</td>
+                    <td>${inviteStatusTag(r.status)}</td>
+                    <td>${esc(r.used_by || '-')}</td>
+                    <td>${esc(fmtTime(r.created_at))}</td>
+                    <td>${r.expires_at ? esc(fmtTime(r.expires_at)) : '<span class="muted">永久</span>'}</td>
+                    <td>${r.status === 'unused'
+                        ? `<button class="btn btn-danger" onclick="revokeInvite('${esc(r.code)}')">作废</button>`
+                        : '<span class="muted">-</span>'}</td>
+                </tr>`).join('');
+
+                // 点码即复制（运营最高频动作）
+                tbody.querySelectorAll('.invite-code').forEach(el => {
+                    el.style.cursor = 'pointer';
+                    el.addEventListener('click', () => copyText(el.textContent));
+                });
+            }
+
+            const totalPages = Math.max(1, Math.ceil((data.total || 0) / INVITE_PAGE_SIZE));
+            setText('invPageInfo', `第 ${data.page} / ${totalPages} 页，共 ${data.total} 条`);
+        }
+
+        function inviteStatusTag(s) {
+            // 复用已有的 tag 变体（tag-on 绿 / tag-neutral 灰 / tag-warn 黄 / tag-off 红）
+            switch (s) {
+                case 'unused': return '<span class="tag tag-on">未使用</span>';
+                case 'used': return '<span class="tag tag-neutral">已使用</span>';
+                case 'expired': return '<span class="tag tag-warn">已过期</span>';
+                case 'disabled': return '<span class="tag tag-off">已作废</span>';
+                default: return esc(s || '-');
+            }
+        }
+
+        function invitePage(delta) {
+            invitePageNo = Math.max(1, invitePageNo + delta);
+            loadInvites();
+        }
+
+        async function generateInvites() {
+            const count = parseInt(document.getElementById('invCount').value, 10);
+            const hours = parseInt(document.getElementById('invExpires').value, 10);
+            const note = document.getElementById('invNote').value.trim();
+
+            if (!Number.isFinite(count) || count < 1 || count > 500) {
+                showToast('error', '参数错误', '数量需在 1–500 之间');
+                return;
+            }
+            if (!Number.isFinite(hours) || hours < 0) {
+                showToast('error', '参数错误', '有效期不能为负数（0 = 永不过期）');
+                return;
+            }
+
+            const data = await api('/api/admin/invite/generate', 'POST', {
+                count: count, note: note, expires_in_hours: hours
+            });
+            if (!data) return;
+            if (data.ok === false) {
+                showToast('error', '生成失败', data.message || data.error || '未知错误');
+                return;
+            }
+
+            // 展示刚生成的码，方便直接复制
+            const box = document.getElementById('invGenResult');
+            const list = document.getElementById('invGenList');
+            box.style.display = '';
+            list.innerHTML = (data.codes || [])
+                .map(c => `<code class="invite-code" title="点击复制">${esc(c)}</code>`)
+                .join('');
+            list.querySelectorAll('.invite-code').forEach(el => {
+                el.style.cursor = 'pointer';
+                el.addEventListener('click', () => copyText(el.textContent));
+            });
+
+            showToast('success', '已生成', `${data.count} 个邀请码`);
+            invitePageNo = 1;
+            loadInvites();
+        }
+
+        async function revokeInvite(code) {
+            if (!confirm(`确定作废邀请码 ${code}？\n作废后无法恢复，但已使用的码不受影响。`)) return;
+            const data = await api('/api/admin/invite/revoke', 'POST', { code: code });
+            if (!data) return;
+            if (data.ok === false) {
+                showToast('error', '作废失败', data.message || '未知错误');
+                return;
+            }
+            showToast('success', '已作废', code);
+            loadInvites();
+        }
+
+        async function exportInvites() {
+            // 导出走纯文本，不能用 api()（那个强制 JSON）。
+            // 用 fetch + blob 下载，避免把几十个码打进弹窗。
+            try {
+                const resp = await fetch('/api/admin/invite/export', {
+                    headers: { 'X-Auth-Key': authKey }
+                });
+                if (resp.status === 401) {
+                    showToastOnce('error', '', '管理密钥错误或未设置');
+                    return;
+                }
+                if (!resp.ok) {
+                    showToast('error', '导出失败', 'HTTP ' + resp.status);
+                    return;
+                }
+                const text = await resp.text();
+                if (!text.trim()) {
+                    showToast('info', '没有可用邀请码', '先生成一批再导出');
+                    return;
+                }
+                // 顺便复制到剪贴板 —— 运营通常是"复制粘到群里"
+                copyText(text.trim());
+                const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `invite-codes-${new Date().toISOString().slice(0, 10)}.txt`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+                showToast('success', '已导出', '文件已下载，内容也已复制到剪贴板');
+            } catch (e) {
+                showToast('error', '导出失败', String(e));
+            }
+        }
+
+        // copyText 是通用剪贴板封装（邀请码/导出共用）
+        async function copyText(text) {
+            try {
+                await navigator.clipboard.writeText(text);
+                showToast('success', '已复制', text.length > 40 ? `${text.length} 个字符` : text);
+            } catch (e) {
+                // 非 HTTPS 环境下 clipboard API 不可用，退回到 textarea + execCommand
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    ta.remove();
+                    showToast('success', '已复制', text.length > 40 ? `${text.length} 个字符` : text);
+                } catch (e2) {
+                    showToast('error', '复制失败', '请手动选中复制');
+                }
+            }
+        }
+
         // ==================== 公告管理 ====================
 
         // 品级编号与服务端一致：稀有=2、神器=3、史诗=4（5 也按史诗）、传说=6。
@@ -4979,8 +5523,108 @@
             return '难度' + ev.difficulty;
         }
 
+        // 公告消息样式（游戏内 NOTI12 的 type 字节）。
+        //
+        // 取值来自 S5A3 的「消息样式对照表-T0-T60」v157 实机测试，这里只列**可用**的值：
+        //   - 禁用：34（弹「无法向GM做出该动作」系统弹窗）、35/36（客户端直接闪退）；
+        //   - 无效：1 / 7 / 15 / 38 / 42 / 45-47 / 50-52 / 54 / 57（客户端静默丢弃）。
+        // 服务端收到禁用值或非法值会退回默认 56，所以后台漏列也不会出事。
+        const ANNOUNCE_NOTICE_STYLES = [
+            {
+                group: '不指定',
+                items: [
+                    { value: '', label: '不指定（跟随服务端默认 = 56 顶部通知横幅）' }
+                ]
+            },
+            {
+                group: '横幅 / 系统文字（推荐）',
+                items: [
+                    { value: '56', label: '56 · 顶部黑色「通知」横幅（最醒目，默认）' },
+                    { value: '58', label: '58 · 红底金边「司令官：」横幅' },
+                    { value: '60', label: '60 · 深底金框、金字横幅' },
+                    { value: '37', label: '37 · 深底品红圆角胶囊条' },
+                    { value: '43', label: '43 · 品红独立文字（无前缀）' },
+                    { value: '0', label: '0 · 系统灰白文字（无前缀）' },
+                    { value: '4', label: '4 · 系统灰白文字（无前缀）' },
+                    { value: '31', label: '31 · 系统灰白文字（无前缀）' }
+                ]
+            },
+            {
+                group: '聊天样式（带角色名前缀）',
+                items: [
+                    { value: '2', label: '2 · 普通聊天' },
+                    { value: '3', label: '3 · 标准普通聊天' },
+                    { value: '5', label: '5 · 普通聊天变体' },
+                    { value: '6', label: '6 · 公会聊天' },
+                    { value: '8', label: '8 · 普通聊天变体' },
+                    { value: '9', label: '9 · 普通聊天变体' },
+                    { value: '14', label: '14 · 橙黄色聊天文字' },
+                    { value: '16', label: '16 · 普通聊天变体' },
+                    { value: '17', label: '17 · 普通聊天变体' },
+                    { value: '18', label: '18 · 普通聊天变体' },
+                    { value: '19', label: '19 · 普通聊天变体' },
+                    { value: '20', label: '20 · 普通聊天变体' },
+                    { value: '21', label: '21 · 普通聊天变体' },
+                    { value: '22', label: '22 · 普通聊天变体' },
+                    { value: '23', label: '23 · 普通聊天变体' },
+                    { value: '24', label: '24 · 普通聊天变体' },
+                    { value: '25', label: '25 · 普通聊天变体' },
+                    { value: '26', label: '26 · 普通聊天变体' },
+                    { value: '27', label: '27 · 普通聊天变体' },
+                    { value: '28', label: '28 · 普通聊天变体' },
+                    { value: '29', label: '29 · 普通聊天变体' },
+                    { value: '30', label: '30 · 普通聊天变体' },
+                    { value: '32', label: '32 · 普通聊天变体' },
+                    { value: '33', label: '33 · 普通聊天变体' },
+                    { value: '39', label: '39 · 普通聊天' },
+                    { value: '40', label: '40 · 普通聊天' },
+                    { value: '48', label: '48 · 普通聊天' },
+                    { value: '49', label: '49 · 蓝色聊天文字' },
+                    { value: '55', label: '55 · 普通聊天' }
+                ]
+            },
+            {
+                group: '频道 / 喇叭（带 Ch. 标签）',
+                items: [
+                    { value: '10', label: '10 · 频道聊天' },
+                    { value: '11', label: '11 · 频道聊天（喇叭）' },
+                    { value: '12', label: '12 · 频道聊天' },
+                    { value: '13', label: '13 · 频道聊天' },
+                    { value: '41', label: '41 · [阵地] 攻坚队聊天' },
+                    { value: '53', label: '53 · 喇叭页签聊天' },
+                    { value: '59', label: '59 · 频道聊天' }
+                ]
+            },
+            {
+                group: '特殊',
+                items: [
+                    { value: '44', label: '44 · 活动模板（文字会被套进固定句式）' }
+                ]
+            }
+        ];
+
+        // fillNoticeStyleSelect 给一个 <select> 灌入上面的分组选项（只灌一次）。
+        function fillNoticeStyleSelect(id) {
+            const el = document.getElementById(id);
+            if (!el || el.dataset.filled === '1') return;
+            ANNOUNCE_NOTICE_STYLES.forEach(group => {
+                const og = document.createElement('optgroup');
+                og.label = group.group;
+                group.items.forEach(item => {
+                    const opt = document.createElement('option');
+                    opt.value = item.value;
+                    opt.textContent = item.label;
+                    og.appendChild(opt);
+                });
+                el.appendChild(og);
+            });
+            el.dataset.filled = '1';
+        }
+
         // 读配置 + 状态概览。三个请求并发，任一失败不影响其他的展示。
         async function loadAnnounceConfig() {
+            fillNoticeStyleSelect('anStyleCleared');
+            fillNoticeStyleSelect('anStyleIncomplete');
             const data = await api('/api/admin/announce/config');
             if (!data) return;
             if (data.ok === false) {
@@ -5007,6 +5651,8 @@
             document.getElementById('anTplCleared').value = c.template_cleared || '';
             document.getElementById('anTplIncomplete').value = c.template_incomplete || '';
             document.getElementById('anTplPickup').value = c.template_pickup || '';
+            document.getElementById('anStyleCleared').value = c.notice_style_cleared || '';
+            document.getElementById('anStyleIncomplete').value = c.notice_style_incomplete || '';
 
             setText('anRevision', `配置版本 r${c.revision || 0}，最后更新 ${fmtTime(c.updated_at)}`);
             const tag = document.getElementById('anStateTag');
@@ -5051,7 +5697,9 @@
                     .split(',').map(s => s.trim()).filter(s => s),
                 template_cleared: document.getElementById('anTplCleared').value,
                 template_incomplete: document.getElementById('anTplIncomplete').value,
-                template_pickup: document.getElementById('anTplPickup').value
+                template_pickup: document.getElementById('anTplPickup').value,
+                notice_style_cleared: document.getElementById('anStyleCleared').value,
+                notice_style_incomplete: document.getElementById('anStyleIncomplete').value
             };
             const data = await api('/api/admin/announce/config', 'POST', { config: cfg });
             if (!data) return;

@@ -1,5 +1,10 @@
 package models
 
+import (
+	"strconv"
+	"strings"
+)
+
 // AnnounceConfig 是全服公告的**业务配置**（区别于 plugin.ini 里的接入参数）。
 //
 // 唯一真源是网关进程内存 + `announce_config` 表；管理后台通过网关写它，
@@ -55,6 +60,23 @@ type AnnounceConfig struct {
 	// TemplatePickup 可用占位符：{player} {dungeon} {difficulty} {item} {rarity} {level}
 	TemplatePickup string `json:"template_pickup"`
 
+	// NoticeStyleCleared / NoticeStyleIncomplete 是公告的**消息样式**（游戏内 NOTI12 的
+	// type 字节），决定这条公告在客户端长什么样 —— 与上面的**文案模板**是两件事：
+	// 模板决定"写什么"，样式决定"怎么显示"。
+	//
+	// 取值为十进制数字字符串（"56" / "58" / "60" / "43" / "37" / "0" / "4" / "31" …）。
+	// **空串 = 不指定**，服务端退回它自己的默认值（56 = 顶部黑色「通知」横幅）。
+	//
+	// ★ 为什么用字符串而不是 int：type 0 是**合法样式**（系统灰白文字），
+	//   用 0 当"未设置"的哨兵会让运营永远选不了它。
+	//
+	// ★ 34/35/36 是禁用值（34 弹「无法向GM做出该动作」系统弹窗、35/36 客户端直接闪退），
+	//   后台不提供这几个选项，服务端收到也会拦掉并退回默认。
+	//
+	// 可用取值与实测效果见 S5A3 的 `消息样式对照表-T0-T60.html`。
+	NoticeStyleCleared    string `json:"notice_style_cleared"`
+	NoticeStyleIncomplete string `json:"notice_style_incomplete"`
+
 	// EventRetentionDays announce_events 的保留天数，超期记录由网关定期清理。0 = 不清理。
 	EventRetentionDays int `json:"event_retention_days"`
 
@@ -88,7 +110,11 @@ func DefaultAnnounceConfig() AnnounceConfig {
 		TemplateCleared:    "恭喜玩家 {player} 通关副本 [{dungeon}·{difficulty}]，用时 {elapsed}",
 		TemplateIncomplete: "玩家 {player} 未能通关副本 [{dungeon}·{difficulty}]，用时 {elapsed}",
 		TemplatePickup:     "恭喜玩家 {player} 在副本 [{dungeon}·{difficulty}] 中获得 [{item}]",
-		EventRetentionDays: 90,
+		// 样式默认留空 = 不指定，由服务端用它的默认值（56 顶部通知横幅）。
+		// 刻意不在网关写死 56：服务端换默认值时网关不该跟着改。
+		NoticeStyleCleared:    "",
+		NoticeStyleIncomplete: "",
+		EventRetentionDays:    90,
 	}
 }
 
@@ -139,6 +165,39 @@ func IsValidAnnounceKind(kind string) bool {
 	default:
 		return false
 	}
+}
+
+// AnnounceNoticeStyleMin/Max 是消息样式（NOTI12 type）的合法区间。
+const (
+	AnnounceNoticeStyleMin = 0
+	AnnounceNoticeStyleMax = 60
+)
+
+// NormalizeAnnounceNoticeStyle 清洗一个消息样式取值。
+//
+// 合法输入是十进制数字字符串（"56"），返回去掉空白的原值；
+// 空串表示"不指定"，原样返回空串。
+// 其它情况（非数字 / 越界 / 禁用值）一律返回空串 —— 即"不指定"，
+// 由服务端退回它自己的默认样式。**绝不报错**：一个手改坏的样式不该让整份配置存不进去。
+//
+// ★ 34/35/36 是禁用值：34 弹「无法向GM做出该动作」系统弹窗、35/36 客户端直接闪退。
+func NormalizeAnnounceNoticeStyle(style string) string {
+	trimmed := strings.TrimSpace(style)
+	if trimmed == "" {
+		return ""
+	}
+	value, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return ""
+	}
+	if value < AnnounceNoticeStyleMin || value > AnnounceNoticeStyleMax {
+		return ""
+	}
+	switch value {
+	case 34, 35, 36:
+		return ""
+	}
+	return strconv.Itoa(value)
 }
 
 // AnnouncePopup 是管理后台发起的弹窗公告。

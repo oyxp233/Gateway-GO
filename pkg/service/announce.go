@@ -120,6 +120,11 @@ func (s *AnnounceService) UpdateConfig(cfg models.AnnounceConfig) (models.Announ
 	if cfg.EventRetentionDays < 0 || cfg.EventRetentionDays > 3650 {
 		cfg.EventRetentionDays = defaults.EventRetentionDays
 	}
+	// 消息样式：非法值/禁用值(34/35/36)归一成空串 = "不指定"，由服务端退回默认样式。
+	// 注意**不要**在这里填默认 56：那等于把服务端的默认值抄一份到网关，
+	// 以后服务端换默认值时网关会一直压着旧值。
+	cfg.NoticeStyleCleared = models.NormalizeAnnounceNoticeStyle(cfg.NoticeStyleCleared)
+	cfg.NoticeStyleIncomplete = models.NormalizeAnnounceNoticeStyle(cfg.NoticeStyleIncomplete)
 
 	saved, err := s.db.SaveAnnounceConfig(cfg)
 	if err != nil {

@@ -41,8 +41,11 @@ const (
 	announceKeyTemplateCleared    = "template_cleared"
 	announceKeyTemplateIncomplete = "template_incomplete"
 	announceKeyTemplatePickup     = "template_pickup"
-	announceKeyEventRetentionDays = "event_retention_days"
-	announceKeyRevision           = "revision"
+	// 消息样式（NOTI12 type 字节）。空值 = 不指定，服务端用它的默认样式。
+	announceKeyNoticeStyleCleared    = "notice_style_cleared"
+	announceKeyNoticeStyleIncomplete = "notice_style_incomplete"
+	announceKeyEventRetentionDays    = "event_retention_days"
+	announceKeyRevision              = "revision"
 )
 
 // LoadAnnounceConfig 读公告配置。
@@ -117,6 +120,12 @@ func applyAnnounceConfigValue(cfg *models.AnnounceConfig, key, value string) {
 		cfg.TemplateIncomplete = value
 	case announceKeyTemplatePickup:
 		cfg.TemplatePickup = value
+	case announceKeyNoticeStyleCleared:
+		// 读侧也清洗一遍：库里的值可能是手改的/旧版本写坏的，
+		// 与其把非法值下发给服务端让它自己兜底，不如在这里就归一成"不指定"。
+		cfg.NoticeStyleCleared = models.NormalizeAnnounceNoticeStyle(value)
+	case announceKeyNoticeStyleIncomplete:
+		cfg.NoticeStyleIncomplete = models.NormalizeAnnounceNoticeStyle(value)
 	case announceKeyEventRetentionDays:
 		if n, ok := parseClampedInt(value, 0, 3650); ok {
 			cfg.EventRetentionDays = n
@@ -145,25 +154,27 @@ func (db *Database) SaveAnnounceConfig(cfg models.AnnounceConfig) (models.Announ
 		cfg.Revision = current + 1
 
 		pairs := map[string]string{
-			announceKeyEnabled:            boolToKV(cfg.Enabled),
-			announceKeyReport:             boolToKV(cfg.Report),
-			announceKeyCleared:            boolToKV(cfg.Cleared),
-			announceKeyIncomplete:         boolToKV(cfg.Incomplete),
-			announceKeyPickup:             boolToKV(cfg.Pickup),
-			announceKeyPickupHellEpic:     boolToKV(cfg.PickupHellEpic),
-			announceKeyPickupLegend:       boolToKV(cfg.PickupLegend),
-			announceKeyPickupUnique:       boolToKV(cfg.PickupUnique),
-			announceKeyPickupStats:        boolToKV(cfg.PickupStats),
-			announceKeyPickupItemLink:     boolToKV(cfg.PickupItemLink),
-			announceKeyHellDifficultyName: cfg.HellDifficultyName,
-			announceKeyDifficultyNames:    strings.Join(cfg.DifficultyNames, ","),
-			announceKeyAnnounceDuration:   strconv.Itoa(cfg.AnnounceDurationMs),
-			announceKeyPopupMode:          strconv.Itoa(cfg.PopupMode),
-			announceKeyTemplateCleared:    cfg.TemplateCleared,
-			announceKeyTemplateIncomplete: cfg.TemplateIncomplete,
-			announceKeyTemplatePickup:     cfg.TemplatePickup,
-			announceKeyEventRetentionDays: strconv.Itoa(cfg.EventRetentionDays),
-			announceKeyRevision:           strconv.FormatInt(cfg.Revision, 10),
+			announceKeyEnabled:               boolToKV(cfg.Enabled),
+			announceKeyReport:                boolToKV(cfg.Report),
+			announceKeyCleared:               boolToKV(cfg.Cleared),
+			announceKeyIncomplete:            boolToKV(cfg.Incomplete),
+			announceKeyPickup:                boolToKV(cfg.Pickup),
+			announceKeyPickupHellEpic:        boolToKV(cfg.PickupHellEpic),
+			announceKeyPickupLegend:          boolToKV(cfg.PickupLegend),
+			announceKeyPickupUnique:          boolToKV(cfg.PickupUnique),
+			announceKeyPickupStats:           boolToKV(cfg.PickupStats),
+			announceKeyPickupItemLink:        boolToKV(cfg.PickupItemLink),
+			announceKeyHellDifficultyName:    cfg.HellDifficultyName,
+			announceKeyDifficultyNames:       strings.Join(cfg.DifficultyNames, ","),
+			announceKeyAnnounceDuration:      strconv.Itoa(cfg.AnnounceDurationMs),
+			announceKeyPopupMode:             strconv.Itoa(cfg.PopupMode),
+			announceKeyTemplateCleared:       cfg.TemplateCleared,
+			announceKeyTemplateIncomplete:    cfg.TemplateIncomplete,
+			announceKeyTemplatePickup:        cfg.TemplatePickup,
+			announceKeyNoticeStyleCleared:    cfg.NoticeStyleCleared,
+			announceKeyNoticeStyleIncomplete: cfg.NoticeStyleIncomplete,
+			announceKeyEventRetentionDays:    strconv.Itoa(cfg.EventRetentionDays),
+			announceKeyRevision:              strconv.FormatInt(cfg.Revision, 10),
 		}
 
 		stmt, err := tx.Prepare("INSERT INTO announce_config(cfg_key, cfg_value, updated_at) VALUES(?, ?, ?) " +

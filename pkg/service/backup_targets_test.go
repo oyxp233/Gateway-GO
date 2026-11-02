@@ -149,6 +149,16 @@ func TestListBackupTargetsCoversEveryDef(t *testing.T) {
 	seen := map[string]bool{}
 	for _, it := range list {
 		seen[it.Key] = true
+		// game_mysql 是 S5A3 专属的「导出产物」目标：本 fixture 用的是 S4A21 配置
+		// （没有 GameDSN），它本来就该是 Exists=false、Path 为空 ——
+		// 强行要求它可用，等于要求 S4A21 也去连一个不存在的 MySQL。
+		// 它的可用性由 TestListBackupTargetsGameMySQLOnlyForS5A3 单独覆盖。
+		if it.Key == TargetGameMySQL {
+			if it.Exists {
+				t.Errorf("S4A21 配置下 game_mysql 不该标记为可用")
+			}
+			continue
+		}
 		if !it.Exists {
 			t.Errorf("%s 应存在，实得 Exists=false（path=%s）", it.Key, it.Path)
 		}
@@ -723,5 +733,55 @@ func assertSQLiteHasMarker(t *testing.T, libBytes []byte, marker string) {
 	}
 	if n != 1 {
 		t.Fatalf("备份出来的库里 marker 行数 = %d，期望 1", n)
+	}
+}
+
+// TestListBackupTargetsGameMySQLOnlyForS5A3 锁死「MySQL 目标只在 S5A3 下可用」。
+//
+// 这条防的是"两头都错"：
+//   - S5A3 上没这个目标 ⇒ 默认备份备不到玩家数据（只剩网关库 + PVF）；
+//   - S4A21 上有这个目标 ⇒ 点一下就去连不存在的 MySQL，备份直接报错。
+func TestListBackupTargetsGameMySQLOnlyForS5A3(t *testing.T) {
+	// S4A21：没有 GameDSN
+	f := newBackupFixture(t)
+	for _, it := range f.mgr().ListBackupTargets() {
+		if it.Key == TargetGameMySQL && it.Exists {
+			t.Fatal("S4A21 配置下 game_mysql 不该可用")
+		}
+	}
+
+	// S5A3：配了 GameDSN
+	f2 := newBackupFixture(t)
+	f2.cfg.Database.GameDSN = "dnf:secret@tcp(127.0.0.1:3306)/dnf_local?parseTime=true"
+	var found bool
+	for _, it := range f2.mgr().ListBackupTargets() {
+		if it.Key != TargetGameMySQL {
+			continue
+		}
+		found = true
+		if !it.Exists {
+			t.Fatal("S5A3 配置下 game_mysql 应可用")
+		}
+		if !strings.Contains(it.Path, "mysql://") {
+			t.Fatalf("game_mysql 的 Path 应显示成连接串，实得 %q", it.Path)
+		}
+		// ★ 密码绝不能出现在给前端的 Path 里。
+		if strings.Contains(it.Path, "secret") {
+			t.Fatalf("Path 里泄露了密码: %q", it.Path)
+		}
+	}
+	if !found {
+		t.Fatal("清单里没有 game_mysql")
+	}
+
+	// 默认备份集也要跟着换：S5A3 的默认集必须包含 game_mysql 且不含 game_db。
+	def := f2.mgr().defaultBackupTargets()
+	if !containsStr(def, TargetGameMySQL) || containsStr(def, TargetGameDB) {
+		t.Fatalf("S5A3 默认备份集不对: %v", def)
+	}
+	// S4A21 保持原样。
+	def21 := f.mgr().defaultBackupTargets()
+	if !containsStr(def21, TargetGameDB) || containsStr(def21, TargetGameMySQL) {
+		t.Fatalf("S4A21 默认备份集不该变: %v", def21)
 	}
 }

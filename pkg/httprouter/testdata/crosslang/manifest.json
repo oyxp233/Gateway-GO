@@ -1,0 +1,49 @@
+{
+  "servers": [
+    {
+      "id": "s4a21",
+      "name": "A21 正式服",
+      "protocol": "s4a21",
+      "host": "1.1.1.1",
+      "auth_port": 8000,
+      "http_port": 8080,
+      "tls": false,
+      "caps": [
+        "policy",
+        "pvf",
+        "plugins",
+        "integrity",
+        "kernel"
+      ],
+      "min_launcher_version": "2.5.0"
+    },
+    {
+      "id": "s5a3",
+      "name": "90CN",
+      "protocol": "s5a3",
+      "host": "2.2.2.2",
+      "auth_port": 8000,
+      "http_port": 8080,
+      "tls": false,
+      "caps": []
+    },
+    {
+      "id": "s5a95",
+      "name": "DNF95",
+      "protocol": "s5a95",
+      "host": "3.3.3.3",
+      "auth_port": 8000,
+      "http_port": 8080,
+      "tls": false,
+      "caps": [
+        "policy",
+        "integrity"
+      ]
+    }
+  ],
+  "servers_json": "[{\"auth_port\":8000,\"caps\":[\"policy\",\"pvf\",\"plugins\",\"integrity\",\"kernel\"],\"host\":\"1.1.1.1\",\"http_port\":8080,\"id\":\"s4a21\",\"min_launcher_version\":\"2.5.0\",\"name\":\"A21 正式服\",\"protocol\":\"s4a21\",\"tls\":false},{\"auth_port\":8000,\"caps\":[],\"host\":\"2.2.2.2\",\"http_port\":8080,\"id\":\"s5a3\",\"name\":\"90CN\",\"protocol\":\"s5a3\",\"tls\":false},{\"auth_port\":8000,\"caps\":[\"policy\",\"integrity\"],\"host\":\"3.3.3.3\",\"http_port\":8080,\"id\":\"s5a95\",\"name\":\"DNF95\",\"protocol\":\"s5a95\",\"tls\":false}]",
+  "signature": "c6de7869a59a237b90bccef3a03d078d0783d946e5305e2d33ab3aad5299746ffe7c450e503b46d7233a538649ae98d8f15209019642e2b4a38876d13469c709",
+  "public_key": "a6808e270e89466b095e50d1106d179cc611224ed54924bbb0a68b1793ae33c3",
+  "generated_at": 1793540156,
+  "expires_at": 1793540456
+}

@@ -17,6 +17,16 @@ type Character struct {
 	Name        string
 	Level       int
 	Job         int
+	// GrowType 是转职/觉醒编码（低 4 位 = 转职，高 4 位 = 觉醒）。
+	// S4A21 的查询不取这一列，留 0；S5A3 的 dnf_characters 有 grow_type 列。
+	GrowType int
+	// AccountKey 是 S5A3 的 account_id 字符串（形如 "dnf:10002"）。
+	//
+	// ★ 为什么需要它：S5A3 的 dnf_characters.account_id 是 varchar，
+	//   而 AccountId 是 int64（装的是 dnf90_web_accounts.id）。
+	//   邮件/点券路径要用字符串形式的 account_id 时读这个字段。
+	//   S4A21 后端不填（保持空串）。
+	AccountKey string
 }
 
 // BackupFile 备份目录中的一个备份文件。
@@ -125,6 +135,12 @@ func (db *Database) SyncGameAccounts() (*SyncResult, error) {
 //
 // onlyIfGatewayEmpty 为 true 时表示启动期自动迁移，网关库有账号即跳过。
 func (db *Database) syncAccountsFromGameDb(onlyIfGatewayEmpty bool) (*SyncResult, error) {
+	// S5A3：账号主权在服务端 MySQL，没有 S4A21 那种 accounts(m_id, pwd_hash, salt)
+	// 表可同步。这里的"同步"在 S5A3 下语义不成立，明确说明而不是报"游戏库未配置"
+	// （后者会让运维以为 GameDSN 没配对，方向完全错）。
+	if db.GameBackend() == "s5a3" {
+		return &SyncResult{Message: "S5A3 服的账号由服务端 MySQL 管理，不需要（也无法）同步到网关库；后台账号列表直接读 dnf90_web_accounts"}, nil
+	}
 	if !db.GameConfigured() {
 		return &SyncResult{Message: "游戏库未配置（GamePath 为空）"}, nil
 	}
@@ -324,7 +340,20 @@ func (db *Database) gameAccountsHasSaltColumn() (bool, error) {
 // GetCeraMap 批量获取多个账号的点券余额。
 func (db *Database) GetCeraMap(names []string) (map[string]int64, error) {
 	result := make(map[string]int64)
-	if !db.GameConfigured() || len(names) == 0 {
+	if len(names) == 0 {
+		return result, nil
+	}
+	if db.GameBackend() == "s5a3" {
+		for _, name := range names {
+			if cera, _, _, ok := db.s5a3GetCurrencyTriple(name); ok {
+				result[name] = cera
+			} else {
+				result[name] = 0
+			}
+		}
+		return result, nil
+	}
+	if !db.GameConfigured() {
 		return result, nil
 	}
 
@@ -342,7 +371,12 @@ func (db *Database) GetCeraMap(names []string) (map[string]int64, error) {
 }
 
 // GetCeraByMId 通过 MId 获取点券余额（游戏库）。
+//
+// S5A3 后端的余额在 dnf_account_metadata 的 account_cera 行里（不是列）。
 func (db *Database) GetCeraByMId(mId string) (int64, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetCeraByMId(mId)
+	}
 	if !db.GameConfigured() {
 		return 0, nil
 	}
@@ -359,7 +393,13 @@ func (db *Database) GetCeraByMId(mId string) (int64, error) {
 // ok=false 表示游戏库未配置、账号无游戏库行或查询失败 —— 调用方应回退网关库镜像值，
 // 不把"游戏库没这行"当成错误上抛（新注册还没进过游戏的账号属正常情况）。
 func (db *Database) GetCurrencyTripleByMId(mId string) (cera, token, happy int64, ok bool) {
-	if !db.GameConfigured() || mId == "" {
+	if mId == "" {
+		return 0, 0, 0, false
+	}
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetCurrencyTriple(mId)
+	}
+	if !db.GameConfigured() {
 		return 0, 0, 0, false
 	}
 	err := db.gameDB.QueryRow(
@@ -390,7 +430,23 @@ type CurrencyTriple struct {
 // 三币种是附加展示。
 func (db *Database) GetCurrencyTriplesByMIds(mIds []string) map[string]CurrencyTriple {
 	out := make(map[string]CurrencyTriple)
-	if !db.GameConfigured() || len(mIds) == 0 {
+	if len(mIds) == 0 {
+		return out
+	}
+	// S5A3 后端：逐个查 metadata（IN 拼 key-value 表反而更啰嗦，
+	// 且账号列表这个场景的条数是分页量级，几十次往返可接受）。
+	if db.GameBackend() == "s5a3" {
+		for _, id := range mIds {
+			if id == "" {
+				continue
+			}
+			if cera, token, happy, ok := db.s5a3GetCurrencyTriple(id); ok {
+				out[id] = CurrencyTriple{Cera: cera, TokenCera: token, HappyTokenCera: happy}
+			}
+		}
+		return out
+	}
+	if !db.GameConfigured() {
 		return out
 	}
 	// 去重 + 去空：IN 列表越短越快，也避免重复参数白占位。
@@ -460,6 +516,10 @@ func (db *Database) GetRolesByAccount(accountName string) ([]RoleInfo, error) {
 	if accountName == "" {
 		return nil, fmt.Errorf("账号名不能为空")
 	}
+	// S5A3：账号名直接在 dnf90_web_accounts 上，不需要经网关库转 m_id。
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetRolesByAccount(accountName)
+	}
 	if !db.GameConfigured() {
 		return nil, fmt.Errorf("游戏库未配置")
 	}
@@ -526,6 +586,11 @@ func (db *Database) SendMailToCharacter(characterId int64, characterName, title,
 
 // SendMailWithGold 发送带金币的邮件到指定角色（注册奖励金币随首封邮件发放）。
 func (db *Database) SendMailWithGold(characterId int64, characterName, title, body string, gold int64, items []MailItem, expireHours int) error {
+	// S5A3：表结构与 S4A21 完全不同（dnf_mails / dnf_mail_attachments），
+	// 走独立实现。raw_entry 留 NULL，由服务端按 PVF 补证据。
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3SendMailWithGold(characterId, characterName, title, body, gold, items, expireHours)
+	}
 	if !db.GameConfigured() {
 		return fmt.Errorf("游戏库未配置")
 	}
@@ -590,7 +655,13 @@ func (db *Database) SendMailWithGold(characterId int64, characterName, title, bo
 
 // AddCurrencyToGameAccount 给游戏库账号累加点券，返回受影响行数。
 // column 必须是白名单列（cera/token_cera/happy_token_cera）。
+//
+// S5A3 后端：余额不是列，而是 dnf_account_metadata 里 entry_key='account_cera'
+// 的一行（key-value）。写法和返回语义见 s5a3AddCurrency。
 func (db *Database) AddCurrencyToGameAccount(mId, column string, amount int64) (int64, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3AddCurrency(mId, column, amount)
+	}
 	if !db.GameConfigured() {
 		return 0, nil
 	}
@@ -611,6 +682,9 @@ func (db *Database) AddCurrencyToGameAccount(mId, column string, amount int64) (
 
 // FindFirstAliveCharacter 查询账号首个存活角色（注册奖励发件目标）。
 func (db *Database) FindFirstAliveCharacter(mId string) (*Character, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3FindFirstAliveCharacter(mId)
+	}
 	if !db.GameConfigured() {
 		return nil, nil
 	}
@@ -638,6 +712,9 @@ func (db *Database) FindFirstAliveCharacter(mId string) (*Character, error) {
 
 // GetCharacter 查询角色。
 func (db *Database) GetCharacter(characterId int64) (*Character, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetCharacter(characterId)
+	}
 	if !db.GameConfigured() {
 		return nil, fmt.Errorf("游戏库未配置")
 	}
@@ -684,6 +761,9 @@ type OnlineRoleCandidate struct {
 // 单查询的变量数受 SQLite 限制，按 chunk 分批。
 func (db *Database) GetCurrentRolesByMIds(mIds []string) (map[string]OnlineRoleCandidate, error) {
 	out := make(map[string]OnlineRoleCandidate)
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetCurrentRolesByMIds(mIds)
+	}
 	if !db.GameConfigured() {
 		return out, nil
 	}
@@ -776,7 +856,13 @@ func (db *Database) GetCurrentRolesByMIds(mIds []string) (map[string]OnlineRoleC
 // 查不到时返回空串。**不要回退成账号名**：后台「角色」列需要靠「空」识别「未知」，
 // 把账号名填进去会让这一列失去区分能力，还会掩盖「解析失败」这个事实。
 func (db *Database) CurrentRoleName(account string) string {
-	if db == nil || strings.TrimSpace(account) == "" || !db.GameConfigured() {
+	if db == nil || strings.TrimSpace(account) == "" {
+		return ""
+	}
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3CurrentRoleName(account)
+	}
+	if !db.GameConfigured() {
 		return ""
 	}
 	mIds, err := db.GetMIdsByNames([]string{account})
@@ -822,7 +908,13 @@ func (db *Database) ResolveMIdByCharacterID(characterId int64) (string, error) {
 }
 
 // GetCharactersByAccount 查询账号下所有存活角色。
+//
+// S5A3 的 accountId 是 dnf90_web_accounts.id（数值），不是 dnf_characters.account_id
+// 那个字符串（dnf:10002）—— 转换在 s5a3GetCharactersByAccount 里做。
 func (db *Database) GetCharactersByAccount(accountId int64) ([]Character, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetCharactersByAccount(accountId)
+	}
 	if !db.GameConfigured() {
 		return nil, fmt.Errorf("游戏库未配置")
 	}
@@ -847,8 +939,11 @@ func (db *Database) GetCharactersByAccount(accountId int64) ([]Character, error)
 	return characters, nil
 }
 
-// GetAllAliveCharacters 查询所有存活角色。
+// GetAllAliveCharacters 查询所有存活角色（全服邮件的目标集合）。
 func (db *Database) GetAllAliveCharacters() ([]Character, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GetAllAliveCharacters()
+	}
 	if !db.GameConfigured() {
 		return nil, fmt.Errorf("游戏库未配置")
 	}
@@ -886,6 +981,9 @@ func generateTokenString() string {
 // 因此这里以 mailbox_messages 为主表删除，并显式清理两张子表，
 // 以保证即使连接未开启 foreign_keys 也能清干净。
 func (db *Database) ClearMailbox(characterId int64) (int64, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3ClearMailbox(characterId)
+	}
 	if !db.GameConfigured() {
 		return 0, fmt.Errorf("游戏库未配置")
 	}

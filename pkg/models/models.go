@@ -117,6 +117,14 @@ type ErrorCode struct {
 	// 老登录器不带 game 字段 ⇒ 空串 ⇒ 默认服，行为不变。
 	GameNotFound int
 	GameDisabled int
+	// ── 邀请码（1040~1041，2026-10-24）───────────────────────────────
+	//
+	// 开启 Register.RequireInvite 后，注册必须带有效邀请码。
+	// 两个码分开：1040 是"没填"，1041 是"填了但不可用"（无效/已用/过期/作废）。
+	// 分开的理由：文案不同 —— "请输入邀请码" vs "邀请码无效或已被使用"，
+	// 混成一个码会让玩家不知道该干什么。
+	InviteRequired int
+	InviteInvalid  int
 }
 
 var Err = ErrorCode{
@@ -162,6 +170,8 @@ var Err = ErrorCode{
 	RegisterMachineLimit: 1037,
 	GameNotFound:         1038,
 	GameDisabled:         1039,
+	InviteRequired:       1040,
+	InviteInvalid:        1041,
 	RateLimited:          3002,
 	UnknownCommand:           3003,
 	DecodeFailed:             3005,
@@ -192,6 +202,17 @@ type GatewayRequest struct {
 	Password        *string `json:"password,omitempty"`
 	OldPwdMd5       *string `json:"old_pwd_md5,omitempty"`
 	NewPwdMd5       *string `json:"new_pwd_md5,omitempty"`
+	// OldPassword / NewPassword 是**明文**，只有 S5A3 服的改密用（2026-10-29）。
+	//
+	// 为什么 S5A3 需要明文：服务端登录时用
+	// `bcrypt.CompareHashAndPassword(hash, 明文)` 校验，网关只有 MD5 就
+	// 生成不出能通过的哈希（MD5 不可逆）。所以改密链路必须让登录器发明文。
+	//
+	// S4A21 / S5A95 服**完全不读这两个字段**，改密仍走 old_pwd_md5 / new_pwd_md5。
+	//
+	// 老登录器不带 ⇒ 为空 ⇒ S5A3 改密返回"请更新登录器"，不会误改。
+	OldPassword *string `json:"old_password,omitempty"`
+	NewPassword *string `json:"new_password,omitempty"`
 	Token           *string `json:"token,omitempty"`
 	AuthKey         *string `json:"auth_key,omitempty"`
 	DeviceSecret    *string `json:"device_secret,omitempty"`
@@ -206,6 +227,14 @@ type GatewayRequest struct {
 	// 老登录器不带此字段 ⇒ 为空串 ⇒ 注册限额**跳过机器维度**、只按 IP 判。
 	// 绝不能把空值当成同一个机器计数（那会全服注册不了）。
 	MachineId *string `json:"machine_id,omitempty"`
+	// InviteCode 是注册邀请码（2026-10-24）。
+	//
+	// 只在 CMD_REGISTER 有意义：开启 Register.RequireInvite 后，
+	// 注册必须带一个后台生成的、未被使用过的邀请码。
+	//
+	// 归一化由服务端做（去空格/连字符、转大写），客户端传原始输入即可 ——
+	// 玩家从聊天窗口复制时常带空格或大小写不一致。
+	InviteCode *string `json:"invite_code,omitempty"`
 	// ForceLogin 强制登录：账号已在线时踢掉旧会话并登录。
 	// 未携带（false）时若账号已在线，登录返回 AccountOnline(1023)。
 	ForceLogin  *bool             `json:"force_login,omitempty"`
@@ -396,6 +425,13 @@ type LauncherBuildEntry struct {
 	Name      string `json:"name,omitempty"`     // 显示名（上传备注）
 	Filename  string `json:"filename,omitempty"` // 上传时的原文件名
 	StoredUtc string `json:"stored_utc"`         // 首次入史时间（毫秒精度 RFC3339）
+
+	// AuthorityRevision 是权威版本序号（三服合一，2026-10-24）。
+	//
+	// 见评估-三服合一登录器-20261023.md 第四章：
+	// 同步按序号而非版本号判断新旧，防"回滚到旧版后从网关覆盖回新版"。
+	// 单调递增：每次上传/回滚都 +1。0 = 未启用同步（单机模式）。
+	AuthorityRevision int64 `json:"authority_revision,omitempty"`
 }
 
 // LauncherUpdateManifest 是 GET /api/launcher/update 的响应体（snake_case，
@@ -419,6 +455,47 @@ type LauncherUpdateManifest struct {
 	DeltaURL   string `json:"delta_url"`   // 按需 delta 基址（登录器拼 ?from=<本地hash>）
 }
 
+// ============================================================================
+// DNF.EXE 增量更新（2026-10-25）
+// ============================================================================
+
+// DnfExeDeltaInfo 与 PvfDeltaInfo 字段完全同构（A21D 是通用文件差分），
+// 独立命名避免「DNF.EXE 在下 PVF」的语义混淆。
+type DnfExeDeltaInfo = PvfDeltaInfo
+
+// DnfExeBuildEntry 是一条 DNF.EXE 构建记录（dnfexe_update/history/index.json 的一行）。
+//
+// 与 LauncherBuildEntry 同构：Version 是 DNF.EXE 版本号（上传时可选，用于展示与强更阈值）。
+type DnfExeBuildEntry struct {
+	Hash              string `json:"hash"`                        // 大写 SHA-256（= 文件名）
+	Version           string `json:"version,omitempty"`           // DNF.EXE 版本号（可选，用于展示）
+	Size              int64  `json:"size"`                        // 字节数
+	Name              string `json:"name,omitempty"`              // 显示名（上传备注）
+	Filename          string `json:"filename,omitempty"`          // 上传时的原文件名
+	StoredUtc         string `json:"stored_utc"`                  // 首次入史时间（毫秒精度 RFC3339）
+	AuthorityRevision int64  `json:"authority_revision,omitempty"` // 权威版本序号（网关间同步用）
+}
+
+// DnfExeUpdateManifest 是 GET /api/dnfexe/update 的响应体（snake_case）。
+//
+// 判据约定（登录器侧，与 LauncherUpdateManifest 同口径）：
+//   - enabled=false        → 服务端关闭 DNF.EXE 增量更新，登录器跳过检查；
+//   - version/hash 为空    → 服务端从未上传过任何版本，登录器跳过检查；
+//   - 本地 DNF.EXE hash == hash → 已是最新；
+//   - 其余                  → 有新版：本地 version < min_version 时强制更新，
+//                            否则弹窗可跳过。
+type DnfExeUpdateManifest struct {
+	OK         bool   `json:"ok"`
+	Enabled    bool   `json:"enabled"`
+	Version    string `json:"version,omitempty"`
+	Hash       string `json:"hash,omitempty"`
+	Size       int64  `json:"size,omitempty"`
+	StoredUtc  string `json:"stored_utc,omitempty"`
+	MinVersion string `json:"min_version"` // 网关内存态 DnfExe.MinVersion（强更阈值）
+	FullURL    string `json:"full_url"`    // 全量 exe 下载（相对路径）
+	DeltaURL   string `json:"delta_url"`   // 按需 delta 基址（登录器拼 ?from=<本地hash>）
+}
+
 
 // BroadcastRequest 表示全服发放请求。
 type BroadcastRequest struct {
@@ -428,6 +505,14 @@ type BroadcastRequest struct {
 	Body              string            `json:"body,omitempty"`
 	Items             []MailItemRequest `json:"items"`
 	ExpireHours       *int              `json:"expire_hours,omitempty"`
+
+	// BatchID 是投递批次号（幂等键）。
+	//
+	// 留空 = 新的一次发送（服务端自己生成，响应里带回来）。
+	// 传上次响应里的 batch_id = **重试同一批**：已成功投递的角色会被跳过，
+	// 只补发失败/跳过的那些。这是"点第二次不会重复发"的唯一手段，
+	// 前端应把响应里的 batch_id 记住并在"重试失败项"时带上。
+	BatchID string `json:"batch_id,omitempty"`
 }
 
 // ResetPasswordBody 表示后台重置密码请求体。
@@ -568,6 +653,14 @@ type Session struct {
 	Token         string
 	Account       string
 	MId           string
+	// S5A3Token 是 **S5A3 服务端**签发的启动令牌（32 位 hex，固定前缀 de509f65），
+	// 与上面网关自己的 Token 是两个东西（见 handleLoginS5A3 的注释）。
+	//
+	// ★ 2026-10-29 新增，修「同 IP 双开时第一个账号被踢」：
+	//   客户端连游戏口时首包里带的就是这个令牌。Game 连接靠它做**精确归属**，
+	//   不再回退到「按 IP 取心跳最新的会话」—— 双开时后者会把 A 的连接挂到 B
+	//   的会话上，B 一登录 ReplaceAccountSessions 就 closeConns 掉 A 的连接。
+	S5A3Token    string
 	ClientIP      string
 	DeviceSecret  string
 	// GameId 是本次登录选服的 Id（GameServers[].Id，2026-10-17 双服）。
@@ -602,4 +695,66 @@ type Session struct {
 	// 踢人只删会话表不断连接，玩家照常游戏（2026-09-23 修复）。
 	ProxyConnections     map[net.Conn]struct{}
 	GameProxyConnections map[net.Conn]struct{}
+}
+
+// ============================================================================
+// 服清单下发（三服合一，2026-10-24）
+//
+// 见 评估-三服合一登录器-20261023.md 第三章：
+// 网关通过 GET /api/launcher/servers 下发签名后的服清单，
+// 登录器校验 Ed25519 签名 + 有效期后用于选服和端点解析。
+// ============================================================================
+
+// ServerListEntry 是服清单中的一条服记录。
+//
+// 登录器拿到后：
+//  - id/name 填充下拉框，id 同时是 CMD_LOGIN.game 字段值
+//  - protocol 决定发 MD5 还是明文（安全相关，必须由签名清单给）
+//  - host/auth_port/http_port 是该服的网关端点
+//  - tls/pin 是该服的证书钉扎
+//  - caps[] 决定登录器为该服启用哪些门禁（替代 gates.go 的协议写死判定）
+//  - min_launcher_version 该服要求的最低登录器版本
+type ServerListEntry struct {
+	Id               string   `json:"id"`                  // 服唯一标识 [a-z0-9-]
+	Name             string   `json:"name"`                // 展示名
+	Protocol         string   `json:"protocol"`            // s4a21 / s5a3 / s5a95
+	Host             string   `json:"host"`                // 网关公网地址
+	AuthPort         int      `json:"auth_port"`            // TCP 认证端口（Gateway.TcpPort）
+	HttpPort         int      `json:"http_port"`            // HTTP API 端口（Gateway.HttpPort）
+	Tls              bool     `json:"tls"`                  // 是否启用 TLS
+	Pin              string   `json:"pin,omitempty"`       // TLS 证书指纹（大写 SHA-256，可空）
+	Caps             []string `json:"caps"`                // 能力位：plugins/integrity/pvf/kernel
+	MinLauncherVer   string   `json:"min_launcher_version,omitempty"` // 该服要求的最低登录器版本
+}
+
+// ServerListManifest 是 GET /api/launcher/servers 的响应体。
+//
+// 签名机制（★ 关键设计，2026-10-24）：
+//
+//	签的是 ServersJson 这个**字符串的 UTF-8 字节**，不是"servers 数组的再序列化结果"。
+//
+//	为什么必须这样：Go 与 C# 的 JSON 序列化规则不同 ——
+//	  · Go 侧 CanonicalJSON 按 key 字典序输出（auth_port 在前）
+//	  · C# 侧 JsonSerializer 按类属性定义序输出（id 在前）
+//	  · Go 的 omitempty 省略空字段，C# 默认输出空串
+//	两端各自"反序列化再序列化"必然得到不同字节，验签永远失败。
+//
+//	解法：网关把自己生成的规范字节**原样放进 ServersJson 下发**，
+//	登录器对这段字符串的字节验签。签的和验的是同一段字节，跨语言零风险。
+//	（与 JWT 的 payload 处理同一思路。）
+//
+//	Servers 字段保留给调试/curl 使用，内容与 ServersJson 等价。
+type ServerListManifest struct {
+	Servers []ServerListEntry `json:"servers"`
+
+	// ServersJson 是 Servers 的规范 JSON 字符串 —— 签名覆盖的就是它的 UTF-8 字节。
+	//
+	// 登录器必须用这个字段验签（不是 Servers），并在验签通过后
+	// 从这个字符串反序列化服列表。
+	ServersJson string `json:"servers_json"`
+
+	Signature   string `json:"signature"`    // hex Ed25519 签名（覆盖 ServersJson 的字节）
+	PublicKey   string `json:"public_key"`   // hex 公钥（网关当前公钥）
+	GeneratedAt int64  `json:"generated_at"` // 生成时间（Unix 秒）
+	ExpiresAt   int64  `json:"expires_at"`   // 有效期（Unix 秒，0=不过期）
 }

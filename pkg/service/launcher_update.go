@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -167,6 +168,11 @@ func (s *LauncherUpdateService) refreshCurrent() {
 			entry.Name = meta.Name
 			entry.Filename = meta.Filename
 			entry.StoredUtc = meta.StoredUtc
+			// ★ AuthorityRevision 必须一起拷贝（三服合一，2026-10-24）：
+			// 漏了它会让 /internal/launcher/sync 下发的 current.revision 恒为 0，
+			// 从网关按 since= 比较时永远认为"没有更新"（或每次都认为有更新）。
+			// 单测 TestPullLauncherFromPeer 就是靠这条抓住的。
+			entry.AuthorityRevision = meta.AuthorityRevision
 		} else {
 			s.logger.Warn("登录器当前版指纹计算失败: " + err.Error())
 		}
@@ -280,6 +286,8 @@ func (s *LauncherUpdateService) archiveHistory(path, version, name, filename str
 		Version:   strings.TrimSpace(version),
 		Name:      strings.TrimSpace(name),
 		Filename:  strings.TrimSpace(filename),
+		// 权威版本序号（三服合一同步用，单调递增）
+		AuthorityRevision: s.nextAuthorityRevisionLocked(),
 	}
 	if stats != nil {
 		entry.Size = stats.Size
@@ -373,6 +381,186 @@ func (s *LauncherUpdateService) GetHistory() []models.LauncherBuildEntry {
 
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].StoredUtc > entries[j].StoredUtc })
 	return entries
+}
+
+// History 是 GetHistory 的别名（供 launcher_sync.go 的 handler 调用）。
+func (s *LauncherUpdateService) History() []models.LauncherBuildEntry {
+	return s.GetHistory()
+}
+
+// nextAuthorityRevision 返回下一个权威版本序号（单调递增）。
+//
+// 见评估-三服合一登录器-20261023.md 第四章：
+// 同步按序号而非版本号判断新旧，防"回滚到旧版后从网关覆盖回新版"。
+// 序号 = 历史索引中最大 AuthorityRevision + 1，0 起步。
+func (s *LauncherUpdateService) nextAuthorityRevision() int64 {
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	return s.nextAuthorityRevisionLocked()
+}
+
+// nextAuthorityRevisionLocked 是持锁版本，调用方须持有 histMu。
+func (s *LauncherUpdateService) nextAuthorityRevisionLocked() int64 {
+	entries := s.loadHistoryIndexLocked()
+	var max int64
+	for _, e := range entries {
+		if e.AuthorityRevision > max {
+			max = e.AuthorityRevision
+		}
+	}
+	return max + 1
+}
+
+// SetAuthorityRevision 把某个 hash 的权威版本序号改成指定值（网关间同步用）。
+//
+// 为什么需要它：从网关通过 ReplaceLauncher 拉取 peer 的包时，ReplaceLauncher
+// 会按本地索引分配一个新序号 —— 那与 peer 的序号对不上，后续按 since= 比较
+// 就会漏拉或重复拉。同步完成后调用本方法把序号对齐到 peer 的值。
+//
+// hash 不存在时返回错误（调用方应先 ReplaceLauncher 再调本方法）。
+//
+// ★ 写完索引必须主动 refreshCurrent：current.exe 本身没变（stamp 不变），
+//   Current() 会直接返回缓存里的旧 entry（revision 还是 0）。
+//   这里先释放 histMu 再刷新 —— refreshCurrent 内部要拿 histMu，持锁调用会自锁。
+func (s *LauncherUpdateService) SetAuthorityRevision(hash string, revision int64) error {
+	s.histMu.Lock()
+	entries := s.loadHistoryIndexLocked()
+	found := false
+	for i := range entries {
+		if strings.EqualFold(entries[i].Hash, hash) {
+			entries[i].AuthorityRevision = revision
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.histMu.Unlock()
+		return fmt.Errorf("历史索引里没有 hash=%s 的记录", utils.ShortHash(hash))
+	}
+	err := s.saveHistoryIndexLocked(entries)
+	s.histMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// 释放 histMu 后刷新缓存，让 Current() 看到新序号
+	s.refreshCurrent()
+	return nil
+}
+
+// MaxAuthorityRevision 返回本地已知的最大权威版本序号（从网关的轮询水位）。
+//
+// 0 = 本地从未同步过任何带序号的版本。
+func (s *LauncherUpdateService) MaxAuthorityRevision() int64 {
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	entries := s.loadHistoryIndexLocked()
+	var max int64
+	for _, e := range entries {
+		if e.AuthorityRevision > max {
+			max = e.AuthorityRevision
+		}
+	}
+	return max
+}
+
+// pullHTTP 是拉取 peer exe 用的 HTTP 客户端。
+//
+// 10 分钟超时：128 MiB 全量下载在慢链路上可能要几分钟。
+// 与登录器侧 LauncherSelfUpdate.UpdateHttp 同口径。
+var pullHTTP = &http.Client{Timeout: 10 * time.Minute}
+
+// PullFromPeer 从主网关（peer）拉取指定版本的登录器 exe 并替换本地版本。
+//
+// 这是网关间同步的**唯一拉取实现**，两个调用方共用：
+//   - httprouter 的 /internal/launcher/push handler（收到主网关推送时）
+//   - PeerSyncService 的定时轮询（主网关没推、或推送丢了时的兜底）
+//
+// 流程：
+//  1. GET {peerBase}/api/launcher/update/exe（流式，不整读进内存）
+//  2. 写入临时文件
+//  3. ★ 校验 SHA-256 == 期望 hash（完整性硬约束，不匹配直接丢弃）
+//  4. ReplaceLauncher 完成"入史 + 替换 current.exe + 清 delta"
+//  5. 序号对齐到 peer 的值
+//
+// 返回 error 由调用方决定记什么日志（推送侧记 WARN，轮询侧记 WARN 并下轮重试）。
+// ★ 任何失败都不影响本地现有版本 —— 降级策略是"保持能服务"。
+func (s *LauncherUpdateService) PullFromPeer(peerBase, wantHash, version string, revision int64) error {
+	peerBase = strings.TrimRight(strings.TrimSpace(peerBase), "/")
+	if peerBase == "" {
+		return fmt.Errorf("peerBase 为空")
+	}
+	if wantHash == "" {
+		return fmt.Errorf("期望 hash 为空")
+	}
+	if !ValidateLauncherVersion(version) {
+		return fmt.Errorf("版本号非法: %q", version)
+	}
+
+	url := peerBase + "/api/launcher/update/exe"
+	resp, err := pullHTTP.Get(url)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("peer 返回 %d", resp.StatusCode)
+	}
+
+	// 落临时文件
+	updateDir := s.UpdateDir()
+	if err := utils.MkdirAll(updateDir); err != nil {
+		return fmt.Errorf("建目录: %w", err)
+	}
+	shortHash := wantHash
+	if len(shortHash) > 8 {
+		shortHash = shortHash[:8]
+	}
+	tmpPath := filepath.Join(updateDir, ".sync-"+shortHash+".tmp")
+	defer os.Remove(tmpPath)
+
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("建临时文件: %w", err)
+	}
+	written, copyErr := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return fmt.Errorf("下载中断: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("落盘: %w", closeErr)
+	}
+
+	// ★ 完整性校验：下载内容的 SHA-256 必须等于期望值
+	actualHash, err := security.ComputeFileFingerprintPath(tmpPath)
+	if err != nil {
+		return fmt.Errorf("算指纹: %w", err)
+	}
+	if !strings.EqualFold(actualHash, wantHash) {
+		return fmt.Errorf("指纹不匹配：期望 %s 实得 %s（%d 字节）",
+			shortHash, utils.ShortHash(actualHash), written)
+	}
+
+	// 交给既有上传流程（PE 校验 / 入史 / 替换 / 清 delta）
+	src, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("重开临时文件: %w", err)
+	}
+	entry, err := s.ReplaceLauncher(src, version, "synced from peer", "")
+	src.Close()
+	if err != nil {
+		return fmt.Errorf("ReplaceLauncher: %w", err)
+	}
+
+	// 序号对齐到 peer（失败不影响版本生效，只影响下次轮询的 since 值）
+	if err := s.SetAuthorityRevision(entry.Hash, revision); err != nil {
+		s.logger.Warn(fmt.Sprintf("[LauncherSync] 序号对齐失败（不影响版本生效）: %v", err))
+	}
+
+	s.logger.Info(fmt.Sprintf("[LauncherSync] 已从 peer 同步到 v%s（%s，%d 字节，rev=%d）",
+		version, utils.ShortHash(entry.Hash), written, revision))
+	return nil
 }
 
 // ReplaceLauncher 上传新版本登录器 exe。

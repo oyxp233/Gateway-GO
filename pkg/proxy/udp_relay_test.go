@@ -51,7 +51,7 @@ func TestUDPRelayPerClientUpstreamSocket(t *testing.T) {
 	backendPort := backend.LocalAddr().(*net.UDPAddr).Port
 
 	publicPort := freeUDPPort(t)
-	relay := NewUDPRelay("s5a3", "127.0.0.1", []int{publicPort})
+	relay := NewUDPRelay("s5a3", "", "127.0.0.1", []int{publicPort})
 	if relay == nil {
 		t.Fatal("中继未创建")
 	}
@@ -134,7 +134,7 @@ func TestUDPRelayReusesSessionForSameClient(t *testing.T) {
 	backendPort := backend.LocalAddr().(*net.UDPAddr).Port
 
 	publicPort := freeUDPPort(t)
-	relay := NewUDPRelay("s5a3", "127.0.0.1", []int{publicPort})
+	relay := NewUDPRelay("s5a3", "", "127.0.0.1", []int{publicPort})
 	relay.backendPorts = map[int]int{publicPort: backendPort}
 	if failures := relay.Start(); len(failures) > 0 {
 		t.Fatalf("中继启动失败: %v", failures)
@@ -187,10 +187,10 @@ func TestUDPRelayPorts(t *testing.T) {
 
 // TestNewUDPRelayDisabled 没配端口/后端地址时不应创建中继。
 func TestNewUDPRelayDisabled(t *testing.T) {
-	if relay := NewUDPRelay("s5a3", "127.0.0.1", nil); relay != nil {
+	if relay := NewUDPRelay("s5a3", "", "127.0.0.1", nil); relay != nil {
 		t.Fatal("端口为空时应返回 nil")
 	}
-	if relay := NewUDPRelay("s5a3", "", []int{30000}); relay != nil {
+	if relay := NewUDPRelay("s5a3", "", "", []int{30000}); relay != nil {
 		t.Fatal("后端地址为空时应返回 nil")
 	}
 }

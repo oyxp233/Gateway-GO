@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,19 @@ type Server struct {
 	// 两个进程各持一份共用 launcher_update/ 目录 —— admin 上传后网关进程
 	// 下一次请求自动感知新版本，不需要跨进程通知。
 	launcherUpdate *service.LauncherUpdateService
+
+	// dnfExeUpdate 是 DNF.EXE 增量更新分发（2026-10-25，见 dnfexe_update.go）。
+	// 与 launcherUpdate 同模式：纯文件系统 + currentStamp（size+mtime）签名校验，
+	// 两个进程各持一份共用 dnfexe_update/ 目录 —— admin 上传后网关进程
+	// 下一次请求自动感知新版本，不需要跨进程通知。
+	dnfExeUpdate *service.DnfExeUpdateService
+
+	// peerSync 是网关间同步服务，**只在主网关**非 nil（配了 Signing.Peers）。
+	//
+	// 用途：上传/回退登录器版本成功后，主动把新版本推送给从网关，
+	// 让发版从"等从网关 300s 轮询"变成秒级生效。
+	// 见 SetPeerSync 与 launcher_update.go 的触发点。
+	peerSync *service.PeerSyncService
 
 	// 公告服务：**只在网关进程**非 nil。
 	// admin 进程不注册 /api/launcher/item-ranking（公开路由），
@@ -148,6 +162,7 @@ func NewServer(
 		portStore: portStore,
 		plugins:   newPluginStore(cfg.Launcher.PluginDir),
 		launcherUpdate: service.NewLauncherUpdateService(cfg, logger),
+		dnfExeUpdate:   service.NewDnfExeUpdateService(cfg, logger),
 		sessions:  b.Sessions,
 		pvf:       b.Pvf,
 		ports:     b.Ports,
@@ -265,7 +280,31 @@ func isLoopbackAddr(addr string) bool {
 // 静态页也不该从内部端口暴露出去。
 func (s *Server) useCommonMiddleware(r *mux.Router) {
 	r.Use(s.httpRateLimitMiddleware)
+	r.Use(s.adminPageNoCacheMiddleware)
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("wwwroot")))
+}
+
+// adminPageNoCacheMiddleware 给后台静态页下发"禁止缓存"响应头。
+//
+// ★ 为什么需要它（2026-10-24 现场）：`wwwroot/index.html` 是从磁盘读的
+//   （http.FileServer(http.Dir("wwwroot"))，不走 go:embed），更新页面后
+//   服务器立刻就是新文件，但**浏览器仍拿旧缓存** —— http.FileServer 只发
+//   Last-Modified，不发 Cache-Control，浏览器按启发式规则缓存，
+//   用户按 F5 刷不出来，表现为"后台没有新功能"。
+//   HTML 里那句 <meta http-equiv="Cache-Control"> 在很多浏览器/反代组合下
+//   并不生效，必须在响应头层面禁用。
+//
+// 只对**非 /api** 路径生效：API 响应由各 handler 自己决定缓存策略
+// （清单类接口本来就要短缓存），这里不插手。
+func (s *Server) adminPageNoCacheMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api") {
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // serveHTTPOn 在指定地址起一个 HTTP(S) 服务（非阻塞）。port<=0 表示不启动。
@@ -419,6 +458,20 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 	// 登录器策略
 	r.HandleFunc("/api/launcher/policy", s.handleLauncherPolicy).Methods("GET")
 
+	// 服清单下发（三服合一，2026-10-24）。
+	// 免鉴权，返回 Ed25519 签名的服清单，登录器据此选服和解析端点。
+	// 见 launcher_servers.go。
+	r.HandleFunc("/api/launcher/servers", s.handleLauncherServers).Methods("GET")
+
+	// Web 注册（三服合一，2026-10-24）。见 register_web.go。
+	//
+	// 同一路径两个方法：GET 返回表单页，POST 处理注册。
+	// ★ 挂在 /api 下是因为 usePublicOnlyMiddleware 会把非 /api 路径 404
+	//   （玩家端口刻意不暴露页面）。
+	// ★ 从网关一律拒绝：GET 返回"请到主网关注册"说明页，POST 返回 403。
+	r.HandleFunc("/api/register", s.handleWebRegisterPage).Methods("GET")
+	r.HandleFunc("/api/register", s.handleWebRegister).Methods("POST")
+
 	// PVF 增量包下载（2026-09-30 PVF 增量更新，公开只读）。
 	//
 	// 与插件下载同组限流（launcher-binary）：它同样是"版本更新时才发生一次"的
@@ -459,6 +512,12 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 	r.HandleFunc("/api/launcher/update/exe", s.handleLauncherUpdateExe).Methods("GET")
 	r.HandleFunc("/api/launcher/update/delta", s.handleLauncherUpdateDelta).Methods("GET")
 
+	// DNF.EXE 增量更新（2026-10-25，公开只读）。与登录器自更新同构。
+	// delta 必须带 ?from=<本地 DNF.EXE hash>。
+	r.HandleFunc("/api/dnfexe/update", s.handleDnfExeUpdateManifest).Methods("GET")
+	r.HandleFunc("/api/dnfexe/update/exe", s.handleDnfExeUpdateExe).Methods("GET")
+	r.HandleFunc("/api/dnfexe/update/delta", s.handleDnfExeUpdateDelta).Methods("GET")
+
 	// 心跳
 	r.HandleFunc("/api/heartbeat", s.handleHeartbeat).Methods("POST")
 
@@ -477,6 +536,10 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 
 	// 在线玩家
 	r.HandleFunc("/api/admin/online", s.handleAdminOnline).Methods("GET")
+	// 运行时能力探测（2026-10-29）：前端据此决定哪些按钮该显示。
+	// 例如 S5A3 下「删除账号」必须隐藏（网关不能安全删）、
+	// 「改密」要提示密码是服务端 bcrypt。
+	r.HandleFunc("/api/admin/runtime", s.handleAdminRuntime).Methods("GET")
 	r.HandleFunc("/api/admin/online/kick", s.handleAdminKick).Methods("POST")
 
 	// 全服发放
@@ -523,6 +586,14 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	// 封禁
 	r.HandleFunc("/api/admin/bans", s.handleAdminBans).Methods("GET")
 	r.HandleFunc("/api/admin/ban", s.handleAdminBan).Methods("POST")
+
+	// 邀请码（2026-10-24）。见 admin_invite.go。
+	// 开启 Register.RequireInvite（默认开）后，注册必须带这里生成的码。
+	r.HandleFunc("/api/admin/invite/generate", s.handleAdminInviteGenerate).Methods("POST")
+	r.HandleFunc("/api/admin/invite/list", s.handleAdminInviteList).Methods("GET")
+	r.HandleFunc("/api/admin/invite/revoke", s.handleAdminInviteRevoke).Methods("POST")
+	r.HandleFunc("/api/admin/invite/export", s.handleAdminInviteExport).Methods("GET")
+
 	// 解除账号与 QQ 号的绑定（2026-09-24）。
 	// 与「解绑设备」是两件事：那个清 device_secret，这个删 qq_bindings 一行。
 	r.HandleFunc("/api/admin/qq/unbind", s.handleAdminQQUnbind).Methods("POST")
@@ -584,6 +655,13 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/launcher/versions", s.handleAdminLauncherVersions).Methods("GET")
 	r.HandleFunc("/api/admin/launcher/upload", s.handleAdminLauncherUpload).Methods("POST")
 	r.HandleFunc("/api/admin/launcher/rollback", s.handleAdminLauncherRollback).Methods("POST")
+
+	// DNF.EXE 版本管理（2026-10-25 增量更新）。与登录器同模式：纯文件系统、
+	// 两个进程共用 dnfexe_update/ 目录，不走内部 API。
+	// ★ /api/admin/dnfexe/upload 收 ~20 MiB exe，已加 bodylimit 白名单。
+	r.HandleFunc("/api/admin/dnfexe/versions", s.handleAdminDnfExeVersions).Methods("GET")
+	r.HandleFunc("/api/admin/dnfexe/upload", s.handleAdminDnfExeUpload).Methods("POST")
+	r.HandleFunc("/api/admin/dnfexe/rollback", s.handleAdminDnfExeRollback).Methods("POST")
 
 	// 服务端管理
 	r.HandleFunc("/api/admin/server/status", s.handleAdminServerStatus).Methods("GET")
@@ -651,6 +729,22 @@ func (s *Server) registerInternalRoutes(r *mux.Router) {
 	r.HandleFunc("/internal/announce/config", s.checkInternal(s.handleInternalAnnounceConfigGet)).Methods("GET")
 	r.HandleFunc("/internal/announce/config", s.checkInternal(s.handleInternalAnnounceConfigSet)).Methods("POST")
 	r.HandleFunc("/internal/announce/popup", s.checkInternal(s.handleInternalAnnouncePopup)).Methods("POST")
+
+	// 登录器包同步（三服合一，2026-10-24）：主网关做权威，从网关拉取。
+	// 见 launcher_sync.go。
+	r.HandleFunc("/internal/launcher/sync", s.checkInternal(s.handleInternalLauncherSync)).Methods("GET")
+	r.HandleFunc("/internal/launcher/push", s.checkInternal(s.handleInternalLauncherPush)).Methods("POST")
+
+	// DNF.EXE 包同步（三服合一，2026-10-25）：主网关做权威，从网关拉取。
+	// 见 dnfexe_sync.go。
+	r.HandleFunc("/internal/dnfexe/sync", s.checkInternal(s.handleInternalDnfExeSync)).Methods("GET")
+	r.HandleFunc("/internal/dnfexe/push", s.checkInternal(s.handleInternalDnfExePush)).Methods("POST")
+
+	// 账号事件同步（三服合一，2026-10-24）：从网关增量拉取主网关的事件流。
+	// 见 account_sync.go。
+	r.HandleFunc("/internal/account/events", s.checkInternal(s.handleInternalAccountEvents)).Methods("GET")
+	// 账号凭据反查（登录兜底）：从网关本地查不到账号时向主网关取 pwd_hash/salt/m_id。
+	r.HandleFunc("/internal/account/credential", s.checkInternal(s.handleInternalAccountCredential)).Methods("GET")
 }
 
 // checkInternal 校验内部调用密钥。用常量时间比较，避免时序侧信道。
@@ -1074,6 +1168,81 @@ func (s *Server) handleLauncherVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// launcherChannelInfo 组装下发给登录器的频道目录快照。
+//
+// 形状：
+//
+//	{
+//	  "landing": 10,                        // 建议落点频道（常驻城镇）
+//	  "open":    [10, 11, 23, 28, 75, ...], // 当前真正在听的频道号（升序）
+//	  "count":   21,
+//	  "source":  "proxy"                    // proxy=代理实况；config=配置兜底
+//	}
+//
+// ★ 为什么用「代理实况」而不是配置里的 GamePorts：
+//   配置可以列 120 个端口，但运维会在 `proxy_ports.json` 里只开其中一部分
+//   （90CN 就是只开 21 个）。玩家只能连到真正在听的那些，登录器如果按配置
+//   全量去判定"频道有效"，就会把连不上的频道当成可用，等于没修。
+//
+// ★ 端口 → 频道号是 `端口 - 10000`（`channel_info.etc` 的默认映射，
+//   见 Docs/CHANNEL_TABLE_DEPLOYMENT.md："默认端口为 10000 + 频道号"）。
+//
+// 失败一律返回空 open + 配置兜底的 landing，**不让 policy 整个失败** ——
+// 频道目录是"锦上添花"，登录器拿不到就退回它自己的编译期常量。
+func (s *Server) launcherChannelInfo() map[string]interface{} {
+	landing := config.DefaultLandingChannel
+	if s.config != nil {
+		landing = s.config.ResolveLandingChannel()
+	}
+
+	out := map[string]interface{}{
+		"landing": landing,
+		"open":    []int{},
+		"count":   0,
+		"source":  "proxy",
+	}
+
+	if s.ports == nil {
+		out["source"] = "config"
+		return out
+	}
+	active, err := s.ports.Active()
+	if err != nil {
+		out["source"] = "config"
+		return out
+	}
+
+	open := make([]int, 0, len(active))
+	for port := range active {
+		// 只认游戏口。频道引导口是 7001、内部口在 18080，都不在这个区间。
+		if port > 10000 && port < 20000 {
+			open = append(open, port-10000)
+		}
+	}
+	sort.Ints(open)
+
+	out["open"] = open
+	out["count"] = len(open)
+
+	// 落点不在开放列表里时，退到"开放列表里最小的那个"并标注出来 ——
+	// 运维把落点关掉了属于配置错误，但让登录器拿到一个能连的号，
+	// 总比让它把玩家写到一个连不上的频道上强。
+	if len(open) > 0 {
+		found := false
+		for _, c := range open {
+			if c == landing {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out["landing"] = open[0]
+			out["landing_fallback"] = true
+		}
+	}
+	return out
+}
+
 func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 	rev := r.URL.Query().Get("rev")
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
@@ -1165,6 +1334,22 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 		"game_found": gameFound,
 		"gates":      gates,
 	}
+
+	// ── 频道目录（2026-10-29）────────────────────────────────────
+	//
+	// 登录器启动前要按"服务端当前有哪些频道"来修正客户端的频道记忆
+	// （DNF.cfg 里存着上次连的频道号；频道改号后旧号已不存在，客户端会按旧号
+	// 去连 → 连不上 → 卡在选人界面 → 弹回频道列表）。
+	//
+	// 数据源是**代理实际在听的端口**（不是配置里的 GamePorts）：
+	// 配置可以列 120 个，但运维可能只开了其中一部分（`proxy_ports.json` 的
+	// enabled 开关），客户端只能连到真正在听的那些。频道号 = 端口 - 10000。
+	//
+	// 同样**恒返回**（与 gates 同理）：它不受 changed 短路影响，
+	// 否则指纹没变时登录器拿不到频道表，改完频道还得等 PVF/策略变化才生效。
+	//
+	// 兼容性：老登录器不认识 `channels` 键，多收一个对象不会有任何影响。
+	resp["channels"] = s.launcherChannelInfo()
 	if changed {
 		resp["white"] = snap.WhiteList
 		resp["black"] = snap.BlackList
@@ -1231,17 +1416,53 @@ func (s *Server) handleAdminOnline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 角色名 / 等级（2026-11-01）。
+	//
+	// 后台在线表原来只有「账号 / IP / 在线时长」，运营看不出这个号现在在玩哪个角色、
+	// 多少级 —— 玩家来报"我卡住了"时对不上人。
+	//
+	// 两步批量查（账号 → m_id → 当前角色），不按人循环打库：
+	// S5A3 下 m_id 是 `dnf:10001` 这种，由 GetMIdsByNames 的 S5A3 分支解析。
+	names := make([]string, 0, len(online))
+	for _, p := range online {
+		names = append(names, p.Account)
+	}
+	mIds := map[string]string{}
+	roleByMId := map[string]database.OnlineRoleCandidate{}
+	if s.db != nil && len(names) > 0 {
+		if got, err := s.db.GetMIdsByNames(names); err == nil {
+			mIds = got
+			mIdList := make([]string, 0, len(got))
+			for _, m := range got {
+				mIdList = append(mIdList, m)
+			}
+			if roles, err := s.db.GetCurrentRolesByMIds(mIdList); err == nil {
+				roleByMId = roles
+			}
+		}
+	}
+
 	// 刻意保留原来的 camelCase 键名，前端按这些键取值
 	players := make([]map[string]interface{}, 0, len(online))
 	for _, p := range online {
-		players = append(players, map[string]interface{}{
+		item := map[string]interface{}{
 			"account":       p.Account,
 			"ip":            p.IP,
 			"onlineMinutes": p.OnlineMinutes,
 			"lastHeartbeat": p.LastHeartbeat,
 			"bonusGranted":  p.BonusGranted,
 			"cera":          p.Cera,
-		})
+		}
+		// 停在选人界面时没有当前角色 —— 这几个字段就不下发，前端显示 "-"。
+		if mId, ok := mIds[p.Account]; ok {
+			if c, ok := roleByMId[mId]; ok {
+				item["roleName"] = c.Name
+				item["roleLevel"] = c.Level
+				item["roleJob"] = c.Job
+				item["roleCount"] = c.RoleCount
+			}
+		}
+		players = append(players, item)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1836,8 +2057,65 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAdminRuntime 返回运行时的能力快照，供前端决定哪些按钮该显示。
+//
+// 目前只有 `game_backend`（"sqlite" / "s5a3" / ""）：
+//   - s5a3：隐藏「删除账号」（网关不能安全删，会留孤儿数据）、
+//           「改密」提示密码是服务端 bcrypt、
+//           「账号同步」只同步身份不同步密码。
+//   - sqlite：S4A21 的原有行为，全部按钮照旧。
+func (s *Server) handleAdminRuntime(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
+		return
+	}
+	backend := s.db.GameBackend()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":           true,
+		"game_backend": backend,
+		// 前端只需要一个布尔就能决定隐藏哪些危险按钮，
+		// 但把原始值也给出，便于排查"为什么按钮不见了"。
+		"s5a3": backend == "s5a3",
+		"capabilities": map[string]interface{}{
+			"delete_account":   backend != "s5a3",
+			"reset_password":   true,
+			"password_plain":   backend == "s5a3", // S5A3 要明文，S4A21 服务端转 MD5
+			"account_sync":     true,
+			"device_binding":   backend != "s5a3", // S5A3 登录器不传 device_secret
+			"game_events":      backend != "s5a3", // S5A3 的活动开关在 GM 工具里
+			"register_limit":   true,
+		},
+	})
+}
+
 func (s *Server) handleAdminSyncAccounts(w http.ResponseWriter, r *http.Request) {
 	if !s.checkAdmin(w, r) {
+		return
+	}
+
+	// ★ S5A3 分支（2026-10-29）：语义不同。
+	//
+	// S4A21 的"同步"是把游戏库 accounts 表的密码哈希/盐**导入**网关库。
+	// S5A3 的账号主权在服务端 MySQL，密码是 bcrypt 不可互转（三服合一
+	// 评估文档限制 #6），所以这里只同步**身份**（m_id + name），
+	// 密码列留空 —— 目的是让后台列表/账号事件/封禁能对上号。
+	if s.db.GameBackend() == "s5a3" {
+		result, err := s.db.SyncS5A3AccountMirrors()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok":      true,
+			"message": fmt.Sprintf("S5A3 账号身份同步完成：共 %d 个，新建 %d，已存在 %d", result.Total, result.Created, result.Existing),
+			// 复用前端的字段名，避免为 S5A3 再改一套渲染逻辑。
+			"game_accounts": result.Total,
+			"imported":      result.Created,
+			"skipped":       result.Existing,
+			"failed":        len(result.Failed),
+			"conflicts":     result.Conflicts,
+			"failed_items":  result.Failed,
+			"note":          "只同步账号身份（m_id + 账号名），不同步密码 —— S5A3 密码是服务端 bcrypt，网关这份镜像不能用来验密",
+		})
 		return
 	}
 
@@ -1891,6 +2169,35 @@ func (s *Server) handleAdminResetPassword(w http.ResponseWriter, r *http.Request
 
 	if body.Account == nil || strings.TrimSpace(*body.Account) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "参数不完整"})
+		return
+	}
+
+	// ★ S5A3 分支（2026-10-29）：密码由服务端 bcrypt 掌管，网关必须拿**明文**
+	// 才能生成能被服务端校验的哈希（MD5 不可逆）。所以这条路径优先要 newPassword，
+	// 且不能走下面的"明文转 MD5"逻辑。
+	//
+	// 只传了 newPasswordMd5 的调用方（旧脚本）在 S5A3 下会拿到明确提示，
+	// 而不是写进一条永远验不过的哈希。
+	if s.db.GameBackend() == "s5a3" {
+		if body.NewPassword == nil || strings.TrimSpace(*body.NewPassword) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"ok": false, "success": false,
+				"message": "S5A3 服的密码是服务端 bcrypt，重置必须提供明文新密码（newPassword），不能用 newPasswordMd5",
+			})
+			return
+		}
+		code, msg := s.adminSvc.ResetPasswordS5A3(*body.Account, *body.NewPassword)
+		ok := code == models.Err.Ok
+		if msg == "" {
+			if ok {
+				msg = "重置成功"
+			} else {
+				msg = "重置失败"
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok": ok, "success": ok, "message": msg,
+		})
 		return
 	}
 
@@ -2013,6 +2320,49 @@ func (s *Server) handleAdminResetAllPasswords(w http.ResponseWriter, r *http.Req
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "参数不完整"})
+		return
+	}
+
+	// ★ S5A3 分支（2026-10-29）：批量重置必须走 bcrypt，且只能收明文。
+	//
+	// 这条路径逐个账号算 bcrypt（每个约 50~80ms），100 个账号要 5~8 秒 ——
+	// 所以前端要给出"正在执行"的感知，别让管理员以为卡死。
+	if s.db.GameBackend() == "s5a3" {
+		if body.NewPassword == nil || strings.TrimSpace(*body.NewPassword) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"ok": false, "message": "S5A3 服的密码是服务端 bcrypt，批量重置必须提供明文新密码（newPassword）",
+			})
+			return
+		}
+		newPwd := *body.NewPassword
+		if err := database.ValidateS5A3Password(newPwd); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": err.Error()})
+			return
+		}
+		names, err := s.db.ListS5A3AccountNames()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "message": err.Error()})
+			return
+		}
+		if body.DryRun {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"ok": true, "message": "预演完成（未执行任何修改）", "dry_run": true,
+				"total": len(names), "updated": 0, "failed": 0,
+			})
+			return
+		}
+		updated, failed := 0, 0
+		for _, name := range names {
+			if code, _ := s.adminSvc.ResetPasswordS5A3(name, newPwd); code == models.Err.Ok {
+				updated++
+			} else {
+				failed++
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok": true, "message": "S5A3 批量重置完成（服务端 bcrypt 已全部更新）", "dry_run": false,
+			"total": len(names), "updated": updated, "failed": failed,
+		})
 		return
 	}
 
@@ -2284,6 +2634,11 @@ func deleteAccountErrorResponse(err error) (int, map[string]interface{}) {
 	case errors.Is(err, database.ErrAccountHasCharacters):
 		return http.StatusConflict, map[string]interface{}{
 			"ok": false, "code": "has_characters", "message": err.Error()}
+	// S5A3 下删号是被明确禁止的能力，用 409（能力不可用）而不是 500 ——
+	// 这不是服务端错误，是"这个部署不支持这个动作"。
+	case errors.Is(err, database.ErrS5A3AccountDeleteUnsupported):
+		return http.StatusConflict, map[string]interface{}{
+			"ok": false, "code": "unsupported", "message": err.Error()}
 	default:
 		return http.StatusInternalServerError, map[string]interface{}{
 			"ok": false, "code": "error", "message": err.Error()}
@@ -2449,7 +2804,11 @@ func (s *Server) handleAdminBans(w http.ResponseWriter, r *http.Request) {
 
 	rows := make([]map[string]interface{}, len(entries))
 	for i, e := range entries {
-		rows[i] = map[string]interface{}{"name": e.Name, "reason": e.Reason, "banned_at": e.BannedAt}
+		rows[i] = map[string]interface{}{
+			"name": e.Name, "reason": e.Reason, "banned_at": e.BannedAt,
+			// scope（三服合一，2026-10-24）：global = 三服同封，其余 = 只封该服
+			"scope": e.Scope,
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2465,6 +2824,9 @@ func (s *Server) handleAdminBan(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Account *string `json:"account"`
 		Reason  *string `json:"reason"`
+		// Scope 是封禁范围（三服合一，2026-10-24）：
+		// "global"（缺省）= 三服同时封；"s4a21"/"s5a3"/"s5a95" = 只封该服。
+		Scope *string `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Account == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "参数不完整"})
@@ -2477,14 +2839,27 @@ func (s *Server) handleAdminBan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.BanAccount(account, deref(body.Reason, "")); err != nil {
+	reason := deref(body.Reason, "")
+	scope := strings.TrimSpace(deref(body.Scope, ""))
+	if scope == "" {
+		scope = database.BanScopeGlobal
+	}
+
+	if err := s.db.BanAccountScoped(account, reason, scope); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "message": err.Error()})
 		return
 	}
 
+	// 记录账号事件（供从网关同步）。
+	// 只有 global 封禁才需要广播到其它服；分服封禁留在本服。
+	// 写流水失败不影响封禁本身（封禁已落库）。
+	if err := s.db.RecordAccountEvent(database.AccountEventBan, account, reason, scope); err != nil {
+		s.logger.Warn("记录账号事件(ban)失败: " + err.Error())
+	}
+
 	kicked, _ := s.sessions.Kick(account)
 	session.LogKickAccount(account, s.logger)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "kicked": kicked})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "kicked": kicked, "scope": scope})
 }
 
 func (s *Server) handleAdminUnban(w http.ResponseWriter, r *http.Request) {
@@ -2500,7 +2875,15 @@ func (s *Server) handleAdminUnban(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	removed, _ := s.db.UnbanAccount(strings.TrimSpace(*body.Account))
+	account := strings.TrimSpace(*body.Account)
+	removed, _ := s.db.UnbanAccount(account)
+
+	// 记录账号事件（供从网关同步解封）
+	if removed {
+		if err := s.db.RecordAccountEvent(database.AccountEventUnban, account, "", database.BanScopeGlobal); err != nil {
+			s.logger.Warn("记录账号事件(unban)失败: " + err.Error())
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "removed": removed})
 }
 
@@ -3133,12 +3516,24 @@ func (s *Server) handleAdminRegisterLogs(w http.ResponseWriter, r *http.Request)
 	case machine != "":
 		logs, err = s.db.ListRecentRegistrationLogsByMachine(machine, limit)
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "需要 ip 或 machine 参数"})
-		return
+		// 2026-11-01：不再强制要求 ip/machine。
+		//
+		// 运营来查的时候手里往往只有一个账号名，或者玩家只说了一句"我注册不了"，
+		// 逼他们填 IP/机器码等于把功能废掉（这正是"注册流水功能无效"的成因）。
+		// 不填就给最近 N 条。
+		logs, err = s.db.ListRecentRegistrationLogs(limit)
 	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
+	}
+
+	// 被拒记录（2026-11-01）：回答"为什么注册不了"。
+	// 只有给了 ip 才按 ip 过滤；否则给最近的。查失败不影响主列表。
+	rejects, rerr := s.db.ListRecentRegisterRejects(ip, limit)
+	if rerr != nil {
+		rejects = nil
+		s.logger.Warn("查注册被拒流水失败: " + rerr.Error())
 	}
 
 	out := make([]map[string]interface{}, 0, len(logs))
@@ -3151,7 +3546,24 @@ func (s *Server) handleAdminRegisterLogs(w http.ResponseWriter, r *http.Request)
 			"created_at": l.CreatedAt,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "logs": out})
+
+	rejectsOut := make([]map[string]interface{}, 0, len(rejects))
+	for _, j := range rejects {
+		rejectsOut = append(rejectsOut, map[string]interface{}{
+			"account":     j.Account,
+			"ip":          j.IP,
+			"machine_id":  j.MachineID,
+			"reason_code": j.ReasonCode,
+			"reason":      j.Reason,
+			"created_at":  j.CreatedAt,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":      true,
+		"logs":    out,
+		"rejects": rejectsOut,
+	})
 }
 
 // ==================== 辅助函数 ====================

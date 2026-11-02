@@ -28,20 +28,34 @@ import (
 // acceptGreetingBackend 接受一条后端连接：立即下发 greeting（复刻线上
 // dfo-server「只收 PROXY 头、零客户端数据也发」的行为），并把随后收到
 // 的全部字节（直到对端关闭或超时）送到返回 channel（cap=1，无需读取）。
-func acceptGreetingBackend(ln net.Listener, greeting []byte, wait time.Duration) <-chan []byte {
-	out := make(chan []byte, 1)
+// backendRead 是假后端的读取结果。
+//
+// ★ 三种情形必须分开（原来只回一个 []byte，%q 全打成 ""，现场分不清）：
+//   - AcceptErr != nil：listener 层面出错（测试环境问题，与网关无关）
+//   - ReadErr != nil 且 Data 为空：网关发 RST 把已写的 PROXY 头丢掉了（**网关 bug**）
+//   - ReadErr != nil 但 Data 非空：读到了数据，末尾错误可忽略
+type backendRead struct {
+	Data      []byte
+	AcceptErr error
+	ReadErr   error
+}
+
+// acceptGreetingBackend 起一个假后端：Accept 一条连接、先发 greeting、
+// 然后把收到的字节全部读出来（读到 EOF）。
+func acceptGreetingBackend(ln net.Listener, greeting []byte, wait time.Duration) <-chan backendRead {
+	out := make(chan backendRead, 1)
 	go func() {
 		c, err := ln.Accept()
 		if err != nil {
-			out <- nil
+			out <- backendRead{AcceptErr: err}
 			return
 		}
 		defer c.Close()
 		_ = c.SetWriteDeadline(time.Now().Add(3 * time.Second))
 		_, _ = c.Write(greeting)
 		_ = c.SetReadDeadline(time.Now().Add(wait))
-		data, _ := io.ReadAll(c)
-		out <- data
+		data, err := io.ReadAll(c)
+		out <- backendRead{Data: data, ReadErr: err}
 	}()
 	return out
 }
@@ -149,15 +163,20 @@ func TestRejectedGameConnNeverReachesBackend(t *testing.T) {
 	}
 
 	select {
-	case data := <-received:
-		if !bytes.HasPrefix(data, []byte("PROXY ")) {
-			t.Fatalf("后端应先收到 PROXY 头，实际: %q", data)
+	case got := <-received:
+		if got.AcceptErr != nil {
+			t.Fatalf("假后端 Accept 失败（测试环境问题，与网关无关）: %v", got.AcceptErr)
+		}
+		if !bytes.HasPrefix(got.Data, []byte("PROXY ")) {
+			// Data 为空 + ReadErr = 网关用 RST 关连接，把已写入的 PROXY 头一起丢了
+			t.Fatalf("后端应先收到 PROXY 头，实际 %d 字节: %q（ReadErr=%v）",
+				len(got.Data), got.Data, got.ReadErr)
 		}
 		// PROXY 头之后不该有任何客户端字节
-		if idx := bytes.Index(data, []byte("\r\n")); idx < 0 || len(data) != idx+2 {
-			t.Fatalf("拒绝连接仍把客户端字节送进了后端: %q", data)
+		if idx := bytes.Index(got.Data, []byte("\r\n")); idx < 0 || len(got.Data) != idx+2 {
+			t.Fatalf("拒绝连接仍把客户端字节送进了后端: %q", got.Data)
 		}
-		t.Logf("后端只收到 PROXY 头（%d 字节），连接已被网关关闭", len(data))
+		t.Logf("后端只收到 PROXY 头（%d 字节），连接已被网关关闭", len(got.Data))
 	case <-time.After(5 * time.Second):
 		t.Fatal("后端连接 5 秒未被关闭——拒决后网关没释放后端连接")
 	}

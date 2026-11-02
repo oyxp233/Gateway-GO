@@ -3,6 +3,7 @@ package utils
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -235,4 +236,80 @@ func (e *SystemdError) Error() string {
 // Unwrap 保留原始错误，便于 errors.Is/As。
 func (e *SystemdError) Unwrap() error {
 	return e.Err
+}
+
+// ==================== journald（2026-11-01） ====================
+
+// journalctlTimeout journalctl 的最长等待时间。
+//
+// 只读最近 N 行，正常是毫秒级；给 15 秒是为了兜住"journal 很大 + 磁盘慢"，
+// 又不至于把后台请求挂死。
+const journalctlTimeout = 15 * time.Second
+
+// JournalTail 读取某个 systemd 单元的最近 N 行日志（走 journalctl）。
+//
+// 为什么需要：S5A3 服务端由 systemd 托管，**不写日志文件** —— 标准输出直接进
+// journald。后台「服务端日志」原来只按文件 tail，于是永远返回「未配置的日志键」。
+//
+// 返回 journalctl 的原样输出行（`short-iso` 格式，自带时间戳），观感与文件 tail 一致。
+func JournalTail(unit string, lines int) ([]string, error) {
+	unit = strings.TrimSpace(unit)
+	if unit == "" {
+		return nil, errors.New("未配置服务单元名（Server.Unit），无法从 journald 读取")
+	}
+	// 单元名来自配置文件，但仍然做一次白名单校验：配置写错时宁可明确报错，
+	// 也不要把奇怪的值当参数塞给 journalctl。
+	if !validUnitName(unit) {
+		return nil, fmt.Errorf("服务单元名不合法: %q", unit)
+	}
+	if lines <= 0 {
+		lines = 300
+	}
+	if lines > 5000 {
+		lines = 5000
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), journalctlTimeout)
+	defer cancel()
+
+	// --no-pager 必须带：否则 journalctl 会尝试调 less，在非交互环境下直接挂住。
+	cmd := exec.CommandContext(ctx, "journalctl",
+		"-u", unit,
+		"-n", strconv.Itoa(lines),
+		"--no-pager",
+		"--output=short-iso")
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("journalctl 超时（%s）", journalctlTimeout)
+		}
+		// 把 stderr 带出来：最常见的是权限不足（服务账号不在 systemd-journal 组）。
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return nil, fmt.Errorf("journalctl 读取失败: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("journalctl 读取失败: %w", err)
+	}
+
+	text := strings.TrimRight(string(out), "\n")
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	return strings.Split(text, "\n"), nil
+}
+
+// validUnitName 校验 systemd 单元名：只允许字母数字与 @ . _ -，长度有上限。
+func validUnitName(name string) bool {
+	if len(name) == 0 || len(name) > 128 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '@' || r == '.' || r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }

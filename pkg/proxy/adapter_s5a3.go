@@ -50,10 +50,27 @@ func NewS5A3PassthroughAdapter() DownlinkAdapter {
 	return s5a3PassthroughAdapter{}
 }
 
-// ProcessDownlink 原样返回 pending，不做切帧、不解密、不改写。
+// ProcessDownlink 把 pending 原样写出，不做切帧、不解密、不改写。
 //
-// 不切帧是刻意的：切帧需要知道 S5A3 频道帧的头部布局，而透传形态下
-// 网关根本不需要理解它。少一层解析就少一个会腐化的地方。
-func (s5a3PassthroughAdapter) ProcessDownlink(pending []byte, _ net.Conn) []byte {
-	return pending
+// ★ 必须真的写出去（2026-10-22 修复）：DownlinkAdapter 的契约是
+// 「适配器负责把可发送的字节交给 dst，返回值只承载**尚未处理完的残包**」
+// （对照 S4A21 实现：处理完返回 nil，有半帧才返回 pending[offset:]）。
+// 本函数初版直接 return pending，等于告诉调用方"这些字节还没处理完，
+// 留着等下次"——copyDownlink 于是每轮 append 新数据、再把整块交回来，
+// 缓冲区无界增长，客户端一个字节也收不到。
+//
+// 线上表现就是「接受频道信息失败」：后端已经回了 47B 应答 + 约 13.6KB
+// 频道表（tcpdump 实证），网关全吞在内存里，客户端等 3 秒超时重连，
+// 无限循环，永远走不到游戏口。
+//
+// 不切帧依然是刻意的：透传形态下网关不需要理解 S5A3 的帧布局，
+// 攒多少发多少，所以**永远没有残包**，恒定返回 nil。
+func (s5a3PassthroughAdapter) ProcessDownlink(pending []byte, dst net.Conn) []byte {
+	if len(pending) > 0 {
+		// 写失败也返回 nil：连接已坏，调用方下一轮 Read 会拿到错误并退出循环；
+		// 绝不能把 pending 还回去，那正是上面那个无界增长的成因。
+		// （net.Conn.Write 的契约保证 n < len 时必然带回 err，故无需处理短写。）
+		_, _ = dst.Write(pending)
+	}
+	return nil
 }

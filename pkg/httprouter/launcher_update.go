@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"s4a21-gateway/pkg/models"
+	"s4a21-gateway/pkg/service"
 	"s4a21-gateway/pkg/utils"
 )
 
@@ -150,10 +151,37 @@ func (s *Server) handleAdminLauncherVersions(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// SetPeerSync 注入网关间同步服务（主网关上传播录器版本用）。
+//
+// 传 nil 或本机没配 Signing.Peers 时，上传/回退完成后**不推送** ——
+// 只靠从网关自己的 300s 轮询追平（旧行为）。
+func (s *Server) SetPeerSync(ps *service.PeerSyncService) {
+	s.peerSync = ps
+}
+
+// notifyPeersLauncherChanged 把新版本推送给所有从网关（异步、失败不影响调用方）。
+//
+// ★ 只在**主网关**（配了 Signing.Peers）有意义。
+//   从网关不配 Peers，PushLauncherToPeers 内部会直接返回。
+//
+// ★ 异步：从网关可能在内网慢链路上，同步等会把后台 HTTP 请求挂住。
+//
+// ★ 推送失败不影响上传结果：轮询兜底还在（默认 300s），
+//   这只是把生效时间从"最多 5 分钟"降到"秒级"。
+func (s *Server) notifyPeersLauncherChanged(cur *models.LauncherBuildEntry) {
+	if s.peerSync == nil || cur == nil {
+		return
+	}
+	rev := s.launcherUpdate.MaxAuthorityRevision()
+	go s.peerSync.PushLauncherToPeers(cur.Hash, cur.Version, rev)
+}
+
 // handleAdminLauncherUpload 上传新版本登录器 exe。
 //
 // multipart 字段：file（必填，exe 本体）、version（必填，x.y.z）、name（可选备注）。
 // 上传 134 MiB 走 admin 端口（bodylimit 白名单放行 512 MiB）。
+//
+// 成功后除写响应外，还会**异步通知从网关**有新版本（见 notifyPeersLauncherChanged）。
 func (s *Server) handleAdminLauncherUpload(w http.ResponseWriter, r *http.Request) {
 	if !s.checkAdmin(w, r) {
 		return
@@ -183,6 +211,8 @@ func (s *Server) handleAdminLauncherUpload(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": err.Error()})
 		return
 	}
+	// 上传成功 → 通知从网关有新版本（异步，失败不影响本次上传）
+	s.notifyPeersLauncherChanged(cur)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "version": cur.Version, "hash": cur.Hash, "size": cur.Size,
 	})
@@ -205,6 +235,8 @@ func (s *Server) handleAdminLauncherRollback(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": err.Error()})
 		return
 	}
+	// 回退也是"版本变了"，同样要通知从网关（否则它们还停在新版上）
+	s.notifyPeersLauncherChanged(cur)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "version": cur.Version, "hash": cur.Hash, "size": cur.Size,
 	})

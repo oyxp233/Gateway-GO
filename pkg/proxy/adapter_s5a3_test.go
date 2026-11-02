@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"io"
+	"net"
+	"sync/atomic"
 	"testing"
 
 	"s4a21-gateway/pkg/config"
@@ -70,26 +73,100 @@ func TestNewProxyServerS5A3ForcedSettings(t *testing.T) {
 	}
 }
 
-// TestS5A3PassthroughAdapterKeepsBytes 透传适配器必须**逐字节**返回输入。
+// TestS5A3PassthroughAdapterWritesBytes 透传适配器必须**把字节真的写给 dst**。
 //
-// 这条断言看着废话，但它守的是本分支的核心承诺：网关不理解也不改写
-// S5A3 的频道帧。任何"顺手做个 trim/切帧"的改动都会让 CHANNELINFO 里的
-// IP / 端口与服务端配置对不上，表现为客户端连不上频道。
-func TestS5A3PassthroughAdapterKeepsBytes(t *testing.T) {
+// ★ 2026-10-22 重写。原测试断言的是 `ProcessDownlink(input, nil) == input`，
+// 把接口语义搞反了：DownlinkAdapter 的返回值是**尚未处理完的残包**，不是
+// "处理结果"。于是初版实现 `return pending` 既没写 dst、又把数据留在缓冲区，
+// 原测试却全程绿灯——测试固化了一个会让频道口彻底瘫痪的 bug（线上表现为
+// 「接受频道信息失败」，后端 13.6KB 频道表被网关吞进内存）。
+//
+// 现在断言两件事，缺一不可：
+//  1. 字节逐字节到达 dst（不改写，守"网关不理解 S5A3 帧"的承诺）；
+//  2. 返回值必须是空（无残包），否则 copyDownlink 会无限堆积。
+func TestS5A3PassthroughAdapterWritesBytes(t *testing.T) {
 	adapter := NewS5A3PassthroughAdapter()
 
+	// 空输入：不写、不 panic、无残包。dst 给 nil 也不该被触碰。
+	for _, input := range [][]byte{nil, {}} {
+		if left := adapter.ProcessDownlink(input, nil); len(left) != 0 {
+			t.Fatalf("空输入不应产生残包，实际 %d 字节", len(left))
+		}
+	}
+
 	cases := [][]byte{
-		nil,
-		{},
 		{0x00},
 		bytes.Repeat([]byte{0xFF}, 1500),
 		[]byte("class0/op1 CHANNELINFO \x00\xb5\xb5"),
+		bytes.Repeat([]byte{0xA5}, 13*1024), // 对齐线上实测的频道表体量
 	}
 	for index, input := range cases {
-		got := adapter.ProcessDownlink(input, nil)
+		server, client := net.Pipe()
+		// net.Pipe 是同步管道：Write 会阻塞到对端 Read，接收必须放独立协程。
+		received := make(chan []byte, 1)
+		go func() {
+			buf := make([]byte, len(input))
+			n, _ := io.ReadFull(client, buf)
+			received <- buf[:n]
+		}()
+
+		left := adapter.ProcessDownlink(input, server)
+		if len(left) != 0 {
+			server.Close()
+			client.Close()
+			t.Fatalf("用例 %d：透传适配器不应留下残包，实际 %d 字节", index, len(left))
+		}
+		server.Close()
+
+		got := <-received
+		client.Close()
 		if !bytes.Equal(got, input) {
 			t.Fatalf("用例 %d：透传后字节不一致\n输入 %x\n输出 %x", index, input, got)
 		}
+	}
+}
+
+// TestS5A3PassthroughAdapterNoPendingGrowth 回归测试：连续多轮喂数据，
+// 每轮都必须立刻写出且不留残包。
+//
+// 初版 `return pending` 在这里第一轮就会失败（返回值非空、对端收不到字节），
+// 而且 pending 会随轮次无界增长——这正是「接受频道信息失败」的直接成因。
+func TestS5A3PassthroughAdapterNoPendingGrowth(t *testing.T) {
+	adapter := NewS5A3PassthroughAdapter()
+
+	server, client := net.Pipe()
+	defer client.Close()
+
+	const rounds = 5
+	chunkSize := 3000
+	var total atomic.Int64
+	drained := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := client.Read(buf)
+			total.Add(int64(n))
+			if err != nil {
+				close(drained)
+				return
+			}
+		}
+	}()
+
+	pending := make([]byte, 0, 4096)
+	for round := 0; round < rounds; round++ {
+		pending = append(pending, bytes.Repeat([]byte{byte(round)}, chunkSize)...)
+		pending = adapter.ProcessDownlink(pending, server)
+		if len(pending) != 0 {
+			t.Fatalf("第 %d 轮后残留 %d 字节：透传适配器必须每轮清空缓冲区",
+				round, len(pending))
+		}
+	}
+
+	server.Close()
+	<-drained
+	if got, want := total.Load(), int64(rounds*chunkSize); got != want {
+		t.Fatalf("客户端收到 %d 字节，应为 %d 字节", got, want)
 	}
 }
 

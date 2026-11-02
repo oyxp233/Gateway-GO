@@ -57,9 +57,11 @@ func loginWithGame(t *testing.T, h *Handler, account, game string) *models.Gatew
 	t.Helper()
 	ver := testLauncherVer
 	pwd := testPwdMd5
+	invite := nextTestInvite() // Register.RequireInvite 默认开启，注册必须带码
 
 	reg := &models.GatewayRequest{
 		Cmd: models.Cmd.Register, Account: &account, PasswordMd5: &pwd, LauncherVersion: &ver,
+		InviteCode: &invite,
 	}
 	if resp, err := h.Handle(reg, "203.0.113.7"); err != nil || !resp.Ok {
 		t.Fatalf("注册失败: ok=%v code=%d err=%v", resp != nil && resp.Ok, codeOf(resp), err)

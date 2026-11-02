@@ -41,6 +41,7 @@ var uploadPaths = map[string]bool{
 	"/api/admin/server/pvf":       true, // 服务端管理：替换游戏服务端 PVF
 	"/api/admin/integrity/upload": true, // 客户端校验：白/黑名单文件批量上传
 	"/api/admin/launcher/upload":  true, // 登录器版本：上传新 exe（约 128 MiB，2026-10-01）
+	"/api/admin/dnfexe/upload":    true, // DNF.EXE 版本：上传新 exe（约 20 MiB，2026-10-25）
 	"/api/admin/drivers/upload":   true, // 驱动白名单：上传 .sys（实测最大的 NEPKernel.sys 3.9 MB，2026-10-16）
 }
 

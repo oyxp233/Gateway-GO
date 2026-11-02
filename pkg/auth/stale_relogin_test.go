@@ -2,8 +2,10 @@ package auth
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +36,40 @@ const testPwdMd5 = "e10adc3949ba59abbe56e057f20f883e"
 // testLauncherVer 必须显式带版本号：Handle 先过版本门禁，不带一律 1016。
 const testLauncherVer = "9.9.9"
 
+// ── 注册邀请码（2026-10-24）──────────────────────────────────────────────
+//
+// Register.RequireInvite 默认开启，所以走 handleRegister 的测试必须带码。
+// 邀请码**一码一用**，而有些测试会在同一 fixture 里连续注册多个账号 ——
+// 所以 fixture 预插一个码池，helper 按调用次序取下一个。
+
+// testInvitePoolSize 是 fixture 预插的码数量。
+//
+// 500 足够任何单测（单个测试连续注册 500 次以上说明测试本身有问题）。
+const testInvitePoolSize = 500
+
+// testInviteCodeAt 返回码池里第 i 个码（i 从 1 开始）。
+//
+// 格式固定 8 位（与真实码同长）：TST + 5 位数字。
+// 字符集不重要 —— CreateInviteWithCode 不校验字符集（那是生成时才管的）。
+func testInviteCodeAt(i int) string {
+	return fmt.Sprintf("TST%05d", i)
+}
+
+// testInviteSeq 是码池的取用计数器（跨测试共享，只增不减）。
+//
+// 并发测试里取到的码可能乱序，但每个码只被取一次，不会撞。
+var testInviteSeq int64
+
+// nextTestInvite 取下一个测试邀请码。
+func nextTestInvite() string {
+	n := atomic.AddInt64(&testInviteSeq, 1)
+	if n > testInvitePoolSize {
+		// 码池耗尽：返回一个必然无效的码，让测试以 1041 失败并暴露问题
+		return "TST99999"
+	}
+	return testInviteCodeAt(int(n))
+}
+
 func newLoginFixture(t *testing.T, staleSeconds int) (*Handler, *session.SessionManager) {
 	t.Helper()
 	cfg := config.DefaultConfig()
@@ -45,6 +81,16 @@ func newLoginFixture(t *testing.T, staleSeconds int) (*Handler, *session.Session
 // newLoginFixtureWithConfig 与 newLoginFixture 相同，但允许调用方自带配置
 // （双服测试要配 GameServers，见 dual_game_login_test.go）。
 func newLoginFixtureWithConfig(t *testing.T, cfg *config.GatewayConfig) (*Handler, *session.SessionManager) {
+	t.Helper()
+	h, sm, _ := newLoginFixtureWithDB(t, cfg)
+	return h, sm
+}
+
+// newLoginFixtureWithDB 与 newLoginFixtureWithConfig 相同，但把网关库句柄也交给测试。
+//
+// 需要它的场景：测试要在网关库直接造数据（封禁记录、投递回执），
+// 而这些写入方法挂在 database.Database 上、auth 包拿不到 service 里的私有字段。
+func newLoginFixtureWithDB(t *testing.T, cfg *config.GatewayConfig) (*Handler, *session.SessionManager, *database.Database) {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "s4a21-login-test-")
@@ -90,6 +136,19 @@ func newLoginFixtureWithConfig(t *testing.T, cfg *config.GatewayConfig) (*Handle
 		t.Fatalf("建网关库表失败: %v", err)
 	}
 
+	// 注册邀请码（2026-10-24）：Register.RequireInvite 默认开启，
+	// 所有走 handleRegister 的测试都必须带一个有效码。
+	//
+	// ★ 必须预插**一批**而不是一个：邀请码一码一用，
+	//   而有些测试（如限额测试）会在同一个 fixture 里连续注册 3+ 个账号。
+	//   插 500 个足够任何单测用（超了会报 1040，反而暴露测试写错了）。
+	for i := 1; i <= testInvitePoolSize; i++ {
+		code := testInviteCodeAt(i)
+		if err := db.CreateInviteWithCode(code, "test-fixture", "admin:test", 0); err != nil {
+			t.Fatalf("创建测试邀请码 %s 失败: %v", code, err)
+		}
+	}
+
 	cfg.RateLimit.Enabled = false
 
 	sm := session.NewSessionManager(nil, nil)
@@ -102,7 +161,7 @@ func newLoginFixtureWithConfig(t *testing.T, cfg *config.GatewayConfig) (*Handle
 		cfg,
 		log,
 	)
-	return h, sm
+	return h, sm, db
 }
 
 // registerAndLogin 走完整注册 + 首次登录，返回首次登录的 token。
@@ -111,11 +170,13 @@ func registerAndLogin(t *testing.T, h *Handler, account, ip string) string {
 
 	ver := testLauncherVer
 	pwd := testPwdMd5
+	invite := nextTestInvite() // Register.RequireInvite 默认开启，注册必须带码
 	reg := &models.GatewayRequest{
 		Cmd:             models.Cmd.Register,
 		Account:         &account,
 		PasswordMd5:     &pwd,
 		LauncherVersion: &ver,
+		InviteCode:      &invite,
 	}
 	if resp, err := h.Handle(reg, ip); err != nil || !resp.Ok {
 		t.Fatalf("注册失败: ok=%v code=%d err=%v", resp != nil && resp.Ok, codeOf(resp), err)

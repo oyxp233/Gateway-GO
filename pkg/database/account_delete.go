@@ -19,6 +19,23 @@ var (
 	// 因此一旦删掉游戏库 accounts 行，该账号的全部角色及其随身数据会被 SQLite 连带删除。
 	// 为避免"手一抖清掉一个真玩家"，这里选择拒绝而不是级联，由管理员先在游戏内删角色。
 	ErrAccountHasCharacters = errors.New("账号下仍有角色，拒绝删除")
+	// ErrS5A3AccountDeleteUnsupported 表示当前后端是 S5A3，网关不支持删号。
+	//
+	// ★ 为什么是"明确拒绝"而不是"尽力而为"（2026-10-29）：
+	//
+	//	S5A3 的账号、角色、存档、邮件、金库、公会全部在服务端 MySQL 里，
+	//	彼此有真实的业务关联（不是 SQLite 那种 ON DELETE CASCADE 一把清）。
+	//	网关只删 dnf90_web_accounts 一行会留下：
+	//	  · dnf_accounts / dnf_account_metadata 的账号级数据（点券、冒险团、图鉴）
+	//	  · dnf_characters 及其几百张 userinfo* 子表（角色存档）
+	//	  · dnf_mails / dnf_mail_attachments（邮件）
+	//	  · dnf_account_inventories（账号金库）
+	//	这些孤儿数据会在同账号重新注册时被"继承"（account_id 复用），
+	//	后果比删不掉严重得多。
+	//
+	//	正确做法是用 S5A3 自己的管理工具，或由运维按服务端 schema 顺序清。
+	ErrS5A3AccountDeleteUnsupported = errors.New(
+		"S5A3 服的账号由服务端 MySQL 管理，网关无法安全删除（会留下角色存档/邮件/金库等孤儿数据）；请用服务端管理工具删除")
 )
 
 // AccountDeletePreview 描述"删除某账号"会波及的数据。
@@ -63,6 +80,12 @@ func (db *Database) PreviewAccountDelete(name string) (*AccountDeletePreview, er
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, ErrAccountDeleteEmpty
+	}
+	// ★ S5A3：账号主权在服务端 MySQL，网关库通常没有这行。
+	// 沿用下面的 GetAccountByName 会直接报"账号不存在"，把运维引向完全错误的方向
+	// （以为号没了）。这里给出可执行的说明，见 DeleteAccount 的同类保护。
+	if db.GameBackend() == "s5a3" {
+		return nil, ErrS5A3AccountDeleteUnsupported
 	}
 
 	acc, err := db.GetAccountByName(name)

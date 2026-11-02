@@ -236,23 +236,23 @@ func NewProxyServer(
 	}
 
 	srv := &ProxyServer{
-		config:              cfg,
-		profile:             profile,
-		sessionManager:      sm,
-		logger:              logger,
-		listenAddr:          cfg.Gateway.ListenAddress,
-		gamePortMap:         gamePortMap,
-		shutdown:            make(chan struct{}),
-		gameListeners:       make(map[int]net.Listener),
-		gameCts:             make(map[int]chan struct{}),
-		gamePorts:           gamePorts,
-		connCounts:          make(map[int]int),
-		portConfig:          portConfig,
-		firstReadTimeout:    firstReadTimeout,
-		idleTimeout:         idleTimeout,
-		backendConnTimeout:  backendConnTimeout,
-		keepAlivePeriod:     keepAlivePeriod,
-		gameAuth:            gameAuth,
+		config:             cfg,
+		profile:            profile,
+		sessionManager:     sm,
+		logger:             logger,
+		listenAddr:         cfg.Gateway.ListenAddress,
+		gamePortMap:        gamePortMap,
+		shutdown:           make(chan struct{}),
+		gameListeners:      make(map[int]net.Listener),
+		gameCts:            make(map[int]chan struct{}),
+		gamePorts:          gamePorts,
+		connCounts:         make(map[int]int),
+		portConfig:         portConfig,
+		firstReadTimeout:   firstReadTimeout,
+		idleTimeout:        idleTimeout,
+		backendConnTimeout: backendConnTimeout,
+		keepAlivePeriod:    keepAlivePeriod,
+		gameAuth:           gameAuth,
 	}
 	srv.ports.Store(initialView)
 
@@ -276,12 +276,24 @@ func NewProxyServer(
 		srv.channelAdapter = NewS5A95ChannelAdapter(profile.PublicIP, &srv.ports, logger)
 		srv.gameAdapter = NewS5A95GameAdapter(profile.PublicIP, &srv.ports, logger)
 	case config.ProtocolS5A3:
-		// S5A3 绑一个"什么都不改"的适配器，而不是不绑。
+		// S5A3 的下行有两种形态：
 		//
-		// 不绑会让下面的 default 分支打出"无下行适配器"的告警，而 S5A3
-		// 恰恰是**不需要**改写的协议（频道表由服务端下发，见
-		// adapter_s5a3.go）。绑一个显式的透传实现，日志语义才正确。
-		srv.channelAdapter = NewS5A3PassthroughAdapter()
+		//  1. **透传**（默认）：一个字节都不改。频道表由服务端下发、
+		//     IP 来自 DNFBRIDGE_SERVER_IP，网关不需要理解帧布局。
+		//  2. **代理模式**（profile.FilterClosedPorts=true）：解析 CHANNELINFO，
+		//     剔除"所在端口已关闭"的频道，让"端口管理关端口"在客户端选频道
+		//     界面里直接消失 —— 与 S4A21 的体验一致。
+		//
+		// 两者都必须**显式绑定**适配器：不绑会让下面的 default 分支打出
+		// "无下行适配器"告警，而 S5A3 本来就不需要（或只需部分）改写。
+		if profile.FilterClosedPortsEnabled() {
+			srv.channelAdapter = NewS5A3ChannelAdapter(profile, &srv.ports, logger)
+			if logger != nil {
+				logger.Info("S5A3 频道列表：代理模式（剔除已关闭端口的频道）")
+			}
+		} else {
+			srv.channelAdapter = NewS5A3PassthroughAdapter()
+		}
 	default:
 		// logger 可为 nil（单测直构 ProxyServer 时不传），告警前先判空。
 		if logger != nil {
@@ -741,6 +753,51 @@ func (p *ProxyServer) handleChannelClient(client net.Conn) {
 	<-task
 }
 
+// closeBackendAfterReject 在**拒绝路径**上关闭后端连接。
+//
+// ★ 为什么不能直接 `defer backend.Close()` 了事（2026-10-24 第七轮修复）：
+//
+//   游戏口是**服务端先说话**协议 —— 后端一收到 PROXY 头就主动下发
+//   greeting。而拒绝发生在首包准入判定时，此刻 greeting 很可能已经到达
+//   网关、躺在 backend 的**接收缓冲区里没人读**（downlink 协程刚起，
+//   未必已被调度）。
+//
+//   此时直接 Close()：socket 带着未读数据关闭 ⇒ 系统发 **RST** 而不是 FIN。
+//   而 RST 会**丢弃发送缓冲区里尚未 ACK 的数据** —— 也就是刚写进去的
+//   PROXY 头。后端于是收到 0 字节，拿不到真实客户端 IP：
+//     · PK 场 UDP 绑定校验失败
+//     · 组队/副本下发给队友的 P2P 端点错
+//     · 账号最后登录 IP 记成 127.0.0.1
+//
+//   Windows 实测偶发（约 5% 的被拒连接后端读到 0 字节），
+//   Linux 上同样存在、只是概率不同。这就是
+//   TestRejectedGameConnNeverReachesBackend 偶发失败的根因。
+//
+// 做法：让 downlink 协程把已到达的数据读走（它本来就要转发 greeting），
+// 接收缓冲区清空后再 Close，此时系统正常发 FIN，PROXY 头必然送达。
+//
+// 等待有上限（rejectDrainWait）：downlink 只在 backend EOF/超时后才退出，
+// 所以先给它一个短读超时，再等它退出。整体不超过几百毫秒 ——
+// 这是**拒绝**路径，客户端连接也要被关，多等这一点无感。
+func (p *ProxyServer) closeBackendAfterReject(backend net.Conn, downlinkDone <-chan struct{}) {
+	// 给 downlink 一个短读超时，让它从"阻塞等 backend 数据"中醒来并退出。
+	// 它退出前会把已到达的 greeting 读走（这正是我们要的 drain）。
+	_ = backend.SetReadDeadline(time.Now().Add(rejectDrainWait))
+
+	select {
+	case <-downlinkDone:
+	case <-time.After(rejectDrainWait + 100*time.Millisecond):
+		// downlink 卡住（不该发生）。兜底：直接关，至少不泄漏连接。
+	}
+	_ = backend.Close()
+}
+
+// rejectDrainWait 是拒绝路径上等 downlink 读干后端数据的宽限时间。
+//
+// 200ms：greeting 只有几十字节，且通常已经到达；这个余量覆盖
+// "协程还没被调度"的最坏情形。再大就会拖慢拒绝路径。
+const rejectDrainWait = 200 * time.Millisecond
+
 func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort int) {
 	defer p.wg.Done()
 	defer client.Close()
@@ -823,6 +880,7 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		} else {
 			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（%s）", remoteIP, publicPort, adm.reason))
 		}
+		p.closeBackendAfterReject(backend, downlinkDone)
 		return
 	}
 
@@ -838,6 +896,7 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		if !p.sessionManager.TryAcquireGameSlotByMId(adm.mId, p.profile.MaxConnectionsPerIP) {
 			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（账号 %s 并发已达上限 %d）",
 				remoteIP, publicPort, adm.mId, p.profile.MaxConnectionsPerIP))
+			p.closeBackendAfterReject(backend, downlinkDone)
 			return
 		}
 		defer p.sessionManager.ReleaseGameSlotByMId(adm.mId)
@@ -845,6 +904,7 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		if !p.sessionManager.TryAcquireGameSlot(remoteIP, p.profile.MaxConnectionsPerIP) {
 			p.logger.Warn(fmt.Sprintf("拒绝 Game 连接: %s -> %d（单 IP 并发已达上限 %d）",
 				remoteIP, publicPort, p.profile.MaxConnectionsPerIP))
+			p.closeBackendAfterReject(backend, downlinkDone)
 			return
 		}
 		defer p.sessionManager.ReleaseGameSlot(remoteIP)
@@ -893,10 +953,30 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		mId, hasMId := parseGameLoginMId(firstBuf)
 		var found bool
 		sessionObj, found = p.sessionManager.FindSessionByMId(mId)
-		if !hasMId || !found {
-			sessionObj, _ = p.sessionManager.TryGetSessionForGameProxy(remoteIP)
-		} else {
+		if hasMId && found {
 			route = "m_id"
+		} else if s5a3Token, ok := parseGameLoginToken(firstBuf); ok {
+			// ★ S5A3（2026-10-29）：按服务端签发的启动令牌精确归属。
+			//
+			// S5A3 的 m_id 形如 `msp`（字母），isNumericMIdStrict 直接否掉，
+			// 所以上面那条 m_id 路径对 S5A3 **永远走不通** —— 以前只能退到
+			// 「按 IP 找心跳最新会话」，同 IP 双开必挂错人（A 的连接挂到 B 的
+			// 会话上，B 一登录 closeConns 就把 A 踢下线）。
+			// 令牌每次登录新签发、同 IP 多开各不相同，按它归属无歧义。
+			if sess, hit := p.sessionManager.FindSessionByS5A3Token(s5a3Token); hit {
+				sessionObj = sess
+				route = "s5a3"
+			}
+		}
+		if sessionObj == nil {
+			// 最后兜底：**只有该 IP 仅一个会话时**才敢挂。
+			// 多会话（双开/NAT/网吧）一律不挂 —— 挂错会踢掉别人，不挂只丢统计。
+			sessionObj, _ = p.sessionManager.TryGetSessionForGameProxyUnique(remoteIP)
+			if sessionObj != nil {
+				route = "ip-unique"
+			} else {
+				route = "none"
+			}
 		}
 	}
 
@@ -958,6 +1038,73 @@ func parseGameLoginMId(buf []byte) (string, bool) {
 	return string(body[4 : 4+n]), true
 }
 
+// S5A3 启动令牌的形态：32 位小写 hex，固定前缀（服务端 loginTokenPrefix）。
+// 前缀是硬约束不是巧合 —— 服务端 normalizeLoginToken 只认 32 位 hex，
+// 前缀 `de509f65` 让「随便一段 32 位 hex」几乎不可能误命中。
+const (
+	s5a3LoginTokenChars  = 32
+	s5a3LoginTokenPrefix = "de509f65"
+	// 服务端实测布局：body+0 标记, body+1 容量 0x30, body+2 u32 长度 32, body+6 起 32 字符。
+	s5a3LoginTokenBodyOffset = 6
+)
+
+// parseGameLoginToken 从 S5A3 登录首包里取出启动令牌。
+//
+// 为什么不复用 parseGameLoginMId / parseGameLoginPacket：那两个是按 S4A21 的
+// legacy 布局写的（14 字节 header + 「m_id、pwd 两个 DStr」+ m_id 必须纯数字），
+// 而 S5A3 客户端发的是 upper 包（body 602 字节，令牌嵌在 body 里），m_id 又是
+// 字母（`msp`）—— 两条判据都不满足，所以对 S5A3 永远返回 false。
+//
+// header 长度不写死：S5A3 的 upper header 与网关假定的 14 字节不一致
+// （实测 wire 615 = header 13 + body 602），且不同 profile 下 16 字节也有可能，
+// 所以对候选起点逐个试；命中条件足够严（长度字段必须等于 32 + 32 位 hex +
+// 固定前缀），误判概率可以忽略。
+//
+// 刻意只读不改：首包始终原样转发，这里纯旁路观察。
+func parseGameLoginToken(buf []byte) (string, bool) {
+	for _, headerSize := range []int{13, 14, 16} {
+		start := headerSize + s5a3LoginTokenBodyOffset
+		if len(buf) < start+s5a3LoginTokenChars {
+			continue
+		}
+		body := buf[headerSize:]
+		if int(binary.LittleEndian.Uint32(body[2:6])) != s5a3LoginTokenChars {
+			continue
+		}
+		raw := body[s5a3LoginTokenBodyOffset : s5a3LoginTokenBodyOffset+s5a3LoginTokenChars]
+		token, ok := normalizeS5A3LoginToken(raw)
+		if !ok {
+			continue
+		}
+		return token, true
+	}
+	return "", false
+}
+
+// normalizeS5A3LoginToken 校验并归一化令牌，口径与服务端 normalizeLoginToken 一致：
+// 必须正好 32 个十六进制字符（大写折成小写），且以服务端固定前缀开头。
+func normalizeS5A3LoginToken(raw []byte) (string, bool) {
+	if len(raw) != s5a3LoginTokenChars {
+		return "", false
+	}
+	out := make([]byte, s5a3LoginTokenChars)
+	for i, c := range raw {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			out[i] = c
+		case c >= 'A' && c <= 'F':
+			out[i] = c + ('a' - 'A')
+		default:
+			return "", false
+		}
+	}
+	token := string(out)
+	if token[:len(s5a3LoginTokenPrefix)] != s5a3LoginTokenPrefix {
+		return "", false
+	}
+	return token, true
+}
+
 // 游戏口准入（方案 D）的拒绝原因。reasonIPNotAllowed 刻意保持旧日志措辞，
 // 监控/排障脚本按原句 grep，不能改。
 const (
@@ -1006,6 +1153,7 @@ type gameAdmission struct {
 //	| 登录包        | 无        | 口令匹配          | 任意               | 放行（无归属）  |
 //	| 登录包        | 无        | 不符 / 库故障     | false              | 回退 IP 白名单  |
 //	| 登录包        | 无        | 不符              | true               | 拒绝           |
+//	| S5A3 upper 包 | 有        | S5A3 令牌命中     | 任意               | 放行（按账号） |
 //	| 开关关闭      | -         | -                 | 任意               | 回退 IP 白名单  |
 //
 // "回退 IP 白名单" = 与旧行为完全一致（IsIPAllowed + 按 m_id/IP 归属），
@@ -1017,13 +1165,61 @@ func (p *ProxyServer) admitGameClient(remoteIP string, firstBuf []byte, frameCom
 		return p.fallbackWhitelist(remoteIP)
 	}
 
-	mId, pwd, ok := parseGameLoginPacket(firstBuf)
-	if !ok {
-		// 首包不是标准登录包（分包未齐/非登录帧/非数字 m_id）——
-		// 完全回退旧行为，既有玩家零退化。
-		return p.fallbackWhitelist(remoteIP)
+	if mId, pwd, ok := parseGameLoginPacket(firstBuf); ok {
+		return p.admitByCredential(remoteIP, mId, pwd, cfg)
 	}
-	return p.admitByCredential(remoteIP, mId, pwd, cfg)
+
+	// S5A3 首包不是 S4A21 的 legacy 布局（那是 14 字节头 + 两个 DStr，且
+	// m_id 必须是 3~10 位纯数字）；S5A3 是 13 字节头的 upper 包、令牌嵌在
+	// body 里、m_id 形如 `msp`。两条判据都不满足 ⇒ parseGameLoginPacket
+	// 对 S5A3 **永远返回 false**。
+	//
+	// 不补这条路，S5A3 的每一条游戏连接都会落到 fallbackWhitelist
+	// （authed=false），并发槽位就从「每账号 MaxConnectionsPerIP 条」
+	// 退化成「每 IP 总共 MaxConnectionsPerIP 条」——同一 NAT 后面
+	// （网吧/加速器/同路由多开）的玩家会互相挤占，正是上面 admitByCredential
+	// 注释里要避免的那个问题。
+	//
+	// 实证（90CN 2026-10-31）：网关运行至今 278 条游戏连接 `[准入=]` 全为空，
+	// 两名玩家共用一个公网 IP 时第 9 条连接被「单 IP 并发已达上限 8」拒绝，
+	// 决斗场景的新连接开不出来 ⇒ 第二场开局黑屏 + 每 0.5s 重试的连接风暴。
+	//
+	// 令牌命中后按**账号**计槽位，与 S4A21 的凭证准入口径一致；RequireCredential
+	// 仍只管「凭证不符要不要拒」，这条分支不新增任何拒绝路径。
+	//
+	// ★ 刻意**不**置 sessionDecided：归属仍交给下面的令牌路径
+	// （route="s5a3"）。本函数这一处改动的唯一目的是把并发槽位从 IP 维度
+	// 挪到账号维度，日志里的归属来源必须保持原样 —— 否则 `[归属=s5a3]`
+	// 会变成 `[归属=m_id]`，而 S5A3 的 m_id（字母）根本不是匹配依据，
+	// 排查时会被这行日志带偏。
+	if token, ok := parseGameLoginToken(firstBuf); ok {
+		if sess, hit := p.sessionManager.FindSessionByS5A3Token(token); hit {
+			if slotKey := s5a3AdmissionSlotKey(sess); slotKey != "" {
+				return gameAdmission{
+					allowed: true, authed: true, mId: slotKey, cred: "s5a3token",
+				}
+			}
+		}
+	}
+
+	// 首包不是标准登录包（分包未齐/非登录帧/非数字 m_id）——
+	// 完全回退旧行为，既有玩家零退化。
+	return p.fallbackWhitelist(remoteIP)
+}
+
+// s5a3AdmissionSlotKey 取 S5A3 会话用于**并发槽位**计数的键。
+//
+// 必须满足「一个账号一个键」且非空：TryAcquireGameSlotByMId 对空键直接
+// 返回 false（等价于拒绝连接），所以取不到键时返回空串，让调用方回退到
+// IP 白名单的旧行为 —— 宁可少一层保护，也不能凭一个空键把人拒之门外。
+func s5a3AdmissionSlotKey(sess *models.Session) string {
+	if sess == nil {
+		return ""
+	}
+	if sess.MId != "" {
+		return sess.MId
+	}
+	return sess.Account
 }
 
 // admitByCredential 首包凭证准入（方案 D）。

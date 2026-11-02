@@ -16,14 +16,24 @@ import (
 
 	"s4a21-gateway/pkg/models"
 
+	_ "github.com/go-sql-driver/mysql"
 	_ "modernc.org/sqlite"
 )
 
-// Database 封装 SQLite 双库访问。
+// Database 封装 SQLite 双库访问（网关库 + 游戏库），并可选持有 S5A3 的
+// MariaDB 游戏库连接。
+//
+// 两套游戏库后端**互斥**：S4A21 用 SQLite 单文件（gameDB），S5A3 用 MariaDB
+// （s5a3DB）。表结构与 SQL 完全不同，所以每个 game 方法都要先问
+// 「当前是哪一种后端」再分派，不能共用语句。
 type Database struct {
 	gatewayDB *sql.DB
 	gameDB    *sql.DB
-	cfg       DatabaseConfig
+	// s5a3DB 是 S5A3 的 MariaDB 连接（GameDSN 非空时打开，否则为 nil）。
+	s5a3DB *sql.DB
+	// s5a3Prefix 是 S5A3 表名前缀（默认 dnf），拼表名时用。
+	s5a3Prefix string
+	cfg        DatabaseConfig
 }
 
 // DatabaseConfig 数据库配置。
@@ -32,6 +42,12 @@ type DatabaseConfig struct {
 	GamePath           string
 	WalMode            bool
 	BusyTimeoutSeconds int
+	// GameDSN 是 S5A3 游戏库（MariaDB）DSN；空 = 没有 S5A3 后端。
+	GameDSN string
+	// GameTablePrefix 是 S5A3 表名前缀，空按 "dnf"。
+	GameTablePrefix string
+	// GameAccountTable 是 S5A3 的账号表名（含前缀），空按 "dnf90_web_accounts"。
+	GameAccountTable string
 }
 
 // NewDatabase 创建数据库连接池。
@@ -58,8 +74,9 @@ func NewDatabase(cfg DatabaseConfig) (*Database, error) {
 	}
 
 	db := &Database{
-		gatewayDB: gatewayDB,
-		cfg:       cfg,
+		gatewayDB:  gatewayDB,
+		s5a3Prefix: normalizeS5A3Prefix(cfg.GameTablePrefix),
+		cfg:        cfg,
 	}
 
 	if cfg.GamePath != "" {
@@ -71,7 +88,73 @@ func NewDatabase(cfg DatabaseConfig) (*Database, error) {
 		db.gameDB = gameDB
 	}
 
+	// S5A3 的 MariaDB 后端。打开失败**不让网关起不来**：网关的主体职责
+	// （登录/选服/代理）不依赖它，只有全服邮件/泡点/注册奖励/角色查询需要。
+	// 这里只记错误，由 GameConfigured() 与各方法的明确报错去暴露问题。
+	if dsn := strings.TrimSpace(cfg.GameDSN); dsn != "" {
+		s5a3DB, err := openMySQL(dsn)
+		if err != nil {
+			gatewayDB.Close()
+			if db.gameDB != nil {
+				db.gameDB.Close()
+			}
+			return nil, fmt.Errorf("open s5a3 game db: %w", err)
+		}
+		db.s5a3DB = s5a3DB
+	}
+
 	return db, nil
+}
+
+// normalizeS5A3Prefix 规范化表前缀：空 → "dnf"，并去掉尾随下划线
+// （表名拼接统一由 s5a3Table 补 "_"，避免配成 "dnf_" 后出现 "dnf__characters"）。
+func normalizeS5A3Prefix(prefix string) string {
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		return "dnf"
+	}
+	return strings.TrimRight(trimmed, "_")
+}
+
+// s5a3Table 按前缀拼出 S5A3 表名（如 s5a3Table("characters") → "dnf_characters"）。
+//
+// 表名是**代码里的常量**，不接受外部输入，所以不需要转义；
+// 前缀由部署配置决定，已在 normalizeS5A3Prefix 里收敛过形态。
+func (db *Database) s5a3Table(name string) string {
+	return db.s5a3Prefix + "_" + name
+}
+
+// s5a3AccountTable 返回 S5A3 的账号表名（含前缀，默认 dnf90_web_accounts）。
+//
+// 它不跟随 GameTablePrefix：账号表是 S5A3 服务端自己建的（DNFBRIDGE_ACCOUNT_API_TABLE），
+// 名字固定为 dnf90_web_accounts，不是 "dnf_xxx" 那套业务表。
+func (db *Database) s5a3AccountTable() string {
+	if db != nil && strings.TrimSpace(db.cfg.GameAccountTable) != "" {
+		return strings.TrimSpace(db.cfg.GameAccountTable)
+	}
+	return "dnf90_web_accounts"
+}
+
+// S5A3GameConfigured 判断 S5A3 的 MariaDB 后端是否可用。
+func (db *Database) S5A3GameConfigured() bool {
+	return db != nil && db.s5a3DB != nil
+}
+
+// GameBackend 返回当前生效的游戏库后端名（"sqlite" / "s5a3" / ""）。
+//
+// 判定顺序固定为 SQLite 优先：S4A21 部署配了 GamePath 时永远走原来那条路，
+// 加 S5A3 支持不会改变任何既有行为。
+func (db *Database) GameBackend() string {
+	if db == nil {
+		return ""
+	}
+	if db.gameDB != nil {
+		return "sqlite"
+	}
+	if db.s5a3DB != nil {
+		return "s5a3"
+	}
+	return ""
 }
 
 func openSQLite(path string, busyTimeoutSec int) (*sql.DB, error) {
@@ -84,8 +167,99 @@ func openSQLite(path string, busyTimeoutSec int) (*sql.DB, error) {
 	return db, nil
 }
 
+// openMySQL 打开 S5A3 的 MariaDB 连接池。
+//
+// 连接池参数说明：
+//   - MaxOpenConns 给 8：全服邮件是逐个角色写入，并发度不需要很高，
+//     但 1 会让批量发放变成纯串行（几十个角色就要等几十次往返）。
+//   - MaxIdleConns 给 4：保持少量热连接，避免每次发邮件都重新握手。
+//   - ConnMaxLifetime 30 分钟：规避 MariaDB 侧 wait_timeout（默认 8 小时）
+//     与中间设备掐空闲连接导致的 "invalid connection"。
+//
+// 不做 Ping：NewDatabase 阶段数据库可能还没起来（compose 里 db 与网关
+// 并行启动），一次 Ping 失败会让整个网关退出。真正的可用性由每次操作的
+// 错误暴露。
+func openMySQL(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	return db, nil
+}
+
 // EnsureInitialized 建表并确保网关库结构正确。
+// accountColumnsUpgraded 是 accounts 表"后加的列"清单（名 + 定义）。
+//
+// 只列**可能缺失**的：最初版本就有的列（m_id/name/pwd_hash/salt/cera/...）
+// 不用列，因为老库一定已经有它们。
+//
+// ★ 为什么 accounts 的补列必须**单独提前**（其他表在 migrateSchema 里补）：
+//   schema 段里有 `CREATE INDEX idx_accounts_last_heartbeat ON accounts(last_heartbeat)`，
+//   而 `CREATE TABLE IF NOT EXISTS` 对已存在的表不会补列 —— 旧库执行到这条索引就报
+//   no such column，整个 EnsureInitialized 失败、网关起不来。
+//   所以 accounts 的补列必须在 Exec(schema) **之前**完成。
+//
+//   其他表的索引要么建在新表上、要么不引用后加列，放 schema 之后补没问题。
+//
+// ⚠️ 新增列必须同步这里 —— 漏了就会在升级时报 no such column。
+var accountColumnsUpgraded = []struct {
+	Name string
+	Def  string
+}{
+	{"device_secret_issued_at", "TEXT DEFAULT ''"},
+	{"device_history", "TEXT DEFAULT ''"},
+	{"device_secret_last_rotated", "INTEGER DEFAULT 0"},
+	{"s5a9_digest", "TEXT DEFAULT ''"},
+	{"last_login_at", "INTEGER DEFAULT 0"},
+	{"last_login_ip", "TEXT DEFAULT ''"},
+	{"failed_login_count", "INTEGER DEFAULT 0"},
+	{"lockout_until", "INTEGER DEFAULT 0"},
+	{"updated_at", "INTEGER DEFAULT 0"},
+	{"last_heartbeat", "INTEGER DEFAULT 0"},
+}
+
+// ensureAccountColumnsUpgraded 在 Exec(schema) 之前补齐 accounts 表缺失的列。
+//
+// 复用 ensureColumn（幂等：先 PRAGMA table_info 查再 ALTER）。
+// 表不存在时（全新库）直接跳过 —— 那种情况由 schema 段的 CREATE TABLE 建。
+func (db *Database) ensureAccountColumnsUpgraded() error {
+	if !db.tableExists("accounts") {
+		return nil
+	}
+	for _, c := range accountColumnsUpgraded {
+		if err := db.ensureColumn("accounts", c.Name, c.Def); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tableExists 判断表是否存在。
+func (db *Database) tableExists(name string) bool {
+	var n int
+	err := db.gatewayDB.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n)
+	return err == nil && n > 0
+}
+
 func (db *Database) EnsureInitialized() error {
+	// ★ 必须先补列，再建表/建索引（2026-10-24 升级阻塞修复）。
+	//
+	// `CREATE TABLE IF NOT EXISTS` 对**已存在**的表是 no-op —— 它不会补上
+	// 后来新增的列。于是紧接着的
+	// `CREATE INDEX idx_accounts_last_heartbeat ON accounts(last_heartbeat)`
+	// 会在旧库上失败（no such column: last_heartbeat），整个 EnsureInitialized
+	// 返回错误 → **网关启动失败**。
+	//
+	// 症状：本地测试全绿（测试每次都建全新库），线上升级后起不来。
+	// 这正是本函数存在的理由：先 ALTER TABLE 补齐，后续语句才有意义。
+	if err := db.ensureAccountColumnsUpgraded(); err != nil {
+		return err
+	}
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS accounts (
 		m_id TEXT PRIMARY KEY,
@@ -134,7 +308,12 @@ func (db *Database) EnsureInitialized() error {
 	CREATE TABLE IF NOT EXISTS banned_accounts (
 		name TEXT PRIMARY KEY,
 		reason TEXT DEFAULT '',
-		banned_at INTEGER NOT NULL
+		banned_at INTEGER NOT NULL,
+		-- scope 是封禁范围（三服合一，2026-10-24）：
+		-- 'global' = 三服同时封（主网关，随事件同步广播）
+		-- 's4a21' / 's5a3' / 's5a95' = 只封该服（该服自己的网关，不同步）
+		-- 缺省 'global'：老数据全部视为全局封禁，与改造前行为一致。
+		scope TEXT DEFAULT 'global'
 	);
 
 	CREATE TABLE IF NOT EXISTS register_bonus_logs (
@@ -154,6 +333,36 @@ func (db *Database) EnsureInitialized() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_rblog_account ON register_bonus_logs(account, status);
+
+	-- 邮件投递回执（2026-10-29）：全服/定向发件的**永久幂等依据**。
+	--
+	-- 为什么必须有这张表（参考 PurpleMagic 的 benefit receipts 设计）：
+	--   S5A3 的邮箱是整箱 replace 语义，服务端退出时按内存 DELETE + 重插。
+	--   网关写库后如果玩家在线退出，邮件被覆盖删掉 —— 运维看到"发了没收到"
+	--   就会点第二次"发送"，于是离线玩家收到两封、在线玩家一封都没收到。
+	--
+	--   有了回执：同一个 batch_id 对同一个角色只认第一次成功。
+	--   重试只会补发**没有成功记录**的那些，天然幂等。
+	--
+	-- ★ 删除邮件不会删除回执 —— 这是刻意的（与 PurpleMagic 同语义）：
+	--   "玩家把邮件删了"和"我们没发过"是两件事，混为一谈会导致重复发放。
+	CREATE TABLE IF NOT EXISTS mail_dispatch_receipts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		batch_id TEXT NOT NULL,
+		character_id INTEGER NOT NULL,
+		character_name TEXT DEFAULT '',
+		account_key TEXT DEFAULT '',
+		item_count INTEGER DEFAULT 0,
+		gold INTEGER DEFAULT 0,
+		status TEXT NOT NULL,
+		message TEXT DEFAULT '',
+		created_at INTEGER NOT NULL
+	);
+
+	-- 同一个批次 + 同一个角色只允许一条成功记录（唯一索引兜底并发重试）。
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_receipt_batch_char
+		ON mail_dispatch_receipts(batch_id, character_id);
+	CREATE INDEX IF NOT EXISTS idx_mail_receipt_batch ON mail_dispatch_receipts(batch_id, status);
 
 	-- 注册流水（2026-10-13）：注册限额的**唯一计数依据**。
 	--
@@ -177,6 +386,26 @@ func (db *Database) EnsureInitialized() error {
 	CREATE INDEX IF NOT EXISTS idx_register_logs_machine ON register_logs(machine_id);
 	-- account 供「删账号时预演统计 / 按 purgeLogs 清流水」点查（2026-10-13 接入）。
 	CREATE INDEX IF NOT EXISTS idx_register_logs_account ON register_logs(account);
+
+	-- 注册**被拒**流水（2026-11-01）。
+	--
+	-- 与 register_logs 分开存：那张表是"限额计数依据"，只记成功的注册，
+	-- 而且删账号时会按 purgeLogs 清理；被拒记录是纯审计数据，
+	-- 不能参与计数（否则被拒一次就白占一个配额），也不该跟着删号消失。
+	--
+	-- 存在的理由：玩家来问"为什么我注册不了"，运营原来只能翻网关日志。
+	-- 现在后台「注册流水」页能直接看到最近的拒绝记录和原因。
+	CREATE TABLE IF NOT EXISTS register_rejects (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account TEXT NOT NULL DEFAULT '',
+		ip TEXT NOT NULL DEFAULT '',
+		machine_id TEXT NOT NULL DEFAULT '',
+		reason_code INTEGER NOT NULL DEFAULT 0,
+		reason TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_register_rejects_created ON register_rejects(created_at);
+	CREATE INDEX IF NOT EXISTS idx_register_rejects_ip ON register_rejects(ip, created_at);
 
 	CREATE TABLE IF NOT EXISTS anticheat_detections (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -338,43 +567,11 @@ func (db *Database) EnsureInitialized() error {
 
 // migrateSchema 为旧数据库添加缺失的列。
 func (db *Database) migrateSchema() error {
-	// 检查 accounts 表的列
-	rows, err := db.gatewayDB.Query("PRAGMA table_info(accounts)")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	existingCols := map[string]bool{}
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull int
-		var dfltValue sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			return err
-		}
-		existingCols[name] = true
-	}
-
-	// 添加缺失的列
-	if !existingCols["device_secret_issued_at"] {
-		if _, err := db.gatewayDB.Exec("ALTER TABLE accounts ADD COLUMN device_secret_issued_at TEXT DEFAULT ''"); err != nil {
-			return err
-		}
-	}
-	if !existingCols["device_history"] {
-		if _, err := db.gatewayDB.Exec("ALTER TABLE accounts ADD COLUMN device_history TEXT DEFAULT ''"); err != nil {
-			return err
-		}
-	}
-	// s5a9_digest（2026-10-17 双服）：S5A9 服登录凭证列。老库没有这一列，
-	// 而新版登录 S5A95 账号时必然要读写它 —— 缺列会让整条登录链 SQL 报错，
-	// 所以在这里补上；insert 语句已同步带这一列（空串）。
-	if err := db.ensureColumn("accounts", "s5a9_digest", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
+	// ★ accounts 的补列不在这里做 —— 已在 EnsureInitialized 开头的
+	//   ensureAccountColumnsUpgraded 提前完成（见那里的注释：schema 段有
+	//   引用后加列的 CREATE INDEX，晚于它就晚了）。
+	//   这里从原来的"补 device_secret_issued_at / device_history / s5a9_digest"
+	//   改成只处理**其他表**的列。
 
 	// register_bonus_logs 旧表(m_id 为主键列)升级：补齐新字段
 	if err := db.migrateRegisterBonusLog(); err != nil {
@@ -411,6 +608,69 @@ func (db *Database) migrateSchema() error {
 	}
 	if _, err := db.gatewayDB.Exec(
 		"CREATE INDEX IF NOT EXISTS idx_anticheat_player ON anticheat_detections(player_name)"); err != nil {
+		return err
+	}
+
+	// banned_accounts.scope（三服合一，2026-10-24）：封禁范围列。
+	// 老库没有这一列，缺省 'global'（与改造前行为一致：全封）。
+	if err := db.ensureColumn("banned_accounts", "scope", "TEXT DEFAULT 'global'"); err != nil {
+		return err
+	}
+
+	// account_events 表（三服合一，2026-10-24）：账号事件同步。
+	// 主网关记录注册/改密/封禁/删除事件，从网关拉取同步。
+	if _, err := db.gatewayDB.Exec(`
+	CREATE TABLE IF NOT EXISTS account_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_type TEXT NOT NULL,
+		account TEXT NOT NULL,
+		detail TEXT DEFAULT '',
+		scope TEXT DEFAULT 'global',
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
+	CREATE INDEX IF NOT EXISTS idx_account_events_type ON account_events(event_type);
+	`); err != nil {
+		return err
+	}
+
+	// account_sync_state 表：从网关的同步水位（三服合一，2026-10-24）。
+	//
+	// ★ 为什么单独一张表而不是复用 account_events.applied：
+	//   从网关自己也会产生事件（本地封禁），两边 ID 空间不同，
+	//   混在一张表里会撞主键。水位单独存一行，语义清晰。
+	if _, err := db.gatewayDB.Exec(`
+	CREATE TABLE IF NOT EXISTS account_sync_state (
+		peer TEXT PRIMARY KEY,
+		last_event_id INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	);
+	`); err != nil {
+		return err
+	}
+
+	// invite_codes 表：注册邀请码（2026-10-24）。
+	//
+	// 一码一用：used_by 非空即已消耗。不做"一码多用"是因为
+	// 邀请码的用途是"控制谁能注册"，多码复用会让泄漏影响面失控。
+	//
+	// code 存**归一化后**的大写形式（去空格/连字符）——
+	// 玩家输入时带空格、大小写不一致是常态，归一化在服务端做，
+	// 这样"K7M2-P9QX" 与 "k7m2p9qx" 是同一个码。
+	if _, err := db.gatewayDB.Exec(`
+	CREATE TABLE IF NOT EXISTS invite_codes (
+		code       TEXT PRIMARY KEY,
+		note       TEXT NOT NULL DEFAULT '',
+		created_by TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL DEFAULT 0,
+		used_by    TEXT NOT NULL DEFAULT '',
+		used_at    INTEGER NOT NULL DEFAULT 0,
+		disabled   INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_invite_used ON invite_codes(used_by);
+	CREATE INDEX IF NOT EXISTS idx_invite_created ON invite_codes(created_at);
+	`); err != nil {
 		return err
 	}
 
@@ -621,18 +881,61 @@ func (db *Database) ExecTxBoth(fn func(txGw *sql.Tx, txGame *sql.Tx) error) erro
 	return nil
 }
 
-// IsBanned 检查账号是否被封禁。
+// BanScopeGlobal 是全局封禁范围（三服同时封）。
+//
+// 三服合一（2026-10-24）：banned_accounts.scope 的取值约定 ——
+//   - "global"          → 三服同时封（主网关下发，随账号事件同步广播）
+//   - "s4a21"/"s5a3"/"s5a95" → 只封该服（该服自己的网关，不同步）
+//
+// 登录校验时 scope='global' OR scope='<本服 id>' 命中即拒。
+const BanScopeGlobal = "global"
+
+// IsBanned 检查账号是否被封禁（全局封禁或指定服封禁）。
+//
+// gameId 为空 = 只判全局封禁（老调用点语义不变）。
+// 非空时同时匹配该服的专属封禁。
 func (db *Database) IsBanned(name string) (bool, error) {
+	return db.IsBannedForServer(name, "")
+}
+
+// IsBannedForServer 检查账号在指定服是否被封禁。
+//
+// scope 语义见 BanScopeGlobal 注释：
+// scope='global' 命中任何服；scope='<gameId>' 只命中该服。
+func (db *Database) IsBannedForServer(name, gameId string) (bool, error) {
 	var count int
-	err := db.gatewayDB.QueryRow("SELECT COUNT(*) FROM banned_accounts WHERE name = ?", name).Scan(&count)
+	if gameId == "" {
+		// 只判全局（向后兼容老调用点：它们没有"服"的概念）
+		err := db.gatewayDB.QueryRow(
+			"SELECT COUNT(*) FROM banned_accounts WHERE name = ? AND (scope = ? OR scope IS NULL OR scope = '')",
+			name, BanScopeGlobal).Scan(&count)
+		return count > 0, err
+	}
+	err := db.gatewayDB.QueryRow(
+		"SELECT COUNT(*) FROM banned_accounts WHERE name = ? AND (scope = ? OR scope = ? OR scope IS NULL OR scope = '')",
+		name, BanScopeGlobal, gameId).Scan(&count)
 	return count > 0, err
 }
 
-// BanAccount 封禁账号。
+// BanAccount 封禁账号（全局封禁，兼容老调用点）。
 func (db *Database) BanAccount(name, reason string) error {
+	return db.BanAccountScoped(name, reason, BanScopeGlobal)
+}
+
+// BanAccountScoped 按范围封禁账号。
+//
+// scope 为空时按 global 处理（与改造前行为一致）。
+// 主键是 name，所以一个账号只能有一条封禁记录 —— 同一账号在 A 服被封、
+// 之后在 B 服也被封时，后写的覆盖前者。这是刻意的简化：运营要"分服封"
+// 就该用分服网关（各自一份库），而不是在一个库里塞多行。
+func (db *Database) BanAccountScoped(name, reason, scope string) error {
+	if scope == "" {
+		scope = BanScopeGlobal
+	}
 	_, err := db.gatewayDB.Exec(
-		"INSERT INTO banned_accounts (name, reason, banned_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET reason = excluded.reason",
-		name, reason, NowUnix())
+		"INSERT INTO banned_accounts (name, reason, banned_at, scope) VALUES (?, ?, ?, ?) "+
+			"ON CONFLICT(name) DO UPDATE SET reason = excluded.reason, scope = excluded.scope",
+		name, reason, NowUnix(), scope)
 	return err
 }
 
@@ -659,7 +962,7 @@ func (db *Database) QueryBans(keyword string, page, pageSize int) (int, []BanEnt
 		return 0, nil, err
 	}
 
-	query := "SELECT name, reason, banned_at FROM banned_accounts"
+	query := "SELECT name, reason, banned_at, COALESCE(scope, 'global') FROM banned_accounts"
 	if keyword != "" {
 		query += " WHERE name LIKE ?"
 	}
@@ -675,7 +978,7 @@ func (db *Database) QueryBans(keyword string, page, pageSize int) (int, []BanEnt
 	var entries []BanEntry
 	for rows.Next() {
 		var e BanEntry
-		if err := rows.Scan(&e.Name, &e.Reason, &e.BannedAt); err != nil {
+		if err := rows.Scan(&e.Name, &e.Reason, &e.BannedAt, &e.Scope); err != nil {
 			return 0, nil, err
 		}
 		entries = append(entries, e)
@@ -688,6 +991,9 @@ type BanEntry struct {
 	Name     string
 	Reason   string
 	BannedAt int64
+	// Scope 是封禁范围（三服合一，2026-10-24）。
+	// "global" = 三服同时封；"s4a21"/"s5a3"/"s5a95" = 只封该服。
+	Scope string
 }
 
 // GetAccountByName 通过名称查询账号。
@@ -1039,6 +1345,18 @@ func (db *Database) ListAccounts(keyword string, page, pageSize int) (int, []Acc
 	// 角色名那一项还有个硬约束：游戏库 characters.name 存的是 GBK 裸字节
 	// （typeof='blob'），拿 UTF-8 的 LIKE 模式去比永远比不中（blob 与 text 是
 	// 不同存储类，直接判不等），所以只能取回后在 Go 里解码再比。
+	//
+	// ★ S5A3 分支（2026-10-29）：账号主权在服务端 MySQL，网关库 accounts 表
+	//   通常一行都没有 ⇒ 沿用旧查询会让后台「账号管理」显示成空列表。
+	//   这里改成从 dnf90_web_accounts 读，后面的过滤/排序/分页逻辑完全复用。
+	if db.GameBackend() == "s5a3" {
+		all, err := db.s5a3LoadAccounts()
+		if err != nil {
+			return 0, nil, err
+		}
+		return db.finishAccountList(all, keyword, page, pageSize)
+	}
+
 	rows, err := db.gatewayDB.Query(
 		"SELECT m_id, name, cera, last_login_at, last_login_ip, failed_login_count, " +
 			"lockout_until, last_heartbeat, created_at FROM accounts")
@@ -1059,6 +1377,14 @@ func (db *Database) ListAccounts(keyword string, page, pageSize int) (int, []Acc
 	if err := rows.Err(); err != nil {
 		return 0, nil, err
 	}
+	return db.finishAccountList(all, keyword, page, pageSize)
+}
+
+// finishAccountList 是 ListAccounts 的公共后半段：补游戏库字段 → 过滤 → 排序 → 分页。
+//
+// 抽出来是为了让 S4A21（SQLite）与 S5A3（MariaDB）两条数据源共用同一套
+// 展示语义 —— 否则两边会出现"同一份数据、两种排序"的漂移。
+func (db *Database) finishAccountList(all []Account, keyword string, page, pageSize int) (int, []Account, error) {
 	if len(all) == 0 {
 		return 0, []Account{}, nil
 	}
@@ -1145,6 +1471,9 @@ func (db *Database) ListAccounts(keyword string, page, pageSize int) (int, []Acc
 // characters.name 是 GBK blob，SQL 的 LIKE 对它无效。角色量级很小
 // （202 上约 240 个），一次全量读没有任何压力。
 func (db *Database) SearchAccountMIdsByRole(keyword string) (map[string]struct{}, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3SearchAccountMIdsByRole(keyword)
+	}
 	result := make(map[string]struct{})
 	keyword = strings.TrimSpace(keyword)
 	if keyword == "" || !db.GameConfigured() {
@@ -1262,6 +1591,27 @@ func (db *Database) GetMIdsByNames(names []string) (map[string]string, error) {
 		return out, nil
 	}
 
+	// ★ S5A3 分支（2026-11-01）：S5A3 的账号主权在服务端 MySQL，
+	// 网关 accounts 表里要么没有这一行、要么 m_id 是注册时另分配的数字
+	// （如 10001），而 S5A3 侧真正的主键是 `dnf:10001`。
+	// 拿网关库那份去查角色必然命中 0 行 —— 这正是「登录器在线角色/等级显示不出来」的根因。
+	//
+	// 在线列表通常只有几十个人，逐个查 account_id 可以接受；
+	// 真变多了再加批量版（S5A3 那边按 account IN (...) 一次查完）。
+	if db.GameBackend() == "s5a3" {
+		for _, n := range uniq {
+			id, err := db.S5A3AccountIDByName(n)
+			if err != nil {
+				// 单条失败不拖垮整张在线表：其余账号照常显示角色。
+				continue
+			}
+			if id != "" {
+				out[n] = id
+			}
+		}
+		return out, nil
+	}
+
 	const chunkSize = 400
 	for start := 0; start < len(uniq); start += chunkSize {
 		end := start + chunkSize
@@ -1308,6 +1658,9 @@ func (db *Database) GetMIdsByNames(names []string) (map[string]string, error) {
 // 账号全部落在同一秒，管理后台的「注册时间」列整列一模一样 —— 玩家真正的注册
 // 时间只存在于游戏库（服务端建号时写 CURRENT_TIMESTAMP）。
 func (db *Database) GetGameAccountCreatedAt(mIds []string) (map[string]string, error) {
+	if db.GameBackend() == "s5a3" {
+		return db.s5a3GameAccountCreatedAt(mIds), nil
+	}
 	out := make(map[string]string)
 	if db.gameDB == nil {
 		return out, nil

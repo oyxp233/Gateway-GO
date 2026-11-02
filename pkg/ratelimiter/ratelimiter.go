@@ -169,6 +169,8 @@ var pathGroups = []struct {
 	// 归 launcher-binary 桶（与插件文件、PVF 增量同类：登录启动阶段的一次性拉取）。
 	// ★ 前缀匹配覆盖整条 /update 子树（清单 / exe / delta），无需逐条列。
 	{"/api/launcher/update", GroupLauncherBinary},
+	// 服清单下发（三服合一，2026-10-24）：每次启动拉一次，与 policy 同类。
+	{"/api/launcher/servers", GroupLauncher},
 	{"/api/launcher/item-ranking", GroupLauncher},
 	{"/api/launcher/policy", GroupLauncher},
 	// online 免鉴权且每次要 join 游戏库查角色（带 5s 缓存），仍必须限流：

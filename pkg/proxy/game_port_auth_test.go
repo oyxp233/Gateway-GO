@@ -12,6 +12,7 @@ import (
 
 	"s4a21-gateway/pkg/config"
 	"s4a21-gateway/pkg/logger"
+	"s4a21-gateway/pkg/models"
 	"s4a21-gateway/pkg/session"
 )
 
@@ -553,4 +554,146 @@ func TestFindSessionByMIdAndToken(t *testing.T) {
 	if _, ok := sm.FindSessionByMIdAndToken("10038", tok2); !ok {
 		t.Fatal("第二个会话的 token 也应能命中")
 	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// S5A3 令牌准入（2026-10-31 修复「第二场决斗黑屏」）
+//
+// 背景：S5A3 首包是 13 字节头的 upper 包、m_id 是字母（`msp`），
+// parseGameLoginPacket 对它**永远返回 false** ⇒ 每条连接都落
+// fallbackWhitelist（authed=false）⇒ 并发槽位从「每账号
+// MaxConnectionsPerIP 条」退化成「每 IP 总共 MaxConnectionsPerIP 条」。
+// 两名玩家共用 NAT 出口时，第 9 条连接（决斗场景那条）被拒 ⇒ 黑屏，
+// 客户端每 0.5s 重试，形成连接风暴。
+// ─────────────────────────────────────────────────────────────
+
+// buildS5A3LoginFrame 构造 S5A3 游戏口首包（upper 包形态）。
+//
+// 布局与 parseGameLoginToken 对齐：header(13B) + 标记(1) + 容量(1) +
+// u32 长度(4) + 32 字节令牌。header 里的长度字段刻意写 0 —— 让
+// parseGameLoginPacket 走 `total < gamePacketHeaderSize` 的失败分支，
+// 与真实 S5A3 首包（不是 legacy 双 DStr）走同一条路。
+func buildS5A3LoginFrame(token string) []byte {
+	const headerSize = 13
+	buf := make([]byte, headerSize+6+len(token))
+	buf[0] = 0x01 // cmd
+	binary.LittleEndian.PutUint32(buf[3:], 0)
+	body := buf[headerSize:]
+	body[0] = 0x01 // 标记
+	body[1] = 0x30 // 容量
+	binary.LittleEndian.PutUint32(body[2:], uint32(len(token)))
+	copy(body[6:], token)
+	return buf
+}
+
+func TestAdmitGameClientS5A3Token(t *testing.T) {
+	const (
+		// 两名玩家共用同一个公网出口（NAT / 网吧 / 同路由双开）
+		sharedIP = "163.142.116.195"
+		// 令牌恒为 32 位 hex，前 8 位是固定前缀 de509f65（见 normalizeS5A3LoginToken）
+		tokenA = "de509f65" + "0123456789abcdef01234567"
+		tokenB = "de509f65" + "fedcba9876543210fedcba98"
+	)
+
+	// s5a3Session 建一个 S5A3 会话（m_id 是字母，与线上 `msp`/`msp2` 同形）。
+	s5a3Session := func(t *testing.T, sm *session.SessionManager, account, mId, s5a3Token string) {
+		t.Helper()
+		gwToken, err := sm.CreateSession(account, mId, sharedIP, "", "")
+		if err != nil {
+			t.Fatalf("建会话失败: %v", err)
+		}
+		sm.SetS5A3Token(gwToken, s5a3Token)
+	}
+
+	t.Run("令牌命中_按账号放行", func(t *testing.T) {
+		srv, sm := newGameAuthFixture(t, nil, nil)
+		s5a3Session(t, sm, "msp", "msp", tokenA)
+
+		adm := srv.admitGameClient(sharedIP, buildS5A3LoginFrame(tokenA), true)
+		if !adm.allowed || !adm.authed || adm.cred != "s5a3token" {
+			t.Fatalf("S5A3 令牌命中必须凭证放行: %+v", adm)
+		}
+		if adm.mId != "msp" {
+			t.Fatalf("槽位键应为账号 m_id，实际 %q", adm.mId)
+		}
+		// 归属仍由下面的令牌路径决定（route="s5a3"）——本改动只动槽位维度，
+		// 若这里变成 true，日志里的归属来源会从 s5a3 变成 m_id，属误伤。
+		if adm.sessionDecided {
+			t.Fatal("S5A3 令牌准入不应接管归属判定，否则 [归属=s5a3] 会退化成 [归属=m_id]")
+		}
+	})
+
+	t.Run("令牌不命中_回退白名单", func(t *testing.T) {
+		srv, sm := newGameAuthFixture(t, nil, nil)
+		s5a3Session(t, sm, "msp", "msp", tokenA)
+
+		adm := srv.admitGameClient(sharedIP, buildS5A3LoginFrame(tokenB), true)
+		if adm.authed || adm.cred != "" {
+			t.Fatalf("未命中的令牌必须回退（本分支不新增拒绝路径）: %+v", adm)
+		}
+	})
+
+	// ★ 回归断言：修复前必红。
+	//
+	// 按 handleGameClient 的口径记账：authed ⇒ 按账号计槽位，否则按 IP 计。
+	// 修复前两条连接都记到 sharedIP 上，两人合计 8 条就把 MaxConnectionsPerIP
+	// 用光；修复后 IP 维度一个槽位都不占。
+	t.Run("同NAT两名玩家不互相挤占IP槽位", func(t *testing.T) {
+		srv, sm := newGameAuthFixture(t, nil, nil)
+		s5a3Session(t, sm, "msp", "msp", tokenA)
+		s5a3Session(t, sm, "msp2", "msp2", tokenB)
+
+		limit := srv.profile.MaxConnectionsPerIP
+		if limit <= 0 {
+			t.Fatalf("测试前置失效：profile 的 MaxConnectionsPerIP 未生效（%d），本用例无法证伪", limit)
+		}
+
+		admit := func(tok string) {
+			t.Helper()
+			adm := srv.admitGameClient(sharedIP, buildS5A3LoginFrame(tok), true)
+			if !adm.allowed {
+				t.Fatalf("令牌 %s 不应被拒: %+v", tok, adm)
+			}
+			if adm.authed {
+				if !sm.TryAcquireGameSlotByMId(adm.mId, limit) {
+					t.Fatalf("账号 %s 槽位不足", adm.mId)
+				}
+				return
+			}
+			if !sm.TryAcquireGameSlot(sharedIP, limit) {
+				t.Fatalf("IP 槽位不足")
+			}
+		}
+
+		// 每人 4 条（线上实测峰值：城镇口 + PVP 口 + 决斗场景口 + 重连残留）
+		for i := 0; i < 4; i++ {
+			admit(tokenA)
+			admit(tokenB)
+		}
+
+		if n := sm.GameSlotCount(sharedIP); n != 0 {
+			t.Fatalf("凭证准入的连接不应占用 IP 槽位，实际占了 %d 条 —— "+
+				"这正是第二场决斗黑屏的成因", n)
+		}
+		if n := sm.GameSlotCountByMId("msp"); n != 4 {
+			t.Fatalf("msp 账号槽位应为 4，实际 %d", n)
+		}
+		if n := sm.GameSlotCountByMId("msp2"); n != 4 {
+			t.Fatalf("msp2 账号槽位应为 4，实际 %d", n)
+		}
+	})
+
+	t.Run("会话无可用键_回退白名单而非拒绝", func(t *testing.T) {
+		// TryAcquireGameSlotByMId 对空键直接返回 false（= 拒绝），
+		// 所以取不到键时必须回退，绝不能带着空键进凭证分支。
+		if got := s5a3AdmissionSlotKey(nil); got != "" {
+			t.Fatalf("nil 会话应返回空键，实际 %q", got)
+		}
+		if got := s5a3AdmissionSlotKey(&models.Session{}); got != "" {
+			t.Fatalf("无 MId/Account 的会话应返回空键，实际 %q", got)
+		}
+		if got := s5a3AdmissionSlotKey(&models.Session{Account: "msp"}); got != "msp" {
+			t.Fatalf("只有 Account 时应回落到 Account，实际 %q", got)
+		}
+	})
 }

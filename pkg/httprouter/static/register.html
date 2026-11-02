@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>注册账号</title>
+<style>
+  :root {
+    --bg: #0f1620;
+    --card: #18202c;
+    --line: #2a3646;
+    --text: #e8eef6;
+    --dim: #8fa8c0;
+    --accent: #3f8cff;
+    --ok: #37c47a;
+    --err: #f2705a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg); color: var(--text);
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 380px;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 28px 24px;
+  }
+  h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+  .sub { margin: 0 0 22px; font-size: 12px; color: var(--dim); }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 14px 0 6px; }
+  input {
+    width: 100%; height: 42px; padding: 0 12px;
+    background: #0d141d; border: 1px solid var(--line);
+    border-radius: 8px; color: var(--text); font-size: 14px;
+    outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    width: 100%; height: 44px; margin-top: 22px;
+    background: var(--accent); color: #fff; border: 0;
+    border-radius: 9px; font-size: 15px; font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .msg { margin-top: 16px; font-size: 13px; line-height: 1.6; min-height: 20px; }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--err); }
+  .hint { margin-top: 18px; font-size: 11px; color: var(--dim); line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>注册账号</h1>
+  <p class="sub">注册一次，所有服务器通用</p>
+
+  <label for="account">账号（3–20 位字母或数字）</label>
+  <input id="account" autocomplete="username" maxlength="20" spellcheck="false">
+
+  <label for="password">密码（6–32 位）</label>
+  <input id="password" type="password" autocomplete="new-password" maxlength="32">
+
+  <label for="confirm">确认密码</label>
+  <input id="confirm" type="password" autocomplete="new-password" maxlength="32">
+
+  <label for="invite">邀请码</label>
+  <input id="invite" autocomplete="off" maxlength="20" spellcheck="false"
+         placeholder="向管理员索取，一码一用"
+         style="letter-spacing:1px; text-transform:uppercase; font-family:Consolas,monospace;">
+  <div class="hint" style="margin-top:6px;">大小写与连字符均可忽略</div>
+
+  <button id="submit">确认注册</button>
+  <div class="msg" id="msg"></div>
+
+  <p class="hint">
+    邀请码由管理员发放，一码一用。<br>
+    注册后可在登录器里直接登录，无需在登录器内再次注册。<br>
+    如遇问题请联系服务器管理员。
+  </p>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var btn = $('submit'), msg = $('msg');
+
+  function show(text, ok) {
+    msg.textContent = text;
+    msg.className = 'msg ' + (ok ? 'ok' : 'err');
+  }
+
+  btn.addEventListener('click', async function () {
+    var account = $('account').value.trim();
+    var password = $('password').value;
+    var confirm = $('confirm').value;
+    // 邀请码只 Trim，不做格式校验 —— 归一化（去连字符/转大写）由服务端做。
+    // 前端多拦一道只会让"码是对的但被前端挡住"成为客服问题。
+    var invite = $('invite').value.trim();
+
+    if (!account || !password) { show('请输入账号和密码', false); return; }
+    if (!/^[A-Za-z0-9]{3,20}$/.test(account)) {
+      show('账号只能是 3–20 位字母或数字', false); return;
+    }
+    if (password.length < 6 || password.length > 32) {
+      show('密码长度需为 6–32 位', false); return;
+    }
+    if (password !== confirm) { show('两次输入的密码不一致', false); return; }
+    if (!invite) { show('请输入邀请码（可向管理员索取）', false); $('invite').focus(); return; }
+
+    btn.disabled = true;
+    show('正在注册…', true);
+
+    try {
+      var resp = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // 只发账号 + 明文密码 + 邀请码：MD5 由网关算，避免浏览器端各语言实现不一致。
+        // 网关会用它转发给 S5A3 建号（S5A3 服务端收明文自己 bcrypt）。
+        body: JSON.stringify({ account: account, password: password, invite_code: invite })
+      });
+
+      var data = null;
+      try { data = await resp.json(); } catch (e) { /* 非 JSON 响应 */ }
+
+      if (resp.ok && data && data.ok) {
+        show(data.message || '注册成功，请到登录器登录', true);
+        $('account').value = ''; $('password').value = ''; $('confirm').value = '';
+        // 邀请码已被消耗，清空避免重试时又拿这个废码去撞
+        $('invite').value = '';
+      } else {
+        var m = (data && (data.message || data.error)) || ('注册失败（HTTP ' + resp.status + '）');
+        show(m, false);
+        // 邀请码类错误：焦点打回邀请码框（玩家的下一步动作就是改这里）
+        if (data && (data.code === 1040 || data.code === 1041)) {
+          $('invite').focus();
+          $('invite').select();
+        }
+      }
+    } catch (e) {
+      show('网络异常，请稍后重试', false);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // 回车直接提交
+  ['account', 'password', 'confirm', 'invite'].forEach(function (id) {
+    $(id).addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') btn.click();
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -49,6 +49,9 @@ var backupKindOrder = []string{backupKindDB, backupKindPvf, backupKindLogs}
 // 两侧共用同一份字符串，改名必须两边一起改。
 const (
 	TargetGameDB        = "game_db"
+	// TargetGameMySQL 是 S5A3 的「游戏库」（MySQL 在线导出）。
+	// S4A21 用 TargetGameDB（SQLite 文件），S5A3 用这个 —— 二选一，见 defaultBackupTargetsFor。
+	TargetGameMySQL     = "game_mysql"
 	TargetGatewayDB     = "gateway_db"
 	TargetPvf           = "pvf"
 	TargetGatewayLog    = "gateway_log"
@@ -74,6 +77,9 @@ type backupTargetDef struct {
 
 var backupTargetDefs = []backupTargetDef{
 	{TargetGameDB, "游戏库存库（inventory.db）", backupKindDB, ""},
+	// S5A3 的游戏库在 MySQL 里，导出成一个 .sql 进同一个 db 包。
+	// entryName 带 game/ 前缀，避免与网关库同名混淆。
+	{TargetGameMySQL, "游戏库（S5A3 MySQL 在线导出）", backupKindDB, "game/gamedb.sql"},
 	{TargetGatewayDB, "网关库（gateway.db）", backupKindDB, ""},
 	{TargetPvf, "服务端 PVF（Script.pvf）", backupKindPvf, ""},
 	{TargetGatewayLog, "网关日志", backupKindLogs, "gateway/gateway.log"},
@@ -131,6 +137,19 @@ func (s *ServerManager) ListBackupTargets() []BackupTarget {
 	out := make([]BackupTarget, 0, len(backupTargetDefs))
 	for _, d := range backupTargetDefs {
 		t := BackupTarget{Key: d.key, Label: d.label, Kind: d.kind, EntryName: d.entryName}
+
+		// S5A3 的 MySQL 目标是**导出产物**，平时磁盘上没有这个文件 ——
+		// 不能按"文件存不存在"判可用，否则后台永远把它置灰。
+		// 判据换成"GameDSN 配没配"，Path 显示成可读的连接串。
+		if d.key == TargetGameMySQL {
+			t.Exists = s.isS5A3Game()
+			if p, ok := parseS5A3DSN(s.config.Database.GameDSN); ok {
+				t.Path = fmt.Sprintf("mysql://%s:%s/%s（在线导出）", p.Host, p.Port, p.DB)
+			}
+			out = append(out, t)
+			continue
+		}
+
 		path := s.resolveBackupTargetPath(d.key)
 		t.Path = path
 		if path != "" {
@@ -150,6 +169,13 @@ func (s *ServerManager) resolveBackupTargetPath(key string) string {
 	switch key {
 	case TargetGameDB:
 		return s.config.Database.GamePath
+	case TargetGameMySQL:
+		// 这个目标不是"现成的文件"，是导出产物：BackupWith 会在解析前先跑 mysqldump
+		// 落到这个路径。没配 GameDSN（S4A21）时返回空串，列表里显示为不可用。
+		if !s.isS5A3Game() {
+			return ""
+		}
+		return s.gameMySQLDumpPath()
 	case TargetGatewayDB:
 		return s.config.Database.Path
 	case TargetPvf:
@@ -254,6 +280,27 @@ func (s *ServerManager) BackupWith(opts BackupOptions) *BackupResult {
 	}
 	if err := utils.MkdirAll(dir); err != nil {
 		return &BackupResult{Ok: false, Error: err.Error()}
+	}
+
+	// S5A3：游戏库是 MySQL，先把数据导成 .sql 再走原来的"按文件打包"流程。
+	//
+	// ★ 导出失败必须**明确报错**，不能静默降级成"只备了网关库 + PVF"——
+	// 那会让运维以为玩家数据已经备好了，等真要恢复时才发现是空的。
+	requested := opts.Targets
+	if len(requested) == 0 {
+		requested = s.defaultBackupTargets()
+	}
+	for _, k := range requested {
+		if k != TargetGameMySQL {
+			continue
+		}
+		dumpPath := s.gameMySQLDumpPath()
+		if _, err := s.dumpS5A3GameMySQL(dumpPath); err != nil {
+			return &BackupResult{Ok: false, Error: "导出 S5A3 游戏库失败：" + err.Error()}
+		}
+		// 打包完就删：中间产物留在备份目录里会被误当成一份"备份"。
+		defer func() { _ = os.Remove(dumpPath) }()
+		break
 	}
 
 	explicit := len(opts.Targets) > 0
@@ -413,13 +460,28 @@ func (s *ServerManager) BackupWith(opts BackupOptions) *BackupResult {
 //
 // 默认集里缺文件是**允许**的（PVF 常常没有）：沿用改造前的宽容行为，只记 ERROR 日志。
 // 显式勾选却缺文件则报错 —— 你明明点名要它，静默跳过就是骗人。
+// defaultBackupTargets 返回本机默认备份集。
+//
+// S5A3 的游戏库在服务端 MySQL 里，SQLite 的 GamePath 必须为空
+// （GamePath 非空会抢在 GameDSN 前面被当成"游戏库"）——
+// 所以默认集必须把 game_db 换成 game_mysql，
+// 否则「默认备份」永远备不到玩家数据，只剩网关库和 PVF。
+func (s *ServerManager) defaultBackupTargets() []string {
+	if s.isS5A3Game() {
+		return []string{TargetGameMySQL, TargetGatewayDB, TargetPvf}
+	}
+	return backupDefaultTargets
+}
+
+// resolveSelected 把勾选的 key 解析成实际文件目标。
 func (s *ServerManager) resolveSelected(keys []string) ([]resolvedTarget, error) {
+	defaults := s.defaultBackupTargets()
 	if len(keys) == 0 {
-		keys = backupDefaultTargets
+		keys = defaults
 		// 默认集走宽容模式，见下方 missing 处理
 	}
 	explicit := true
-	if len(keys) == len(backupDefaultTargets) && sameStringSet(keys, backupDefaultTargets) {
+	if len(keys) == len(defaults) && sameStringSet(keys, defaults) {
 		explicit = false
 	}
 

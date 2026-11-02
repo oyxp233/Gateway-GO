@@ -58,6 +58,10 @@ func main() {
 		GamePath:           cfg.Database.GamePath,
 		WalMode:            cfg.Database.WalMode,
 		BusyTimeoutSeconds: cfg.Database.BusyTimeoutSeconds,
+		// S5A3 的 MariaDB 游戏库（全服邮件/泡点/注册奖励/角色查询用）。
+		// 留空 = 该部署没有 S5A3 后端，相关功能会明确报"未配置"。
+		GameDSN:         cfg.S5A3GameDSN(),
+		GameTablePrefix: cfg.S5A3TablePrefix(),
 	})
 	if err != nil {
 		log.Fatal(fmt.Sprintf("数据库初始化失败: %v", err))
@@ -112,6 +116,15 @@ func main() {
 	announceSvc.Start()
 	defer announceSvc.Stop()
 
+	// 登录器自更新分发服务（2026-10-01）。
+	// 这里提前建（而不是等 httpServer 内部建）是为了让网关间同步也能拿到同一个实例 ——
+	// 否则定时轮询与 admin 上传会各自持一份缓存，跨进程感知要靠 stamp，跨实例就更容易错位。
+	launcherUpdateSvc := service.NewLauncherUpdateService(cfg, log)
+
+	// DNF.EXE 增量更新分发服务（2026-10-25）。
+	// 与登录器自更新同构：提前建好实例，网关间同步与 admin 上传共用同一份。
+	dnfExeUpdateSvc := service.NewDnfExeUpdateService(cfg, log)
+
 	// 注册奖励和泡点默认配置。
 	// 注意：bonusSvc.Start() 不在这里调 —— 泡点按「玩家真实在游戏频道内的
 	// 时长」计费，必须先拿到会话管理器（见下面 SetSessionManager），
@@ -142,6 +155,10 @@ func main() {
 	bonusSvc.SetSessionManager(sessionMgr)
 	bonusSvc.Start()
 
+	// 全服邮件要排除在线角色：S5A3 的邮箱是整箱 replace 语义，
+	// 在线时网关写进库的邮件会被服务端退出存档覆盖删掉（见 BroadcastItems 注释）。
+	adminSvc.SetSessionManager(sessionMgr)
+
 	// TLS 证书
 	var cert *tls.Certificate
 	if cfg.Tls.Enabled {
@@ -154,6 +171,21 @@ func main() {
 		log.Info(fmt.Sprintf("[TLS] HTTP 服务已启用 HTTPS"))
 	} else {
 		log.Warn("[SECURITY] Tls.Enabled=false，HTTP 服务保持明文")
+	}
+
+	// 服清单签名密钥初始化（三服合一，2026-10-24）。
+	// 见评估-三服合一登录器-20261023.md 第三章：
+	// 网关首次启动时自动生成 Ed25519 密钥对（0600 权限），
+	// 后续启动加载已有密钥。公钥 hex 打到日志里方便运维复制到登录器编译配置。
+	if cfg.Signing.PrivateKeyPath != "" {
+		pubHex, err := httprouter.InitSigning(cfg.Signing.PrivateKeyPath)
+		if err != nil {
+			log.Error(fmt.Sprintf("[Signing] Ed25519 密钥初始化失败: %v", err))
+		} else if pubHex != "" {
+			log.Info(fmt.Sprintf("[Signing] 服清单签名已启用，公钥=%s", pubHex))
+		}
+	} else {
+		log.Info("[Signing] Signing.PrivateKeyPath 为空，服清单不签名（清单仍可下发，signature 字段为空）")
 	}
 
 	// TCP 认证服务器
@@ -240,6 +272,39 @@ func main() {
 		// 结果是谁都不提供管理后台。这属于严重误配，必须喊出来。
 		log.Error("[Admin] Gateway.ServeAdminInProcess=false 且 Admin.InternalKey 为空：" +
 			"管理后台将无任何进程提供。请配置 Admin.InternalKey 并启动 s4a21-admin 服务。")
+	}
+
+	// 网关间同步（三服合一，2026-10-24）：从网关定时拉取账号事件与登录器版本。
+	//
+	// ★ 只在配了 Signing.PeerInternalUrl 时才真正启动 ——
+	//   主网关（自己就是权威）不配这一项，Start 会直接返回。
+	//
+	// ★ 这里传的 launcherUpdateSvc 与 httpServer 内部那个是**两个实例**，
+	//   共用同一个 launcher_update/ 目录。这是既有设计（admin 进程也是各持一份），
+	//   靠 current.exe 的 size+mtime stamp 感知对方写入 —— 不需要跨实例通知。
+	peerSyncSvc := service.NewPeerSyncService(cfg, log, db, launcherUpdateSvc, dnfExeUpdateSvc)
+	peerSyncSvc.Start()
+	defer peerSyncSvc.Stop()
+
+	// 上传播录器版本给从网关（2026-10-24 第七轮）。
+	//
+	// 主网关上传播录器 exe / 回退版本成功后，主动 POST 到各从网关的
+	// /internal/launcher/push，让发版从"等 300s 轮询"变成秒级生效。
+	//
+	// ★ 只在配了 Signing.Peers 时才有意义（PushLauncherToPeers 内部会直接返回）。
+	// ★ 与 Start() 互不依赖：没配 Peers 时这只是个无害的注入。
+	httpServer.SetPeerSync(peerSyncSvc)
+	if len(cfg.Signing.Peers) > 0 {
+		log.Info(fmt.Sprintf("[PeerSync] 已配置 %d 台从网关，上传登录器版本后会主动推送", len(cfg.Signing.Peers)))
+	}
+
+	// 登录兜底反查主网关（三服合一，评估文档 5.4）：
+	// 从网关本地查不到账号时，向主网关反查凭据并懒建本地副本。
+	//
+	// ★ 只在配了 PeerInternalUrl 时才注入 —— 主网关自身不需要反查自己。
+	//   未注入时 Login 的行为与改造前逐字节一致。
+	if peerSyncSvc.Enabled() {
+		accountSvc.SetPeerCredentialLookup(peerSyncSvc.LookupCredential)
 	}
 
 	// 启动清理服务

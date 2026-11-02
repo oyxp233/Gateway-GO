@@ -226,6 +226,57 @@ func (sm *SessionManager) FindSessionByMIdAndToken(mId, token string) (*models.S
 	return best, best != nil
 }
 
+// SetS5A3Token 给已建好的会话补上 S5A3 服务端签发的启动令牌。
+//
+// 登录流程是「先 ReplaceAccountSessions 建网关会话、再拿到 S5A3 令牌」，
+// 而令牌在 LoginResult.Token 里（与网关自己的 Token 无关），所以只能后补。
+// gatewayToken 就是 ReplaceAccountSessions 的返回值。
+func (sm *SessionManager) SetS5A3Token(gatewayToken, s5a3Token string) {
+	if gatewayToken == "" || s5a3Token == "" {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s, ok := sm.sessions[gatewayToken]; ok {
+		s.S5A3Token = s5a3Token
+	}
+}
+
+// FindSessionByS5A3Token 按 S5A3 启动令牌查找会话。
+//
+// ★ 2026-10-29 新增，修「同 IP 双开时第一个账号被踢下线」。
+//
+// 为什么需要它：S5A3 客户端连游戏口的首包是 upper 包（body 602 字节，
+// 令牌在 body+6 起 32 字符），而网关的 parseGameLoginMId/parseGameLoginPacket
+// 是按 legacy 的「m_id + pwd 两个 DStr、m_id 必须纯数字」解析的 —— S5A3 的
+// m_id 形如 `msp`（字母），必然解析失败 ⇒ 永远走「按 IP 找心跳最新会话」。
+// 同一公网 IP 双开（一台机器两个客户端 / 同一 NAT）时，后登录的会话心跳更新，
+// 于是先连上的那条 Game 连接被挂到了**别人的**会话上；那个人随后登录，
+// ReplaceAccountSessions 的 closeConns 把旧会话上的连接全关掉 —— 先连上的
+// 玩家就这么被踢了，客户端表现是「第二个账号一登录，第一个账号网络中断」。
+//
+// 令牌是 S5A3 每次登录新签发的（32 位 hex，固定前缀 de509f65），
+// 同 IP 多开也各不相同的，所以按它归属是**无歧义**的。
+func (sm *SessionManager) FindSessionByS5A3Token(token string) (*models.Session, bool) {
+	if token == "" {
+		return nil, false
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	var best *models.Session
+	for _, s := range sm.sessions {
+		if s.S5A3Token == "" || !security.ConstantTimeEquals(s.S5A3Token, token) {
+			continue
+		}
+		// 与 FindSessionByMId 同口径：归属必须确定，秒级时间相同用 token 字典序兜底。
+		if best == nil || s.CreatedAt < best.CreatedAt ||
+			(s.CreatedAt == best.CreatedAt && s.Token < best.Token) {
+			best = s
+		}
+	}
+	return best, best != nil
+}
+
 // ReplaceAccountSessions 踢掉该账号现有全部会话并创建新会话（单账号单令牌）。
 //
 // carryOver=true 时把旧会话的登录时间与泡点累计结转到新会话 ——
@@ -484,6 +535,33 @@ func (sm *SessionManager) TryGetSessionForGameProxy(ip string) (*models.Session,
 
 	if best != nil {
 		return best, true
+	}
+	return nil, false
+}
+
+// TryGetSessionForGameProxyUnique 只在「该 IP 恰好只有一个在线会话」时返回它。
+//
+// ★ 2026-10-29 新增。按 IP 猜归属的**兜底**，只在拿不到 m_id / S5A3 令牌时用。
+//
+// 为什么不直接用 TryGetSessionForGameProxy（按心跳最新挑）：同一公网 IP 有
+// 多个会话时（一台机器双开 / 同一 NAT / 网吧），挑「心跳最新」必然挑错一半 ——
+// 而挑错的代价不只是泡点记错人：GameProxyConnections 挂到别人会话上之后，
+// 那个人下次登录触发 ReplaceAccountSessions，closeConns 会把旧会话上的
+// **所有**连接关掉，包括这条根本不属于他的连接（实测：双开第二个账号登录，
+// 第一个账号直接「网络连接中断」）。
+//
+// 宁可不挂（丢泡点/在线时长统计，双开本来也不该拿双份），也不挂错（会踢人）。
+func (sm *SessionManager) TryGetSessionForGameProxyUnique(ip string) (*models.Session, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	tokens := sm.ipIndex[ip]
+	if len(tokens) != 1 {
+		return nil, false
+	}
+	for token := range tokens {
+		if s, exists := sm.sessions[token]; exists {
+			return s, true
+		}
 	}
 	return nil, false
 }

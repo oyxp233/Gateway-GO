@@ -37,6 +37,225 @@ type AccountService struct {
 	//
 	// 注意：本结构体因此**不可按值拷贝**，全仓均以 *AccountService 传递。
 	registerMu sync.Mutex
+
+	// peerCredential 是「登录兜底反查主网关」的注入点（三服合一，2026-10-24）。
+	//
+	// nil = 不反查（主网关自身，或未启用同步）。此时行为与改造前完全一致。
+	// 用函数字段而不是直接持有 *PeerSyncService：
+	//   ① 避免 AccountService 依赖 PeerSyncService 的生命周期
+	//   ② 测试里可以注入假实现，不用起 HTTP
+	//
+	// 语义约定（★ 很重要）：返回 nil **只表示"没有额外信息"**，
+	// 绝不表示"账号被封"或"应该拒绝登录"。任何失败都必须降级为本地判定。
+	peerCredential func(name string) *PeerCredential
+}
+
+// SetPeerCredentialLookup 注入登录兜底反查（由 cmd/gateway 在启动时调用）。
+//
+// 传 nil 关闭反查。
+func (s *AccountService) SetPeerCredentialLookup(fn func(name string) *PeerCredential) {
+	s.peerCredential = fn
+}
+
+// RegisterPlatform 建"平台账号"并把明文密码转发给所有 S5A3 服。
+//
+// 这是注册的**唯一实现**，两个入口共用：
+//   - auth.Handler（登录器走 TCP 8000 的 CMD_REGISTER）
+//   - httprouter 的 Web 注册（GET/POST /api/register）
+//
+// 返回 (models.Err.Ok, "") 表示成功；
+// message 非空时是给玩家看的文案（可能是"注册成功（s5a3 服建号未完成…）"这种部分成功）。
+//
+// ★ 失败方向：
+//   - 邀请码不可用 / 平台账号建失败 → 直接返回该错误，玩家什么都得不到
+//   - 平台账号建成、S5A3 转发失败 → **仍返回成功**，但 message 点名没建成的服
+//
+//   回滚会让玩家"什么都没注册成功"，体验更差；而平台账号是有用的
+//   （S4A21/S5A95 立刻能登）。能用的部分先给玩家。
+//
+// ★ 为什么 S5A3 要用明文密码：
+//   S5A3 的账号在它自己的服务端 MySQL（bcrypt），网关的 accounts 表推不过去。
+//   注册时调用方手里有明文（登录器表单 / Web 表单），转发给
+//   /api/account/register 建号 —— 这样 S5A3 也能"注册一次就能登"。
+//
+// ★ 邀请码顺序（2026-11-01 重做）：
+//   ① 只读校验邀请码（不消耗）
+//   ② 平台账号（含 IP/机器限额）
+//   ③ 建号成功后把邀请码**绑定**到账号
+//   ④ S5A3 转发
+//
+//   ①②③ 在 RegisterWithInvite 里由同一把注册锁包住，所以不会出现
+//   "两个请求都通过校验、最后一条码绑了两个号"。
+//
+//   ⚠️ 旧实现（2026-10-24）是"先原子消耗再建号"，建号失败时码就被烧掉了：
+//   玩家既没注册成功、码也作废，只能找运营补发 —— 这是玩家反馈的主要问题。
+//   当时的取舍是"不给用无效请求试码留窗口"，代价落在玩家身上，不划算。
+//   现在改成失败不消耗：试码者能拿到的信息只是"这个码有效"，而码本身不会丢。
+func (s *AccountService) RegisterPlatform(account, passwordMd5, password, inviteCode, ip, machineID string) (int, string) {
+	// ①②③ 邀请码 + 平台账号（同一临界区，2026-11-01）
+	//
+	// 不开邀请码时直接走带限额的注册，逻辑与原来一致。
+	var (
+		code int
+		msg  string
+	)
+	if s.requireInvite() {
+		code, msg = s.RegisterWithInvite(account, passwordMd5, inviteCode, ip, machineID)
+	} else {
+		code, msg = s.RegisterWithLimit(account, passwordMd5, ip, machineID)
+	}
+	if code != models.Err.Ok {
+		return code, msg
+	}
+
+	// ③ 转发给所有启用的 S5A3 服
+	//
+	// 没有明文 = 老登录器 / Web 端未填。跳过转发，但**不报错** ——
+	// 平台账号已经建好了，照常能登非 S5A3 服。
+	password = strings.TrimSpace(password)
+	if password == "" {
+		if s.hasEnabledS5A3() {
+			s.logger.Warn(fmt.Sprintf(
+				"注册未转发 S5A3（调用方未提供明文密码）: 账号=%s", account))
+		}
+		return models.Err.Ok, ""
+	}
+
+	var failed []string
+	for _, p := range s.enabledS5A3Profiles() {
+		// 把玩家真实 IP 一路带到服务端（X-Forwarded-For），否则服务端
+		// 只看到 127.0.0.1：last_login_ip 记不对、按 IP 限流会把全服算成一个人。
+		//
+		// ★ 用 RegisterS5A3Upstream 而不是 RegisterS5A3：限额与注册流水
+		//   已经在上面 RegisterWithLimit（②）那一步做过了。这里再判一次会让
+		//   一次注册吃掉 1 + N 个配额（N = S5A3 服数量），表现为"注册一个号
+		//   当天就再也注册不了"。
+		if c, m := s.RegisterS5A3Upstream(account, password, p.Id, ip); c != models.Err.Ok {
+			failed = append(failed, p.Id)
+			s.logger.Warn(fmt.Sprintf("注册转发 S5A3 失败: 服=%s 账号=%s 码=%d %s",
+				p.Id, account, c, m))
+		} else {
+			s.logger.Info(fmt.Sprintf("注册已转发 S5A3: 服=%s 账号=%s", p.Id, account))
+		}
+	}
+
+	if len(failed) > 0 {
+		return models.Err.Ok, fmt.Sprintf(
+			"注册成功（%s 服建号未完成，请稍后在该服重试或联系管理员）",
+			strings.Join(failed, "、"))
+	}
+	return models.Err.Ok, ""
+}
+
+// requireInvite 返回是否要求邀请码（默认 true）。
+//
+// config 为 nil 时（测试里偶尔不配）按**要求**处理 —— fail-closed：
+// 配置缺失不该变成"谁都能注册"。
+func (s *AccountService) requireInvite() bool {
+	if s.config == nil {
+		return true
+	}
+	return s.config.Register.RequireInviteEnabled()
+}
+
+// enabledS5A3Profiles 返回所有启用的 S5A3 服配置。
+func (s *AccountService) enabledS5A3Profiles() []config.GameServerEntry {
+	if s.config == nil {
+		return nil
+	}
+	var out []config.GameServerEntry
+	for _, p := range s.config.GameServers {
+		if p.Protocol == config.ProtocolS5A3 && p.IsEnabled() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// hasEnabledS5A3 判断是否配了启用的 S5A3 服（只用于决定要不要打日志）。
+func (s *AccountService) hasEnabledS5A3() bool {
+	return len(s.enabledS5A3Profiles()) > 0
+}
+
+// tryLazyCreateFromPeer 尝试从主网关反查凭据并懒建本地账号副本。
+//
+// 返回非 nil 表示"本地已建好副本，可以继续走正常登录流程（含验密）"。
+// 返回 nil 表示"没有额外信息，按原有逻辑处理"。
+//
+// ★ 校验链条（任何一步不过都返回 nil）：
+//  1. 未注入反查 → nil
+//  2. 主网关查不到 → nil
+//  3. 主网关的凭据无法用本次上报的密码验过 → nil
+//     （这一条是安全关键：反查不能变成"知道账号名就能建号"）
+//
+// ★ 为什么第 3 步必须在**本地**再验一次，而不是信任主网关：
+//   主网关只返回哈希，不返回"密码对不对"。本地必须自己算一遍 ——
+//   否则反查就变成了"随便报个账号名就能进"，等于绕过密码。
+//
+// ★ m_id 用**本地分配**，不沿用主网关的（2026-10-24 第四轮修正）：
+//
+//   原先沿用主网关的 m_id 是错的，两个理由：
+//
+//   ① **必然撞号**：新部署时各服的 m_id 都从 100001 起，主网关的
+//      100001 在从网关很可能已经被某个土生土长的账号占了。
+//      冲突时只能跳过懒建 → 玩家在从网关完全登不进。
+//
+//   ② **撞号会串角色**：m_id 是游戏库里角色的归属键。若两服恰好用同一个
+//      m_id 指向不同账号，玩家可能看到别人的角色 —— 这是数据事故，不只是登不进。
+//
+//   各服的游戏库本来就是**独立**的（每台机器一份 inventory.db），
+//   角色集也各自独立，所以 m_id 跨服一致没有任何好处。
+//   本地分配新号 = 玩家在这个服第一次登录、建自己的新角色，这是正确语义。
+func (s *AccountService) tryLazyCreateFromPeer(name, passwordMd5 string) *database.Account {
+	if s.peerCredential == nil || name == "" || passwordMd5 == "" {
+		return nil
+	}
+
+	cred := s.peerCredential(name)
+	if cred == nil || !cred.Exists || cred.PwdHash == "" {
+		return nil
+	}
+
+	// 用主网关的 pwd_hash + salt 构造一个"临时账号"来验密。
+	// verifyAccountPassword 的算法：
+	//   salt 非空 → SHA256(MD5(pwd) + salt) == pwd_hash
+	//   salt 为空 → pwd_hash 就是 MD5 明文（迁移账号）
+	probe := &database.Account{
+		Name:    name,
+		PwdHash: cred.PwdHash,
+		Salt:    cred.Salt,
+	}
+	if !verifyAccountPassword(passwordMd5, probe) {
+		// 密码不对 → 不建号、不泄露"主网关有这个账号"
+		// （时序由调用方的 equalizeLoginTiming 抹平）
+		s.logger.Info(fmt.Sprintf("反查命中但密码不符，不懒建: name=%s", name))
+		return nil
+	}
+
+	// 本地分配 m_id（见上面 ②③ 的说明）
+	mId, err := s.db.AllocateNumericMId(name)
+	if err != nil {
+		s.logger.Warn(fmt.Sprintf("反查懒建失败（分配 m_id）: name=%s err=%v", name, err))
+		return nil
+	}
+
+	// 懒建：用主网关的**凭据**（pwd_hash + salt），但用本地的 m_id。
+	// 设备绑定/点券/登录统计全部从零开始 —— 那些是"本服的"数据，不该跨服复制。
+	created := &database.Account{
+		MId:       mId,
+		Name:      name,
+		PwdHash:   cred.PwdHash,
+		Salt:      cred.Salt,
+		CreatedAt: utils.NowUnix(),
+	}
+	if err := s.db.InsertAccount(created); err != nil {
+		s.logger.Warn(fmt.Sprintf("反查懒建失败（按账号不存在处理）: name=%s err=%v", name, err))
+		return nil
+	}
+
+	s.logger.Info(fmt.Sprintf("反查懒建成功: name=%s 本地m_id=%s（凭据来自主网关 m_id=%s）",
+		name, mId, cred.MId))
+	return created
 }
 
 // NewAccountService 创建账号服务。
@@ -133,6 +352,12 @@ func (s *AccountService) Register(name, passwordMd5 string) int {
 		return models.Err.DatabaseError
 	}
 
+	// 记录账号事件（三服合一，2026-10-24）：供从网关同步。
+	// 写流水失败不影响注册本身。
+	if err := s.db.RecordAccountEvent(database.AccountEventRegister, name, "", database.BanScopeGlobal); err != nil {
+		s.logger.Warn("记录账号事件(register)失败: " + err.Error())
+	}
+
 	return models.Err.Ok
 }
 
@@ -144,12 +369,21 @@ func (s *AccountService) Register(name, passwordMd5 string) int {
 // 调用方（auth.handler）必须在**客户端 IP 可用的地方**调用它 —— 原 Register
 // 不带来源信息，算不出限额。clientIP 由 TCP 远端地址得到（不是客户端自填）。
 func (s *AccountService) RegisterWithLimit(name, passwordMd5, ip, machineID string) (int, string) {
+	s.registerMu.Lock()
+	defer s.registerMu.Unlock()
+	return s.registerWithLimitLocked(name, passwordMd5, ip, machineID)
+}
+
+// registerWithLimitLocked 是 RegisterWithLimit 的本体。
+//
+// ★ 调用方**必须已持有 s.registerMu**。抽出来是为了让「校验邀请码 → 建号 →
+// 绑定邀请码」三步能在同一把锁内完成（见 RegisterWithInvite）：
+// 三步分开加锁会留下 TOCTOU 窗口 —— 两个人同时提交同一个邀请码时，
+// 都通过校验、都建了号，最后一个码绑两个账号。
+func (s *AccountService) registerWithLimitLocked(name, passwordMd5, ip, machineID string) (int, string) {
 	name = utils.TrimSpace(name)
 	ip = utils.TrimSpace(ip)
 	machineID = utils.TrimSpace(machineID)
-
-	s.registerMu.Lock()
-	defer s.registerMu.Unlock()
 
 	if code, msg := s.CheckRegisterLimit(ip, machineID); code != models.Err.Ok {
 		// 单独再打一条**带账号名**的拒绝日志。
@@ -159,11 +393,13 @@ func (s *AccountService) RegisterWithLimit(name, passwordMd5, ip, machineID stri
 		// 「拒绝重复登录: 账号=…」保持同一风格，排障时一眼能对上。
 		s.logger.Warn(fmt.Sprintf("拒绝注册: 账号=%s IP=%s machine=%s 原因码=%d",
 			name, ip, maskMachineID(machineID), code))
+		s.recordRegisterReject(name, ip, machineID, code, "注册限额")
 		return code, msg
 	}
 
 	code := s.Register(name, passwordMd5)
 	if code != models.Err.Ok {
+		s.recordRegisterReject(name, ip, machineID, code, "建号失败")
 		return code, ""
 	}
 
@@ -179,6 +415,89 @@ func (s *AccountService) RegisterWithLimit(name, passwordMd5, ip, machineID stri
 	}
 
 	return models.Err.Ok, ""
+}
+
+// RegisterWithInvite 带邀请码的注册：**校验 → 建号 → 绑定**在同一临界区内完成。
+//
+// 与旧流程的区别（2026-11-01）：
+//
+//	旧：① 原子消耗邀请码 ② 建号（含限额） ③ 转发 S5A3
+//	    ⇒ ② 失败（撞限额 / 账号重名 / 库错）时码已被烧掉：玩家没号、码也没了，
+//	      只能找运营补发。这是玩家反馈的主要问题。
+//	新：① 只读校验 ② 建号 ③ 成功后把码**绑定**到账号
+//	    ⇒ ② 失败时码原封不动，可以再用，也可以给别人。
+//
+// 绑定仍走 ConsumeInvite 的原子 UPDATE（`WHERE used_by = ''`），只是语义从
+// "消耗"变成"绑定到 account"：used_by 里记的就是账号名，后台一眼能看出码给了谁。
+//
+// ★ 三步必须在同一把 registerMu 内：分开加锁会留下 TOCTOU 窗口 ——
+// 两个人同时提交同一个码时都通过校验、都建了号，最后一条码绑了两个账号。
+func (s *AccountService) RegisterWithInvite(
+	name, passwordMd5, inviteCode, ip, machineID string,
+) (int, string) {
+	s.registerMu.Lock()
+	defer s.registerMu.Unlock()
+
+	code := database.NormalizeInviteCode(inviteCode)
+	if code == "" {
+		return models.Err.InviteRequired, ""
+	}
+
+	// ① 只读校验：先给玩家明确答复，不碰任何数据
+	if st := s.db.ValidateInvite(code); st != database.InviteConsumeOK {
+		reason := s.logInviteReject(name, code, ip, st)
+		s.recordRegisterReject(name, ip, machineID, models.Err.InviteInvalid, "邀请码"+reason)
+		return models.Err.InviteInvalid, ""
+	}
+
+	// ② 建号（限额判定 + 插入，仍在注册锁内）
+	res, msg := s.registerWithLimitLocked(name, passwordMd5, ip, machineID)
+	if res != models.Err.Ok {
+		return res, msg
+	}
+
+	// ③ 绑定到账号。锁内无竞态，失败只可能是码在两步之间被后台作废/删除。
+	if st := s.db.ConsumeInvite(code, name); st != database.InviteConsumeOK {
+		reason := s.logInviteReject(name, code, ip, st)
+		s.recordRegisterReject(name, ip, machineID, models.Err.InviteInvalid, "邀请码"+reason)
+		return models.Err.InviteInvalid, ""
+	}
+	s.logger.Info(fmt.Sprintf("注册邀请码已绑定: 账号=%s 码=%s",
+		name, database.FormatInviteCode(code)))
+
+	return models.Err.Ok, ""
+}
+
+// logInviteReject 统一记录邀请码被拒的原因，并把它返回给调用方落审计表。
+func (s *AccountService) logInviteReject(account, code, ip string, status int) string {
+	reason := "无效"
+	switch status {
+	case database.InviteConsumeNotFound:
+		reason = "不存在"
+	case database.InviteConsumeUsed:
+		reason = "已被使用"
+	case database.InviteConsumeDisabled:
+		reason = "已作废"
+	case database.InviteConsumeExpired:
+		reason = "已过期"
+	}
+	s.logger.Warn(fmt.Sprintf("注册邀请码%s: 账号=%s 码=%s ip=%s", reason, account, code, ip))
+	return reason
+}
+
+// recordRegisterReject 记一条被拒的注册尝试。
+//
+// ★ 写失败**不影响**注册流程：这是审计数据。玩家该看到的错误码照常返回。
+// 有了它，后台「注册流水」页才能回答"这个号为什么注册不了"。
+func (s *AccountService) recordRegisterReject(
+	account, ip, machineID string, code int, reason string,
+) {
+	if s == nil || s.db == nil {
+		return
+	}
+	if err := s.db.InsertRegisterReject(account, ip, machineID, code, reason, utils.NowUnix()); err != nil {
+		s.logger.Warn(fmt.Sprintf("写注册被拒流水失败（不影响注册流程）: account=%s err=%v", account, err))
+	}
 }
 
 // CheckRegisterLimit 判定本次注册是否触顶（2026-10-13）。
@@ -262,6 +581,22 @@ func (s *AccountService) Login(name, passwordMd5, deviceSecret, ip, gameId strin
 	account, err := s.db.GetAccountByName(name)
 	if err != nil {
 		return &models.LoginResult{ErrorCode: models.Err.DatabaseError}
+	}
+	if account == nil {
+		// ── 登录兜底反查主网关（三服合一，评估文档 5.4）────────────────
+		//
+		// 场景：玩家在主网关注册，立刻来从网关登录。从网关本地没这个账号，
+		// 直接报"账号不存在"会让"注册一次三服都能登"落空。
+		//
+		// 反查拿到主网关的 pwd_hash + salt + m_id 后：
+		//   ① 用同一套算法验密（凭据同源，算出来的哈希可比）
+		//   ② 验过就**懒建**本地副本，之后走本地路径（不再每次反查）
+		//
+		// ★ 反查失败/超时一律降级为原有行为（报账号不存在）——
+		//   失败方向必须保守，不能因为主网关抖动就让玩家以为账号被删了。
+		if lazily := s.tryLazyCreateFromPeer(name, passwordMd5); lazily != nil {
+			account = lazily
+		}
 	}
 	if account == nil {
 		// 账号不存在也要花掉与「密码错误」同量级的时间，否则响应时延本身就是
@@ -419,12 +754,29 @@ func (s *AccountService) ChangePassword(name, oldPwdMd5, newPwdMd5 string) int {
 	}
 
 	s.logger.Info(fmt.Sprintf("修改密码: %s", name))
+
+	// 记录账号事件（三服合一，2026-10-24）：供从网关同步。
+	// ★ detail 留空 —— 密码哈希不同源（S4A21 MD5 / S5A3 bcrypt），同步不了。
+	//   从网关看到 password_change 事件后，本地副本无法更新密码，
+	//   玩家在从网关登录时走"兜底反查主网关"路径。
+	if err := s.db.RecordAccountEvent(database.AccountEventPasswordChange, name, "", database.BanScopeGlobal); err != nil {
+		s.logger.Warn("记录账号事件(password_change)失败: " + err.Error())
+	}
+
 	return models.Err.Ok
 }
 
 // IsBanned 检查账号是否被封禁。
 func (s *AccountService) IsBanned(name string) (bool, error) {
 	return s.db.IsBanned(name)
+}
+
+// IsBannedForServer 检查账号在指定服是否被封禁（三服合一，2026-10-24）。
+//
+// scope='global' 命中任何服；scope='<gameId>' 只命中该服。
+// gameId 为空时等价于 IsBanned（只判全局）。
+func (s *AccountService) IsBannedForServer(name, gameId string) (bool, error) {
+	return s.db.IsBannedForServer(name, gameId)
 }
 
 // UpdateHeartbeat 更新心跳。
@@ -674,11 +1026,49 @@ type AdminService struct {
 	db     *database.Database
 	config *config.GatewayConfig
 	logger *logger.ConsoleLogger
+	// sessionMgr 用于「全服邮件」排除在线角色（见 BroadcastItems 的说明）。
+	// 可能为 nil（独立管理进程里没有会话表），此时不做在线过滤。
+	sessionMgr *session.SessionManager
+	smMu       sync.RWMutex
 }
 
 // NewAdminService 创建管理后台服务。
 func NewAdminService(db *database.Database, cfg *config.GatewayConfig, logger *logger.ConsoleLogger) *AdminService {
 	return &AdminService{db: db, config: cfg, logger: logger}
+}
+
+// SetSessionManager 注入会话管理器（只有网关进程有，独立管理进程传 nil 即可）。
+//
+// 用途仅限「全服邮件排除在线角色」：S5A3 的邮箱是整箱 replace 语义，
+// 玩家退出时服务端会按内存里的邮箱 DELETE + 重插，把网关刚写进去的邮件抹掉。
+func (s *AdminService) SetSessionManager(sm *session.SessionManager) {
+	s.smMu.Lock()
+	s.sessionMgr = sm
+	s.smMu.Unlock()
+}
+
+func (s *AdminService) sessionManager() *session.SessionManager {
+	s.smMu.RLock()
+	defer s.smMu.RUnlock()
+	return s.sessionMgr
+}
+
+// onlineMIds 返回当前在线会话的 m_id 集合（小写去空）。
+//
+// S5A3 下 m_id 就是服务端的 account_id（形如 dnf:10002），
+// 与 database.Character.AccountKey 是同一个值，可直接比对。
+func (s *AdminService) onlineMIds() map[string]struct{} {
+	out := make(map[string]struct{})
+	sm := s.sessionManager()
+	if sm == nil {
+		return out
+	}
+	for _, sess := range sm.GetAllSessions() {
+		if key := strings.TrimSpace(sess.MId); key != "" {
+			out[key] = struct{}{}
+		}
+	}
+	return out
 }
 
 // ValidateAuthKey 验证管理密钥。
@@ -694,6 +1084,16 @@ func (s *AdminService) ResetPassword(account, newPwdMd5 string) int {
 	account = utils.TrimSpace(account)
 	if account == "" {
 		return models.Err.AccountEmpty
+	}
+
+	// ★ S5A3 分支：密码由服务端 bcrypt 掌管，网关拿不到明文（只有 MD5）就没法
+	// 生成能被服务端校验的哈希。这条路径必须由调用方传明文，见 ResetPasswordS5A3。
+	// 走到这里说明调用方没识别出 S5A3 —— 明确报错，别去写一条永远验不过的哈希。
+	if s.db.GameBackend() == "s5a3" {
+		if s.logger != nil {
+			s.logger.Warn(fmt.Sprintf("重置密码被拒: 账号=%s 原因=S5A3 服需要明文密码", account))
+		}
+		return models.Err.AccountUpstream
 	}
 
 	existing, _ := s.db.GetAccountByName(account)
@@ -719,6 +1119,38 @@ func (s *AdminService) ResetPassword(account, newPwdMd5 string) int {
 	}
 
 	return models.Err.Ok
+}
+
+// ResetPasswordS5A3 重置 S5A3 账号密码（2026-10-29）。
+//
+// 与 ResetPassword 的差别：这里要的是**明文**，因为 S5A3 服务端登录时用
+// `bcrypt.CompareHashAndPassword(hash, 明文)` 校验 —— 网关只有 MD5 的话
+// 生成不出能通过的哈希。
+//
+// 返回 (错误码, 给运维看的文案)。错误码语义与 ResetPassword 一致。
+func (s *AdminService) ResetPasswordS5A3(account, newPassword string) (int, string) {
+	account = utils.TrimSpace(account)
+	if account == "" {
+		return models.Err.AccountEmpty, "账号不能为空"
+	}
+	if err := database.ValidateS5A3Password(newPassword); err != nil {
+		return models.Err.PasswordLength, err.Error()
+	}
+
+	hit, err := s.db.S5A3ChangePassword(account, newPassword)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Error(fmt.Sprintf("S5A3 重置密码失败: 账号=%s err=%v", account, err))
+		}
+		return models.Err.DatabaseError, "重置失败：" + err.Error()
+	}
+	if !hit {
+		return models.Err.AccountNotFound, "S5A3 库中不存在该账号"
+	}
+	if s.logger != nil {
+		s.logger.Info(fmt.Sprintf("S5A3 重置密码成功: 账号=%s", account))
+	}
+	return models.Err.Ok, "密码已重置（服务端 bcrypt 已更新，玩家下次登录用新密码）"
 }
 
 // ResetDeviceBinding 解除指定账号的设备绑定。
@@ -759,9 +1191,35 @@ func (s *AdminService) ResetDeviceBinding(account string) int {
 }
 
 // BroadcastItems 全服发放。
+//
+// ── 幂等（2026-10-29，参考 PurpleMagic 的 benefit receipts）───────────────
+//
+// 每次调用都会分配一个 **batch_id**：
+//   - 请求里带了 BatchID（重试同一个批次）→ 先查回执，已成功投递的角色直接跳过；
+//   - 没带 → 生成新批次号，等于"这是新的一次发送"。
+//
+// 这样"发完发现有人没收到 → 再点一次"只会补发失败的那些，
+// 不会让已经收到的玩家再收一封。
+//
+// 为什么要这个：S5A3 的邮箱是整箱 replace 语义，在线玩家的邮件会被退出存档
+// 覆盖删掉；运维看到"没收到"就会重复点发送。没有回执的话离线玩家会收两封。
 func (s *AdminService) BroadcastItems(req *models.BroadcastRequest) map[string]interface{} {
 	if req == nil || len(req.Items) == 0 {
 		return map[string]interface{}{"ok": false, "error": "物品列表不能为空"}
+	}
+
+	batchID := strings.TrimSpace(req.BatchID)
+	if batchID == "" {
+		batchID = database.NewMailBatchID()
+	}
+	// 先读已成功名单：重试时这是"跳过"的唯一依据。
+	delivered, err := s.db.DeliveredCharacters(batchID)
+	if err != nil {
+		// 读不到回执不能当成"都没发过"（那会重复发放），直接拒绝并让人去查库。
+		return map[string]interface{}{
+			"ok": false, "batch_id": batchID,
+			"error": fmt.Sprintf("读取投递回执失败，已中止以免重复发放: %v", err),
+		}
 	}
 
 	items := make([]database.MailItem, len(req.Items))
@@ -803,6 +1261,38 @@ func (s *AdminService) BroadcastItems(req *models.BroadcastRequest) map[string]i
 		return map[string]interface{}{"ok": false, "error": "未找到符合条件的角色"}
 	}
 
+	// ★ S5A3 专属：排除在线角色。
+	//
+	// S5A3 的邮箱是**整箱 replace** 语义（服务端 mysql_mail.go 的 replaceMails：
+	// DELETE 该角色全部邮件后按内存里的邮箱重插）。玩家在线时邮箱在服务端内存里，
+	// 网关直接写库的邮件会在玩家退出存档时被整箱覆盖删掉 —— 表现为"发了但没收到"。
+	//
+	// 所以这里跳过在线账号的角色，并把跳过的数量回报给后台。
+	// S4A21 后端没有这个问题（append 语义），不做过滤，行为与改造前完全一致。
+	skipped := 0
+	if s.db.GameBackend() == "s5a3" {
+		online := s.onlineMIds()
+		if len(online) > 0 {
+			kept := make([]database.Character, 0, len(characters))
+			for _, char := range characters {
+				if key := strings.TrimSpace(char.AccountKey); key != "" {
+					if _, busy := online[key]; busy {
+						skipped++
+						continue
+					}
+				}
+				kept = append(kept, char)
+			}
+			characters = kept
+			if len(characters) == 0 {
+				return map[string]interface{}{
+					"ok": false, "skipped": skipped,
+					"error": fmt.Sprintf("目标角色全部在线（%d 个），S5A3 在线时写邮箱会被退出存档覆盖，请等玩家下线后再发", skipped),
+				}
+			}
+		}
+	}
+
 	// 检查角色数上限
 	if s.config.Admin.BroadcastTotalCharacterLimit > 0 && len(characters) > s.config.Admin.BroadcastTotalCharacterLimit {
 		return map[string]interface{}{"ok": false, "error": fmt.Sprintf("角色数 %d 超过上限 %d", len(characters), s.config.Admin.BroadcastTotalCharacterLimit)}
@@ -810,22 +1300,61 @@ func (s *AdminService) BroadcastItems(req *models.BroadcastRequest) map[string]i
 
 	sent := 0
 	failed := 0
+	// alreadyDone 统计"这个批次之前已经发成功、本次跳过"的数量。
+	alreadyDone := 0
 	errors := []string{}
 
 	for _, char := range characters {
+		// 幂等：同一批次里已成功投递过的角色直接跳过。
+		// 这是"重复点发送不会重复发"的核心，比"记录发过什么"更重要 ——
+		// 玩家把邮件删了不该导致再收一封。
+		if _, done := delivered[char.CharacterId]; done {
+			alreadyDone++
+			continue
+		}
+		// 按角色一条回执：先写 failed，成功后再改 delivered。
+		// 中途进程崩溃时留下的是 failed，下次重试会补发（宁可重试也不要静默丢）。
+		receipt := database.MailReceipt{
+			BatchID:       batchID,
+			CharacterID:   char.CharacterId,
+			CharacterName: char.Name,
+			AccountKey:    char.AccountKey,
+			ItemCount:     len(items),
+			Status:        database.MailReceiptFailed,
+		}
 		if err := s.db.SendMailToCharacter(char.CharacterId, char.Name, "系统邮件", "", items, 720); err != nil {
 			failed++
+			receipt.Message = err.Error()
 			errors = append(errors, fmt.Sprintf("角色 %d: %v", char.CharacterId, err))
+			_ = s.db.RecordMailReceipt(receipt)
 			if len(errors) >= 50 {
 				break
 			}
-		} else {
-			sent++
+			continue
+		}
+		sent++
+		receipt.Status = database.MailReceiptDelivered
+		receipt.Message = ""
+		if err := s.db.RecordMailReceipt(receipt); err != nil {
+			// 邮件已经发出去了，回执写失败只记日志 —— 此时报错会让运维以为没发成。
+			// 代价是这个角色在下次重试时可能收到第二封（重复而非丢失，取舍明确）。
+			if s.logger != nil {
+				s.logger.Warn(fmt.Sprintf("投递回执写入失败（邮件已发出）: 批次=%s 角色=%d err=%v",
+					batchID, char.CharacterId, err))
+			}
 		}
 	}
 
 	result := map[string]interface{}{
-		"ok": true, "total": len(characters), "sent": sent, "failed": failed,
+		"ok": true, "batch_id": batchID,
+		"total": len(characters), "sent": sent, "failed": failed,
+	}
+	if alreadyDone > 0 {
+		result["already_delivered"] = alreadyDone
+	}
+	if skipped > 0 {
+		// 让后台明确看到"有一部分没发"，而不是以为全发出去了。
+		result["skipped"] = skipped
 	}
 	if len(errors) > 0 {
 		result["errors"] = errors
@@ -2514,11 +3043,24 @@ func (s *RegisterBonusService) processRegistered(account string, reg *models.Reg
 	// 另分配一个数字 m_id（如 kokiku -> 932320940），而下面所有游戏库操作查的都是
 	// WHERE m_id = ?。此前直接传 account，导致昵称型账号的注册奖励永远命中 0 行、
 	// 静默不发也不报错（纯数字登录名因为 m_id == name 而碰巧正常，所以一直没被发现）。
+	//
+	// ★ S5A3 分支（2026-10-29）：S5A3 的账号主权在服务端 MySQL，网关库
+	// accounts 表里通常没有这一行（只有同步脚本补过才有）。此时 m_id 直接取
+	// dnf90_web_accounts.account_id（形如 dnf:10002），它正是
+	// dnf_account_metadata.account_id，也是会话的 MId。
 	mId := ""
-	if acct, err := s.db.GetAccountByName(account); err != nil {
-		return err
-	} else if acct != nil {
-		mId = acct.MId
+	if s.db.GameBackend() == "s5a3" {
+		resolved, err := s.db.S5A3AccountIDByName(account)
+		if err != nil {
+			return err
+		}
+		mId = resolved
+	} else {
+		if acct, err := s.db.GetAccountByName(account); err != nil {
+			return err
+		} else if acct != nil {
+			mId = acct.MId
+		}
 	}
 	if mId == "" {
 		s.logWarn("注册奖励找不到账号记录，保持待发: account=%s", account)
@@ -2526,7 +3068,16 @@ func (s *RegisterBonusService) processRegistered(account string, reg *models.Reg
 	}
 
 	// 游戏库里没有该 m_id 的账号行时保持待发，而不是静默当成"已发放"。
-	if _, _, _, ok := s.db.GetCurrencyTripleByMId(mId); !ok {
+	//
+	// S5A3 的「账号行」是 dnf_accounts（不是 dnf90_web_accounts）：
+	// 后者是网页注册表，前者由服务端在玩家首次进游戏时 bootstrap 出来。
+	// 点券挂在 dnf_account_metadata 上，没有 dnf_accounts 行就无处可挂。
+	if s.db.GameBackend() == "s5a3" {
+		if !s.db.S5A3AccountExists(mId) {
+			s.logWarn("注册奖励：S5A3 尚未建 dnf_accounts 行（玩家还没进过游戏），保持待发: account=%s m_id=%s", account, mId)
+			return nil
+		}
+	} else if _, _, _, ok := s.db.GetCurrencyTripleByMId(mId); !ok {
 		s.logWarn("注册奖励：游戏库无此 m_id 的账号行，保持待发: account=%s m_id=%s", account, mId)
 		return nil
 	}
@@ -2567,7 +3118,10 @@ func (s *RegisterBonusService) processRegistered(account string, reg *models.Reg
 		return s.db.MarkRegisterDone(reg.ID)
 	}
 
-	if !s.db.GameConfigured() {
+	// 判"有没有游戏库"要用 GameBackend（sqlite / s5a3 都算有），
+	// 不能用 GameConfigured —— 后者只认 S4A21 的 SQLite，S5A3 部署会永远走到
+	// 这个分支、把金币/物品奖励无限期挂着。
+	if s.db.GameBackend() == "" {
 		s.logger.Warn(fmt.Sprintf("注册奖励待发放但游戏库未配置，跳过: %s", account))
 		return nil // 保留 pending,等游戏库配置后重试
 	}
@@ -3564,16 +4118,58 @@ func (s *ServerManager) Control(action string) *ControlResult {
 }
 
 // TailLog 读取日志尾部。
+//
+// 取数顺序：**先文件、后 journald**（2026-11-01）。
+//
+// S5A3 的服务端由 systemd 托管、不写日志文件 —— 标准输出直接进 journald。
+// 原来只按文件 tail，后台「服务端日志」永远报「未配置的日志键」/ ENOENT。
 func (s *ServerManager) TailLog(key string, lines int) *LogResult {
 	path := s.resolveLogPath(key)
 	if path == "" {
 		return &LogResult{Error: "未配置的日志键", Lines: nil}
 	}
+
+	// ★ 文件不存在 / 是空文件 → **直接走 journald**（2026-11-01 修正）。
+	//
+	// 不能靠 TailFile 的 error 判断回退：它对"文件不存在"返回的是 ([], nil)
+	// （历史调用方 S4A21 希望"日志还没生成"显示成空列表而不是报错）。
+	// 结果回退分支永远不触发，S5A3 上永远返回空行 —— 表现就是"日志读取无效"。
+	if fi, statErr := os.Stat(path); statErr == nil && fi.Size() > 0 {
+		if fileLines, err := utils.TailFile(path, lines); err == nil && len(fileLines) > 0 {
+			return &LogResult{Error: "", Lines: fileLines}
+		}
+	}
+
+	if unit := s.journalUnitFor(key); unit != "" {
+		jLines, jerr := utils.JournalTail(unit, lines)
+		if jerr == nil {
+			return &LogResult{Error: "", Lines: jLines}
+		}
+		// 两条路都失败时把两边的原因都报出来：只报 "no such file" 会让人
+		// 以为配置漏了，其实可能是没权限读 journal。
+		return &LogResult{
+			Error: fmt.Sprintf("日志文件 %s 无内容，回退 journald 也失败：%s", path, jerr.Error()),
+			Lines: nil,
+		}
+	}
+
+	// 没有 journald 通道（如 packet 日志）→ 回到文件口径，如实报告
 	fileLines, err := utils.TailFile(path, lines)
 	if err != nil {
 		return &LogResult{Error: err.Error(), Lines: nil}
 	}
 	return &LogResult{Error: "", Lines: fileLines}
+}
+
+// journalUnitFor 把日志键映射到 systemd 单元；不支持 journald 的键返回空串。
+func (s *ServerManager) journalUnitFor(key string) string {
+	switch key {
+	case "server":
+		return strings.TrimSpace(s.config.Server.Unit)
+	case "gateway":
+		return strings.TrimSpace(s.config.GatewayControl.Unit)
+	}
+	return ""
 }
 
 // resolvePvfPath 解析服务端 PVF 的真实路径。
@@ -3949,7 +4545,17 @@ func (s *ServerManager) resolveLogPath(key string) string {
 		}
 		return root
 	case "packet":
-		return filepath.Join(workDir, "packet.log")
+		// S5A3 的封包日志在 logs/packet_log.txt（不是 packet.log），
+		// 两个都试，取第一个存在的（2026-11-01）。
+		for _, p := range []string{
+			filepath.Join(workDir, "packet.log"),
+			filepath.Join(workDir, "logs", "packet_log.txt"),
+		} {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+		return filepath.Join(workDir, "logs", "packet_log.txt")
 	case "gateway":
 		return filepath.Join(workDir, "gateway.log")
 	case "error":

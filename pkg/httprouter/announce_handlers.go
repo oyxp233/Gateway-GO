@@ -81,11 +81,21 @@ func (s *Server) handleInternalAnnouncePull(w http.ResponseWriter, r *http.Reque
 	}
 
 	cfg := s.announceSvc.Config()
-	popups, err := s.announceSvc.PullPopups(announcePullPopupLimit, announcePendingPopupTTLSeconds)
-	if err != nil {
-		// 弹窗取不出来不该拖垮配置下发：公告开关仍然要热重载。
-		s.logger.Error(fmt.Sprintf("[Announce] 取弹窗队列失败: %v", err))
-		popups = nil
+
+	// ★ popups=0：服务端没有在线玩家时会带这个参数，**不要取走队列**。
+	//
+	// 网关的 PullPopups 是"拉走即标记 sent"（同事务改状态），一旦取走就再也发不出去。
+	// 没有在线玩家时取走 = 运营点了「全服弹窗」、玩家一条都没看到、后台却显示已投递。
+	// 带 popups=0 时弹窗留在 pending，等有人上线再取（2026-11-01）。
+	var popups []models.AnnouncePopup
+	if r.URL.Query().Get("popups") != "0" {
+		var err error
+		popups, err = s.announceSvc.PullPopups(announcePullPopupLimit, announcePendingPopupTTLSeconds)
+		if err != nil {
+			// 弹窗取不出来不该拖垮配置下发：公告开关仍然要热重载。
+			s.logger.Error(fmt.Sprintf("[Announce] 取弹窗队列失败: %v", err))
+			popups = nil
+		}
 	}
 
 	out := announcePullResponse{

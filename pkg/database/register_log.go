@@ -99,6 +99,39 @@ func (db *Database) queryRegistrationLogs(where string, arg interface{}, limit i
 	return out, rows.Err()
 }
 
+// ListRecentRegistrationLogs 返回最近的注册流水（不按 IP / 机器码过滤）。
+//
+// 用途（2026-11-01）：后台「注册流水」页原来**强制**填 IP 或机器码才能查，
+// 而运营手里往往只有一个账号名、或玩家一句"我注册不了" —— 直接给最近 N 条才有用。
+//
+// 不复用 queryRegistrationLogs：那个函数固定拼一个 where 占位符参数，
+// 传 "1=1" 会多出一个没人用的参数，SQLite 直接报参数个数不匹配。
+func (db *Database) ListRecentRegistrationLogs(limit int) ([]RegistrationLog, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := db.gatewayDB.Query(
+		"SELECT account, m_id, ip, machine_id, created_at FROM register_logs ORDER BY id DESC LIMIT ?",
+		limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]RegistrationLog, 0, limit)
+	for rows.Next() {
+		var r RegistrationLog
+		if err := rows.Scan(&r.Account, &r.MID, &r.IP, &r.MachineID, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // RegistrationLog 是一条注册流水。
 type RegistrationLog struct {
 	Account   string

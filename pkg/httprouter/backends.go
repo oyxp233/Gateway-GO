@@ -437,6 +437,33 @@ func (b *localRuntimeConfigBackend) SetMaintenance(enabled *bool, message *strin
 	if b.cfg == nil {
 		return 0, fmt.Errorf("配置未加载")
 	}
+
+	// ★★ 持久化（2026-10-19）：维护模式原先**只改内存**，网关一重启就复位成
+	//    "不维护"。而运维的真实用法恰恰是「更新前开维护 → 发版/换二进制重启网关 →
+	//    更新完手动关」—— 内存态让重启这一步把闸门自己打开了：更新失败（或更新
+	//    还没完成）时玩家照样能登录，维护模式形同虚设。
+	//    因此与 SetLauncher / SetRegisterLimit / SetHeartbeat 同款：
+	//    先落盘 override，成功后再改内存（落盘失败不留"内存已改、重启还原"的不一致）。
+	//
+	//    override 是**字段级**覆盖（LoadConfig 把 override 直接 Unmarshal 进 cfg，
+	//    不是整段替换），所以只写本次变更的键，同段的 AdminAccounts / Message 由
+	//    主配置或上一次落盘继续提供。
+	maintUpdates := make(map[string]interface{})
+	if enabled != nil {
+		maintUpdates["Enabled"] = *enabled
+	}
+	if message != nil {
+		maintUpdates["Message"] = *message
+	}
+	if admins != nil {
+		maintUpdates["AdminAccounts"] = admins
+	}
+	if len(maintUpdates) > 0 && b.editor != nil {
+		if err := b.editor.SaveOverride(map[string]interface{}{"Maintenance": maintUpdates}); err != nil {
+			return 0, err
+		}
+	}
+
 	// G-5（2026-10-04 审查）：原先直接改 b.cfg.Maintenance.*，且紧接着
 	// `if b.cfg.Maintenance.Enabled` 是**未加锁读同一批字段**。这里改为
 	// 锁内写入 + 锁后快照判定，踢人用的是与判定一致的那份值。

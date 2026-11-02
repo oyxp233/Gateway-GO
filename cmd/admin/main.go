@@ -76,6 +76,10 @@ func main() {
 		GamePath:           cfg.Database.GamePath,
 		WalMode:            cfg.Database.WalMode,
 		BusyTimeoutSeconds: cfg.Database.BusyTimeoutSeconds,
+		// S5A3 的 MariaDB 游戏库（全服邮件/泡点/注册奖励/角色查询用）。
+		// 留空 = 该部署没有 S5A3 后端，相关功能会明确报"未配置"。
+		GameDSN:         cfg.S5A3GameDSN(),
+		GameTablePrefix: cfg.S5A3TablePrefix(),
 	})
 	if err != nil {
 		log.Fatal(fmt.Sprintf("数据库初始化失败: %v", err))

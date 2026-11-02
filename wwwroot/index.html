@@ -718,7 +718,7 @@
                 <button class="btn btn-danger" onclick="kickAll()">踢全部下线</button>
                 <span id="onlineCount" class="muted"></span>
                 <table>
-                    <thead><tr><th>账号</th><th>IP</th><th>在线时长</th><th>最后心跳</th><th>泡点累计</th><th>点券余额</th><th>操作</th></tr></thead>
+                    <thead><tr><th>账号</th><th>角色</th><th>等级</th><th>IP</th><th>在线时长</th><th>最后心跳</th><th>泡点累计</th><th>点券余额</th><th>操作</th></tr></thead>
                     <tbody id="onlineTable"></tbody>
                 </table>
             </div>
@@ -1015,8 +1015,9 @@
                 <h3>日志</h3>
                 <div class="row">
                     <select id="serverLogKey">
-                        <option value="server">server.log（主日志）</option>
-                        <option value="packet">packet.log（封包日志）</option>
+                        <option value="server">服务端日志（文件缺失时自动读 journald）</option>
+                        <option value="packet">封包日志（logs/packet_log.txt）</option>
+                        <option value="gateway">网关日志（journald）</option>
                     </select>
                     <label>行数</label><input type="text" id="serverLogLines" value="300" style="width: 90px;">
                     <button class="btn" onclick="loadServerLogs()">读取</button>
@@ -1600,17 +1601,23 @@
             <div class="card">
                 <h3>查注册流水</h3>
                 <p class="muted">
-                    按来源 IP 或机器码查「最近注册了哪些号」。玩家来问「为什么我注册不了」时先在这里看 ——
-                    流水只从本次上线开始记，存量账号没有历史记录。
+                    IP / 机器码可以<b>留空</b> —— 留空就是「最近 50 条」。玩家来问「为什么我注册不了」时，
+                    先看下面的<b>被拒记录</b>：那里会写明是撞了限额、邀请码无效、还是账号重名。
                 </p>
                 <div class="row">
-                    <input type="text" id="regLogIp" placeholder="按 IP 查，如 113.15.1.1" style="width: 200px;">
-                    <input type="text" id="regLogMachine" placeholder="按机器码查（完整值）" style="width: 280px;">
+                    <input type="text" id="regLogIp" placeholder="按 IP 查，如 113.15.1.1（可留空）" style="width: 240px;">
+                    <input type="text" id="regLogMachine" placeholder="按机器码查（完整值，可留空）" style="width: 280px;">
                     <button class="btn" onclick="loadRegisterLogs()">查询</button>
                 </div>
+                <h4 style="margin:16px 0 8px;">成功注册</h4>
                 <table>
                     <thead><tr><th>账号</th><th>MID</th><th>来源 IP</th><th>机器码</th><th>注册时间</th></tr></thead>
                     <tbody id="regLogTable"></tbody>
+                </table>
+                <h4 style="margin:16px 0 8px;">被拒记录</h4>
+                <table>
+                    <thead><tr><th>账号</th><th>来源 IP</th><th>机器码</th><th>原因</th><th>时间</th></tr></thead>
+                    <tbody id="regRejectTable"></tbody>
                 </table>
             </div>
         </div>
@@ -2678,6 +2685,8 @@
             players.forEach(p => {
                 tbody.innerHTML += `<tr>
                     <td>${esc(p.account)}</td>
+                    <td>${p.roleName ? esc(p.roleName) : '<span class="muted">（选人界面）</span>'}</td>
+                    <td>${p.roleLevel ? esc(p.roleLevel) : '-'}</td>
                     <td>${esc(p.ip)}</td>
                     <td>${esc(p.onlineMinutes)}分钟</td>
                     <td>${esc(fmtTime(p.lastHeartbeat))}</td>
@@ -5283,23 +5292,39 @@
             const ip = document.getElementById('regLogIp').value.trim();
             const machine = document.getElementById('regLogMachine').value.trim();
             const tbody = document.getElementById('regLogTable');
-            if (!ip && !machine) { alert('请填写 IP 或机器码'); return; }
-            const q = ip ? `ip=${encodeURIComponent(ip)}` : `machine=${encodeURIComponent(machine)}`;
-            const data = await api(`/api/admin/register-logs?${q}&limit=50`);
+            const rbody = document.getElementById('regRejectTable');
+
+            // 2026-11-01：不再强制填 IP/机器码 —— 留空就是「最近 50 条」。
+            // 原来那句 "请填写 IP 或机器码" 把整个功能废掉了：
+            // 运营手里往往只有一个账号名，或者玩家只说"我注册不了"。
+            const qs = new URLSearchParams();
+            if (ip) qs.set('ip', ip);
+            if (machine) qs.set('machine', machine);
+            qs.set('limit', '50');
+
+            const data = await api(`/api/admin/register-logs?${qs.toString()}`);
             if (!data) return;
             if (data.ok === false) { alert('查询失败：' + (data.error || '未知错误')); return; }
+
             const rows = data.logs || [];
-            if (!rows.length) {
-                tbody.innerHTML = '<tr><td colspan="5" class="muted">没有记录（流水只从本次上线开始记）</td></tr>';
-                return;
-            }
-            tbody.innerHTML = rows.map(l => `<tr>
+            tbody.innerHTML = rows.length ? rows.map(l => `<tr>
                 <td>${esc(String(l.account || ''))}</td>
                 <td>${esc(String(l.m_id || ''))}</td>
                 <td>${esc(String(l.ip || ''))}</td>
                 <td title="${esc(String(l.machine_id || ''))}">${esc(maskMachine(l.machine_id))}</td>
                 <td>${esc(fmtTime(l.created_at))}</td>
-            </tr>`).join('');
+            </tr>`).join('')
+                : '<tr><td colspan="5" class="muted">没有记录（流水只从本次上线开始记）</td></tr>';
+
+            const rej = data.rejects || [];
+            rbody.innerHTML = rej.length ? rej.map(j => `<tr>
+                <td>${esc(String(j.account || ''))}</td>
+                <td>${esc(String(j.ip || ''))}</td>
+                <td title="${esc(String(j.machine_id || ''))}">${esc(maskMachine(j.machine_id))}</td>
+                <td>${esc(String(j.reason || ''))} <span class="muted">(码 ${esc(String(j.reason_code || ''))})</span></td>
+                <td>${esc(fmtTime(j.created_at))}</td>
+            </tr>`).join('')
+                : '<tr><td colspan="5" class="muted">没有被拒记录</td></tr>';
         }
 
         // ==================== 邀请码（2026-10-24） ====================

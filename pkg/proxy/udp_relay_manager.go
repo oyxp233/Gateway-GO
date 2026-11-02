@@ -47,7 +47,7 @@ func StartUDPRelays(cfg *config.GatewayConfig, log *logger.ConsoleLogger) *UDPRe
 			log.Error(fmt.Sprintf("[UDP] 服 %s 配了 PartyUDPPorts 但 BackendHost 为空，跳过 UDP 中继", entry.Id))
 			continue
 		}
-		relay := NewUDPRelay(entry.Id, backend, ports)
+		relay := NewUDPRelay(entry.Id, cfg.Gateway.ListenAddress, backend, ports)
 		if relay == nil {
 			continue
 		}

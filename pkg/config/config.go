@@ -67,6 +67,7 @@ type GatewayConfig struct {
 	GameServers    []GameServerEntry     `json:"GameServers"`
 	Pvf            PvfSection            `json:"Pvf"`
 	Launcher       LauncherSection       `json:"Launcher"`
+	DnfExe         DnfExeSection         `json:"DnfExe"`
 	Admin          AdminSection          `json:"Admin"`
 	RateLimit      RateLimitSection      `json:"RateLimit"`
 	Token          TokenSection          `json:"Token"`
@@ -74,11 +75,13 @@ type GatewayConfig struct {
 	Heartbeat      HeartbeatSection      `json:"Heartbeat"`
 	Device         DeviceSection         `json:"Device"`
 	RegisterLimit  RegisterLimitSection  `json:"RegisterLimit"`
+	Register       RegisterSection       `json:"Register"`
 	Server         ServerSection         `json:"Server"`
 	GatewayControl GatewayControlSection `json:"GatewayControl"`
 	Maintenance    MaintenanceSection    `json:"Maintenance"`
+	Signing        SigningSection        `json:"Signing"`
 
-	// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit / Heartbeat）——
+	// runtimeMu 保护**运行时可变**的配置段（Launcher / Maintenance / RegisterLimit / Heartbeat / DnfExe）——
 	// 这几段会被管理后台在运行中改写（httprouter 的 runtimeConfigBackend），
 	// 而认证侧（auth 的版本门禁、注册限额判定）、HTTP 侧（policy/notice/update 端点）
 	// 与清理协程（cmd/gateway 的巡检 ticker 读 Heartbeat.TimeoutSeconds）在并发读。
@@ -127,6 +130,24 @@ func (c *GatewayConfig) SetLauncherRuntime(minVersion, downloadURL, updateNotice
 	}
 	if maxInstances != nil {
 		c.Launcher.MaxInstances = *maxInstances
+	}
+}
+
+// DnfExeSnapshot 返回 DnfExe 段的运行时快照（并发安全）。
+//
+// 与 LauncherSnapshot 同理：MinVersion 会被管理后台热改，读侧走快照避免撕裂。
+func (c *GatewayConfig) DnfExeSnapshot() DnfExeSection {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	return c.DnfExe
+}
+
+// SetDnfExeRuntime 在锁内更新 DnfExe 段的运行时可变字段（传 nil = 不改该项）。
+func (c *GatewayConfig) SetDnfExeRuntime(minVersion *string) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if minVersion != nil {
+		c.DnfExe.MinVersion = *minVersion
 	}
 }
 
@@ -240,11 +261,104 @@ type GatewaySection struct {
 	ServeAdminInProcess bool `json:"ServeAdminInProcess"`
 }
 
+// SigningSection 是服清单签名的配置（三服合一，2026-10-24）。
+//
+// 见评估-三服合一登录器-20261023.md 第三章：
+// 网关用 Ed25519 私钥对服清单签名，登录器用编译期公钥验签。
+// 私钥文件由网关首次启动时自动生成（0600 权限），
+// 公钥 hex 字符串需要手动复制到登录器 BuildDefaults 中。
+type SigningSection struct {
+	// PrivateKeyPath 是 Ed25519 私钥文件路径。留空 = 不启用清单签名
+	//（清单仍可下发，但 signature 字段为空，登录器按"未签名"处理）。
+	PrivateKeyPath string `json:"PrivateKeyPath,omitempty"`
+	// KeyExpirySeconds 是清单有效期（秒），0 = 300（5 分钟）。
+	KeyExpirySeconds int `json:"KeyExpirySeconds,omitempty"`
+
+	// PeerBaseUrl 是主网关的**公开 HTTP 基址**（如 http://10.0.0.1:8080），
+	// 供从网关在收到 /internal/launcher/push 后去拉登录器 exe。
+	//
+	// 留空 = 本机是主网关（或未启用网关间同步），收到推送时直接回 501。
+	// 只有从网关需要配这一项。
+	//
+	// ★ 用公开端口而不是 internal 端口：exe 是 128 MiB 的大文件，
+	//   走 /api/launcher/update/exe 才能复用既有的限流与 ETag 逻辑，
+	//   也不需要把 internal API 暴露给跨机访问（它默认只绑 loopback）。
+	PeerBaseUrl string `json:"PeerBaseUrl,omitempty"`
+	// PeerInternalUrl 是主网关的**内部 API 基址**（如 http://10.0.0.1:18080），
+	// 供从网关定时拉取账号事件与版本元数据。
+	//
+	// 留空 = 不同步账号事件。跨机使用时主网关的
+	// Gateway.InternalListenAddress 要改成内网地址（默认 127.0.0.1 不可达）。
+	PeerInternalUrl string `json:"PeerInternalUrl,omitempty"`
+	// PeerInternalKey 是访问主网关内部 API 的密钥（= 主网关的 Admin.InternalKey）。
+	//
+	// ★ 与 Admin.InternalKey 分开配：本机的 InternalKey 用于"别人访问我"，
+	//   PeerInternalKey 用于"我访问主网关"。两者在主从同机时可相同，跨机时必须分开理解。
+	PeerInternalKey string `json:"PeerInternalKey,omitempty"`
+
+	// PeerAccountSyncSeconds 是账号事件同步间隔（秒），0 = 60。
+	//
+	// 间隔越短，"主网关封号后从网关多久生效"越短。60s 是延迟与主网关负载的折中。
+	PeerAccountSyncSeconds int `json:"PeerAccountSyncSeconds,omitempty"`
+	// PeerLauncherSyncSeconds 是登录器版本同步间隔（秒），0 = 300。
+	//
+	// 比账号事件慢得多：登录器版本变化频率是"每次发版"，不是"每次封号"。
+	// 而且这一步可能要拉 128 MiB exe，没必要勤快。
+	PeerLauncherSyncSeconds int `json:"PeerLauncherSyncSeconds,omitempty"`
+
+	// Peers 是**从网关列表**，只有主网关需要配（2026-10-24 第七轮）。
+	//
+	// 用途：主网关上传播录器新版本时，逐个 POST 到从网关的
+	// `/internal/launcher/push`，让发版从"等 300s 轮询"变成秒级生效。
+	//
+	// ★ 为什么不自动发现（从网关心跳上报）：
+	//   从网关数量少（个位数），显式列表更可靠 —— 自动发现要处理
+	//   "网关下线了但列表里还有"的清理，而那份复杂度换来的只是
+	//   "加从网关时不用改主网关配置"。显式配一次更省心。
+	//
+	// 从网关**不需要**配这一项（它们只往外连，不接受推送）。
+	Peers []PeerSection `json:"Peers,omitempty"`
+}
+
+// PeerSection 是一台从网关的连接信息。
+type PeerSection struct {
+	// Name 是展示名（日志用，如 "s5a3-slave"）。
+	Name string `json:"Name"`
+	// InternalUrl 是该从网关的内部 API 基址（如 http://10.0.0.2:18080）。
+	//
+	// ★ 必须是**从网关自己的** internal 地址，不是主网关的。
+	//   跨机时从网关的 Gateway.InternalListenAddress 要配成内网地址
+	//   （默认 127.0.0.1 不可达）。
+	InternalUrl string `json:"InternalUrl"`
+	// InternalKey 是访问该从网关内部 API 密钥（= 那台网关的 Admin.InternalKey）。
+	InternalKey string `json:"InternalKey"`
+}
+
 type DatabaseSection struct {
 	Path               string `json:"Path"`
 	GamePath           string `json:"GamePath"`
 	WalMode            bool   `json:"WalMode"`
 	BusyTimeoutSeconds int    `json:"BusyTimeoutSeconds"`
+
+	// GameDSN 是 S5A3 游戏库（MariaDB/MySQL）的连接串，形如
+	//   dnf:pass@tcp(127.0.0.1:3306)/dnf_local?charset=utf8mb4&parseTime=true&loc=Local
+	//
+	// ★ 为什么不能复用 GamePath：S4A21 的游戏库是 SQLite（单文件），S5A3 是
+	//   MariaDB。两者的表结构完全不同（S4A21 用 mailbox_messages/accounts/characters，
+	//   S5A3 用 dnf_mails/dnf_mail_attachments/dnf_account_metadata/dnf_characters），
+	//   SQL 一句都不能共用。所以这里必须是独立的一份连接串。
+	//
+	// 留空 = 该部署没有 S5A3 游戏库，所有依赖游戏库的功能（全服邮件、泡点、
+	// 注册奖励、角色查询）会明确报"游戏库未配置"，而不是静默失败。
+	GameDSN string `json:"GameDSN"`
+
+	// GameTablePrefix 是 S5A3 库的表名前缀，默认 "dnf"（表名形如 dnf_characters）。
+	// 独立部署的 S5A3 一律是 dnf；留空按默认处理。
+	GameTablePrefix string `json:"GameTablePrefix"`
+
+	// GameAccountTable 是 S5A3 的账号表名（含前缀），默认 dnf90_web_accounts。
+	// 注册奖励快照表建在它旁边（<表名>_benefit_policy / _benefit_signup）。
+	GameAccountTable string `json:"GameAccountTable"`
 }
 
 type GameServerSection struct {
@@ -335,6 +449,25 @@ type GameServerSection struct {
 	//     一致性，后端又不验密码）。
 	// 方案 D 用首包凭证同时解决两者，详见 pkg/proxy 的 admitGameClient。
 	GamePortAuth GamePortAuthSection `json:"GamePortAuth"`
+
+	// FilterClosedPorts 让 S5A3 频道列表走**代理模式**（2026-10-25）：
+	// 网关解析下行 CHANNELINFO，把"所在端口已关闭"的频道条目剔除，
+	// 于是"端口管理里关端口"在客户端选频道界面里直接消失 —— 与 S4A21 一致。
+	//
+	// 只对 Protocol=s5a3 生效（S4A21/S5A95 本来就有各自的重写适配器）。
+	//
+	// 取值：nil 或 false = 透传（缺省，行为与改造前逐字节一致）；
+	//       true = 代理模式。
+	//
+	// ★ 缺省关闭是有意的：它改变了网关对下行帧的处理方式（要分帧+解密+重编码）。
+	// 虽然实现里每一步失败都退回原样透传，但这是**行为变更**，
+	// 应由运维确认后再打开（打开后看日志 "[S5A3 频道列表] 已隐藏 N 个…"）。
+	FilterClosedPorts *bool `json:"FilterClosedPorts"`
+}
+
+// FilterClosedPortsEnabled 报告该服是否启用 S5A3 频道列表代理模式。
+func (s *GameServerEntry) FilterClosedPortsEnabled() bool {
+	return s != nil && s.FilterClosedPorts != nil && *s.FilterClosedPorts
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +520,33 @@ type GameServerEntry struct {
 	// 0 = 用 Gateway.ProxyPort —— 仅「只有一个启用服」时允许，
 	// 多服必须显式配置且互不碰撞（见 ValidateGameServers）。
 	ChannelListenerPort int `json:"ChannelListenerPort"`
+
+	// ── 服清单下发（三服合一，2026-10-24）─────────────────────────
+	//
+	// 以下字段用于 GET /api/launcher/servers 下发给登录器。
+	// 见评估-三服合一登录器-20261023.md 第三章。
+	// 留空/缺省时由网关从已有字段推导，不要求运营手填。
+
+	// ListHost 是下发给登录器的该服公网地址。留空 = 用 PublicIP。
+	// （加速器/CDN 场景下 PublicIP 可能不是玩家实际连接的地址。）
+	ListHost string `json:"ListHost,omitempty"`
+	// ListAuthPort 是下发给登录器的 TCP 认证端口。0 = 用 Gateway.TcpPort。
+	ListAuthPort int `json:"ListAuthPort,omitempty"`
+	// ListHttpPort 是下发给登录器的 HTTP API 端口。0 = 用 Gateway.HttpPort。
+	ListHttpPort int `json:"ListHttpPort,omitempty"`
+	// ListTls 是下发给登录器的 TLS 开关。nil = 用 Gateway Tls.Enabled。
+	ListTls *bool `json:"ListTls,omitempty"`
+	// ListPin 是下发给登录器的证书指纹。留空 = 用 Gateway Tls.PinnedFingerprint。
+	ListPin string `json:"ListPin,omitempty"`
+	// ListCaps 是下发给登录器的能力位列表。
+	// 可选值："plugins" / "integrity" / "pvf" / "kernel"。
+	// nil = 由网关按 Protocol 推导默认值（见 gates.go 的协议判定）。
+	ListCaps []string `json:"ListCaps,omitempty"`
+	// ListMinLauncherVer 是该服要求的最低登录器版本。留空 = 用全局 Launcher.MinVersion。
+	ListMinLauncherVer string `json:"ListMinLauncherVer,omitempty"`
+	// ListHidden 为 true 时该服不出现在服清单中（但 CMD_LOGIN 仍可用）。
+	// 用于内部测试服或即将下线的服。
+	ListHidden bool `json:"ListHidden,omitempty"`
 
 	GameServerSection
 }
@@ -726,6 +886,34 @@ type LauncherSection struct {
 	//   - 定位是**提高多开成本**，不是绝对封死：槽位机制对重命名 exe 无效
 	//     （槽名编译在登录器里），但改动过的登录器不在本文档覆盖范围内。
 	MaxInstances int `json:"MaxInstances"`
+
+	// LandingChannel 是「建议落点频道号」（2026-10-29）。
+	//
+	// 登录器启动前要把客户端的频道记忆（`DNF.cfg` 的
+	// CONFIG_CHARACTER_LATELY_GAMESERVER_INFO）重写成"区服 + 落点频道"。
+	// 落点**必须是常驻城镇频道**：停在特殊频道（团本/PVP/裂缝）上时客户端
+	// 不发 op4 选人包，表现为卡在选人界面 → 弹回频道列表 → 重试风暴。
+	//
+	// 以前这个值编译在登录器里（BuildDefaults.ChannelHistoryLandingChannel），
+	// 改频道表就得重发一个 139 MB 的 exe。现在由网关下发，改配置即生效。
+	//
+	// 0 = 未配置，走 DefaultLandingChannel（10 = 格兰之森第一个城镇频道）。
+	LandingChannel int `json:"LandingChannel"`
+}
+
+// DefaultLandingChannel 是未配置 LandingChannel 时的落点频道号。
+//
+// 10 = `[granfloris]` 格兰之森第一个频道，是 118/120 两版频道表里
+// 编号最小的常驻城镇频道（6 是 `[goldenroad]` 黄金之路，type 36 特殊频道，
+// 不能当落点）。
+const DefaultLandingChannel = 10
+
+// ResolveLandingChannel 返回生效的落点频道号（未配置走默认）。
+func (c *GatewayConfig) ResolveLandingChannel() int {
+	if c != nil && c.Launcher.LandingChannel > 0 && c.Launcher.LandingChannel < 1000 {
+		return c.Launcher.LandingChannel
+	}
+	return DefaultLandingChannel
 }
 
 // LauncherUpdateEnabled 返回登录器自更新总开关的生效值（缺省视为开）。
@@ -746,6 +934,67 @@ func (c *GatewayConfig) LauncherPluginEnabled() bool {
 		return true
 	}
 	return *c.Launcher.PluginEnabled
+}
+
+// ============================================================================
+// DNF.EXE 增量更新（2026-10-25）
+//
+// 背景：DNF.EXE 是游戏客户端主程序（~20 MB），每次更新玩家要重下全量。
+// 与登录器自更新（LauncherUpdateService）同构：复用 A21D 通用差分引擎做
+// exe 级增量，玩家从「等几十秒」变成「约 1 秒」。
+//
+// 与登录器增量的区别：
+//   - DNF.EXE 比 launcher.exe 小一个量级（~20 MB vs ~128 MB），历史保留版数
+//     默认更大（8 版 vs 4 版），磁盘压力相当；
+//   - DNF.EXE 的更新由登录器侧触发（登录器检测到新版后下载并替换 DNF.EXE），
+//     登录器自身不参与更新链路（它用 launcher_update/ 那套）。
+// ============================================================================
+
+// DnfExeSection 是 DNF.EXE 增量更新的配置段。
+//
+// 与 LauncherSection 平级、独立：DNF.EXE 和 launcher.exe 是两个不同的文件，
+// 各自维护版本历史、各自有开关，互不干扰。未配置此段时所有字段取零值 →
+// DnfExeUpdateEnabled() 返回 true（缺省视为开），行为同登录器自更新。
+type DnfExeSection struct {
+	// UpdateDir 是 DNF.EXE 更新分发目录，相对网关运行目录（默认 "./dnfexe_update"）。
+	//
+	// 布局（与 launcher_update/ 同构）：
+	//
+	//	dnfexe_update/current.exe            当前版本全量（按需 delta 的 to 源）
+	//	dnfexe_update/history/<HASH>.exe     历史版本（内容寻址）
+	//	dnfexe_update/history/index.json    版本记录（version/name/filename）
+	//	dnfexe_update/delta/from_<HASH>.delta 按需增量缓存（换版即清）
+	//
+	// 纯文件系统、无网关内存态，gateway(8080 下发) 与 admin(8443 上传)
+	// 两个进程共用同一目录，不需要 backends 抽象。
+	UpdateDir string `json:"UpdateDir"`
+
+	// UpdateKeep 是 DNF.EXE 历史保留版数上限（默认 8）。
+	//
+	// 与 Launcher.UpdateKeep=4 不同：DNF.EXE 一版约 20 MB，8 版 ≈ 160 MB，
+	// 覆盖「当前 + 最近七版」—— 比最老历史还老的客户端自动回退全量下载。
+	UpdateKeep int `json:"UpdateKeep"`
+
+	// UpdateEnabled 是 DNF.EXE 自更新总开关。**缺省（nil）视为开。**
+	//
+	// 置 false 时 /api/dnfexe/update 仍返回 200，但带 enabled=false，
+	// 登录器据此跳过 DNF.EXE 检查 —— 一键回滚开关，
+	// 改 appsettings.json + 重启即可，不动任何已分发文件。
+	UpdateEnabled *bool `json:"UpdateEnabled"`
+
+	// MinVersion 是 DNF.EXE 的最低版本门禁（语义化版本 x.y.z）。
+	//
+	// 登录器上报本地 DNF.EXE 版本，低于此值则强制更新（类似 launcher MinVersion）。
+	// 空串表示不做强更门槛（只做增量推送，不拦玩家）。
+	MinVersion string `json:"MinVersion"`
+}
+
+// DnfExeUpdateEnabled 返回 DNF.EXE 增量更新总开关的生效值（缺省视为开）。
+func (c *GatewayConfig) DnfExeUpdateEnabled() bool {
+	if c.DnfExe.UpdateEnabled == nil {
+		return true
+	}
+	return *c.DnfExe.UpdateEnabled
 }
 
 type AdminSection struct {
@@ -830,6 +1079,52 @@ const (
 	DefaultPerIPPerDay = 2
 	DefaultPerMachine  = 5
 )
+
+// RegisterSection 是注册策略（三服合一，2026-10-24）。
+//
+// 背景：三服合一后"注册入口必须唯一" —— 否则玩家在 A 服注册的号在 B 服登不进，
+// 而反向同步需要明文密码（评估文档 5.2 的方案 A），代价太大。
+//
+// 做法：注册一律在**主网关**建"平台账号"（网关自己的 accounts 表，MD5），
+// 然后主网关把明文密码转发给清单里所有 S5A3 服建号。
+// 从网关直接拒绝注册请求。
+//
+// ★ 为什么主网关要转发给 S5A3：
+//   S5A3 的账号在它自己的服务端 MySQL（bcrypt），网关的 accounts 表推不过去。
+//   但注册时登录器手里有**明文密码**，主网关可以用它调 S5A3 的
+//   /api/account/register 建号 —— 这样 S5A3 也能"注册一次就能登"。
+//   前提：主网关的 GameServers 必须包含 s5a3 条目且 AccountApiUrl 可达。
+type RegisterSection struct {
+	// PlatformOnly 注册只建"平台账号"，不按 game 分流到 S5A3 的注册接口。
+	//
+	// nil / true（默认）→ 平台账号 + 遍历 GameServers 里的 S5A3 服转发建号。
+	// false           → 保留改造前的行为（选中 S5A3 服时只注册 S5A3 账号）。
+	//
+	// 用指针是为了区分"没配"（默认 true）与"显式配 false"。
+	PlatformOnly *bool `json:"PlatformOnly,omitempty"`
+
+	// RequireInvite 注册必须带有效邀请码（2026-10-24）。
+	//
+	// nil / true（默认）→ 必须带邀请码。**升级后必须先在后台生成邀请码，
+	//                      否则没人能注册**（这是刻意的：需求就是"有邀请码才能注册"）。
+	// false           → 关闭邀请码校验（回到改造前的自由注册 + IP/机器限额）。
+	//
+	// ★ 为什么默认 true 而不是 false：
+	//   这个开关的目的是"卡死注册入口"。默认 false 等于"配了但没生效"，
+	//   运营以为开了、实际谁都能注册 —— 那种静默失效比"注册不了"危险得多。
+	//   需要临时放开时显式配 false 即可。
+	RequireInvite *bool `json:"RequireInvite,omitempty"`
+}
+
+// PlatformOnlyEnabled 返回 PlatformOnly 的生效值（默认 true）。
+func (s RegisterSection) PlatformOnlyEnabled() bool {
+	return s.PlatformOnly == nil || *s.PlatformOnly
+}
+
+// RequireInviteEnabled 返回 RequireInvite 的生效值（默认 true）。
+func (s RegisterSection) RequireInviteEnabled() bool {
+	return s.RequireInvite == nil || *s.RequireInvite
+}
 
 type TlsSection struct {
 	Enabled      bool   `json:"Enabled"`
@@ -972,6 +1267,9 @@ func DefaultConfig() *GatewayConfig {
 			GamePath:           "",
 			WalMode:            true,
 			BusyTimeoutSeconds: 30,
+			GameDSN:            "",
+			GameTablePrefix:    "",
+			GameAccountTable:   "",
 		},
 		GameServer: GameServerSection{
 			PublicIP:                     "127.0.0.1",
@@ -1191,6 +1489,49 @@ func (c *GatewayConfig) InternalAPIEnabled() bool {
 // 等于"以为回到单进程了，其实后台没人提供"，这种配置要能一眼看出来。
 func (c *GatewayConfig) ShouldServeAdminInProcess() bool {
 	return c.Gateway.ServeAdminInProcess && c.AdminSplitEnabled()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S5A3 游戏库（MariaDB）配置解析
+// ─────────────────────────────────────────────────────────────────────────────
+
+// DefaultS5A3TablePrefix 是 S5A3 库的默认表名前缀（表名形如 dnf_characters）。
+const DefaultS5A3TablePrefix = "dnf"
+
+// DefaultS5A3AccountTable 是 S5A3 的默认账号表名。
+//
+// 它同时是注册奖励快照表的前缀：<表名>_benefit_policy / <表名>_benefit_signup，
+// 与 S5A3 服务端 internal/modules/dnf/signupbenefits/store.go 完全一致。
+const DefaultS5A3AccountTable = "dnf90_web_accounts"
+
+// S5A3GameDSN 返回有效的 S5A3 游戏库 DSN（空 = 未配置）。
+func (c *GatewayConfig) S5A3GameDSN() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Database.GameDSN)
+}
+
+// S5A3TablePrefix 返回有效的表前缀，留空走默认。
+func (c *GatewayConfig) S5A3TablePrefix() string {
+	if c == nil {
+		return DefaultS5A3TablePrefix
+	}
+	if v := strings.TrimSpace(c.Database.GameTablePrefix); v != "" {
+		return v
+	}
+	return DefaultS5A3TablePrefix
+}
+
+// S5A3AccountTable 返回有效的账号表名，留空走默认。
+func (c *GatewayConfig) S5A3AccountTable() string {
+	if c == nil {
+		return DefaultS5A3AccountTable
+	}
+	if v := strings.TrimSpace(c.Database.GameAccountTable); v != "" {
+		return v
+	}
+	return DefaultS5A3AccountTable
 }
 
 // SaveOverride 将变更的配置写入 appsettings.override.json。

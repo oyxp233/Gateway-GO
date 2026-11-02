@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +75,13 @@ type UDPRelay struct {
 	backend  string
 	ports    []int
 
+	// listenHost 是监听 socket 绑定的宿主地址，与 TCP 侧（Gateway.ListenAddress）
+	// 保持一致。空或 0.0.0.0 表示绑通配地址。
+	//
+	// 同机部署（网关前置 + 后端容器）时**必须**绑具体地址：后端把组队口发布在
+	// 127.0.0.1 上，通配绑定会撞上同一个端口号直接 EADDRINUSE，64 个端口全废。
+	listenHost string
+
 	// listeners 按端口索引，不能用 r.ports 的下标 ——
 	// 某个端口监听失败时两个切片就不再等长，按位对齐会串包。
 	listeners map[int]*net.UDPConn
@@ -94,13 +102,15 @@ type UDPRelay struct {
 }
 
 // NewUDPRelay 按服配置创建中继。PartyUDPPorts 为空返回 nil（不启用）。
-func NewUDPRelay(serverId, backendHost string, ports []int) *UDPRelay {
+// listenHost 与 TCP 侧同源（Gateway.ListenAddress），空串 = 绑通配地址。
+func NewUDPRelay(serverId, listenHost, backendHost string, ports []int) *UDPRelay {
 	if len(ports) == 0 || backendHost == "" {
 		return nil
 	}
 	return &UDPRelay{
-		serverId:  serverId,
-		backend:   backendHost,
+		serverId:   serverId,
+		listenHost: strings.TrimSpace(listenHost),
+		backend:    backendHost,
 		ports:     append([]int(nil), ports...),
 		listeners: make(map[int]*net.UDPConn, len(ports)),
 		sessions:  make(map[int]map[string]*udpRelaySession),
@@ -113,7 +123,13 @@ func NewUDPRelay(serverId, backendHost string, ports []int) *UDPRelay {
 func (r *UDPRelay) Start() []error {
 	var failures []error
 	for _, port := range r.ports {
-		addr := &net.UDPAddr{IP: net.IPv4zero, Port: port}
+		ip := net.IPv4zero
+		if r.listenHost != "" && r.listenHost != "0.0.0.0" {
+			if parsed := net.ParseIP(r.listenHost); parsed != nil {
+				ip = parsed
+			}
+		}
+		addr := &net.UDPAddr{IP: ip, Port: port}
 		conn, err := net.ListenUDP("udp", addr)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("服 %s UDP %d 监听失败: %w", r.serverId, port, err))

@@ -21,25 +21,57 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 // registerViaHandler 走真实入口注册，返回错误码。
+//
+// ★ 自动带一个**有效邀请码**（2026-10-24）：Register.RequireInvite 默认开启，
+// 不带码一律 1040 —— 本组测试关心的是限额，不该被邀请码拦在前面。
 func registerViaHandler(t *testing.T, h *Handler, account, ip, machineID string) int {
+	t.Helper()
+	code, _ := registerViaHandlerFull(t, h, account, ip, "", "", "", machineID)
+	return code
+}
+
+// registerViaHandlerFull 走真实入口注册，可指定 game / 明文密码 / 邀请码。
+//
+// invite 为空时自动取码池里的下一个（绝大多数测试用这个）；
+// 要测"无码/错码"的用例显式传值。
+func registerViaHandlerFull(t *testing.T, h *Handler, account, ip, game, password, invite, machineID string) (int, string) {
 	t.Helper()
 	ver := testLauncherVer
 	pwd := testPwdMd5
+
+	if invite == "" {
+		invite = nextTestInvite()
+	}
+
 	req := &models.GatewayRequest{
 		Cmd:             models.Cmd.Register,
 		Account:         &account,
 		PasswordMd5:     &pwd,
 		LauncherVersion: &ver,
+		InviteCode:      &invite,
 	}
 	if machineID != "" {
 		m := machineID
 		req.MachineId = &m
 	}
+	if game != "" {
+		g := game
+		req.Game = &g
+	}
+	if password != "" {
+		p := password
+		req.Password = &p
+	}
+
 	resp, err := h.Handle(req, ip)
 	if err != nil {
 		t.Fatalf("注册请求出错: %v", err)
 	}
-	return codeOf(resp)
+	msg := ""
+	if resp.Message != nil {
+		msg = *resp.Message
+	}
+	return codeOf(resp), msg
 }
 
 // ── A. clientIP 必须真的被用上 ──────────────────────────────────────────

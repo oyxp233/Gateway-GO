@@ -522,6 +522,41 @@
             display: flex; justify-content: space-between; align-items: center;
             margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border);
         }
+        /* ===== 上传进度条（全局，顶部悬浮） =====
+           为什么做成全局而不是每个表单各一条：PVF / 登录器 / DNF.EXE 三个上传入口
+           加上「引导流程」里的步骤 2/4 都走同一个 upload()，全局一条能覆盖全部，
+           也不会出现「某个新加的入口忘了接进度条」。 */
+        .upload-progress-global {
+            position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+            display: none; padding: 10px 18px 12px;
+            background: var(--panel, #1f2430); color: var(--text, #e6e8ee);
+            border-bottom: 1px solid var(--border, #333a48);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, .35);
+            font-size: 13px;
+        }
+        .upload-progress-global.show { display: block; }
+        .upload-progress-meta {
+            display: flex; justify-content: space-between; align-items: baseline;
+            gap: 16px; margin-bottom: 7px;
+        }
+        .upload-progress-label {
+            font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .upload-progress-stats {
+            color: var(--text-muted, #9aa3b2); font-variant-numeric: tabular-nums;
+            white-space: nowrap; flex: 0 0 auto;
+        }
+        .upload-progress-track {
+            height: 7px; border-radius: 4px; overflow: hidden;
+            background: rgba(128, 128, 128, .25);
+        }
+        .upload-progress-fill {
+            height: 100%; width: 0; border-radius: 4px;
+            background: var(--accent, #4f8cff);
+            transition: width .12s linear;
+        }
+        .upload-progress-global.done .upload-progress-fill { background: var(--success, #35c46a); }
+        .upload-progress-global.failed .upload-progress-fill { background: var(--danger, #e05555); }
     </style>
 </head>
 <body>
@@ -2010,17 +2045,144 @@
         }
 
         // 文件上传走 multipart，不能带 Content-Type（由浏览器自动生成 boundary）。
-        async function upload(path, formData) {
-            const resp = await fetch(path, {
-                method: 'POST',
-                headers: { 'X-Auth-Key': authKey },
-                body: formData
+        // ==================== 上传进度条（全局） ====================
+        //
+        // fetch() 拿不到上传进度（需要 streams + duplex，浏览器支持面窄），
+        // 所以上传一律走 XMLHttpRequest：xhr.upload.onprogress 才有 loaded/total。
+        //
+        // 做成**全局一条**而不是每个表单一条：PVF / 登录器 / DNF.EXE 三个入口
+        // 加上「引导流程」的步骤 2/4 都调同一个 upload()，一处改动全覆盖，
+        // 将来新加入口也不会漏。
+        function ensureUploadProgressBar() {
+            let el = document.getElementById('uploadProgressGlobal');
+            if (el) return el;
+            el = document.createElement('div');
+            el.id = 'uploadProgressGlobal';
+            el.className = 'upload-progress-global';
+            el.innerHTML =
+                '<div class="upload-progress-meta">' +
+                '<span class="upload-progress-label" id="uploadProgressLabel"></span>' +
+                '<span class="upload-progress-stats" id="uploadProgressStats"></span>' +
+                '</div>' +
+                '<div class="upload-progress-track">' +
+                '<div class="upload-progress-fill" id="uploadProgressFill"></div>' +
+                '</div>';
+            document.body.appendChild(el);
+            return el;
+        }
+
+        function resetUploadProgress(label) {
+            const bar = ensureUploadProgressBar();
+            bar.classList.remove('done', 'failed');
+            bar.classList.add('show');
+            document.getElementById('uploadProgressLabel').textContent = label;
+            document.getElementById('uploadProgressStats').textContent = '准备中…';
+            document.getElementById('uploadProgressFill').style.width = '0%';
+            return bar;
+        }
+
+        function setUploadProgress(pct, statsText) {
+            document.getElementById('uploadProgressFill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+            document.getElementById('uploadProgressStats').textContent = statsText;
+        }
+
+        function finishUploadProgress(state, label, statsText) {
+            const bar = ensureUploadProgressBar();
+            bar.classList.remove('done', 'failed');
+            bar.classList.add(state === 'ok' ? 'done' : 'failed');
+            if (label) document.getElementById('uploadProgressLabel').textContent = label;
+            if (statsText) document.getElementById('uploadProgressStats').textContent = statsText;
+            // 成功后停 1.2s 再收起来，让用户看到 100% 与服务端处理完成；
+            // 失败停久一点，便于看清原因。
+            setTimeout(() => {
+                bar.classList.remove('show');
+            }, state === 'ok' ? 1200 : 4000);
+        }
+
+        function uploadFileLabel(formData) {
+            try {
+                const f = formData.get('file');
+                if (f && f.name) return f.name;
+            } catch (e) { /* ignore */ }
+            return '文件';
+        }
+
+        // 上传。返回解析后的 JSON；401 弹一次密钥错误；非 2xx / 非 JSON 返回 null
+        //（与改造前的 upload() 语义完全一致，调用方不需要改）。
+        function upload(path, formData) {
+            return new Promise((resolve) => {
+                const name = uploadFileLabel(formData);
+                resetUploadProgress('上传中：' + name);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', path, true);
+                xhr.setRequestHeader('X-Auth-Key', authKey);
+
+                const startedAt = Date.now();
+
+                xhr.upload.onprogress = (e) => {
+                    if (!e.lengthComputable) {
+                        setUploadProgress(0, '已发送 ' + fmtSize(e.loaded));
+                        return;
+                    }
+                    const pct = e.total > 0 ? (e.loaded * 100 / e.total) : 0;
+                    const secs = Math.max(0.001, (Date.now() - startedAt) / 1000);
+                    const speed = e.loaded / secs;
+                    let text = Math.round(pct) + '%　' + fmtSize(e.loaded) + ' / ' + fmtSize(e.total);
+                    if (speed > 0) text += '　' + fmtSize(speed) + '/s';
+                    const remain = speed > 0 ? (e.total - e.loaded) / speed : 0;
+                    if (remain >= 1) text += '　剩余 ' + fmtDuration(remain);
+                    setUploadProgress(pct, text);
+                };
+
+                // 上传字节发完 ≠ 服务端处理完：PVF 要算指纹 + 生成增量（124 MB 可能要十几秒），
+                // 这里明确告诉用户在等什么，避免以为卡死。
+                xhr.upload.onload = () => {
+                    setUploadProgress(100, '上传完成，服务端处理中…');
+                };
+
+                xhr.onload = () => {
+                    if (xhr.status === 401) {
+                        finishUploadProgress('fail', '上传被拒绝', '管理密钥错误或未设置');
+                        showToastOnce('error', '', '管理密钥错误或未设置');
+                        resolve(null);
+                        return;
+                    }
+                    if (xhr.status < 200 || xhr.status >= 300) {
+                        console.warn('[S4A21] 接口 ' + xhr.status + '：' + path);
+                        finishUploadProgress('fail', '上传失败', 'HTTP ' + xhr.status);
+                        resolve(null);
+                        return;
+                    }
+                    let data = null;
+                    try {
+                        data = JSON.parse(xhr.responseText);
+                    } catch (e) {
+                        console.warn('[S4A21] 响应不是 JSON：' + path);
+                    }
+                    if (data && data.ok === false) {
+                        finishUploadProgress('fail', '服务端拒绝', String(data.message || data.error || '失败'));
+                    } else {
+                        finishUploadProgress('ok', '上传完成：' + name, '已发布');
+                    }
+                    resolve(data);
+                };
+
+                xhr.onerror = () => {
+                    finishUploadProgress('fail', '上传失败', '网络错误');
+                    resolve(null);
+                };
+                xhr.onabort = () => {
+                    finishUploadProgress('fail', '上传已取消', '');
+                    resolve(null);
+                };
+                xhr.ontimeout = () => {
+                    finishUploadProgress('fail', '上传超时', '');
+                    resolve(null);
+                };
+
+                xhr.send(formData);
             });
-            if (resp.status === 401) {
-                showToastOnce('error', '', '管理密钥错误或未设置');
-                return null;
-            }
-            return await parseApiBody(resp, path);
         }
 
         // 404/500 时后端返回的是纯文本（如 "404 page not found"），直接 .json()

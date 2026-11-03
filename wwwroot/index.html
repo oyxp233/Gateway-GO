@@ -1813,6 +1813,31 @@
             </div>
 
             <div class="card">
+                <h3>BOSS 乱入配置</h3>
+                <p class="muted">
+                    整份配置以 JSON 原样下发，网关<b>不解释字段</b>。保存后游戏服务端在 10 秒内自动拉取，
+                    只有 revision 变化时才重建装备池 —— <b>不用重启服务端、不用等 PVF 预热</b>。<br>
+                    从未保存过时这里是空的，服务端会保持自己的启动期配置（环境变量文件或内嵌默认），
+                    <b>不会被清空成全关</b>。
+                </p>
+                <div class="row">
+                    <button class="btn" onclick="loadBossIntrusionConfig()">读取当前配置</button>
+                    <button class="btn" onclick="fillBossIntrusionTemplate()">填入默认模板</button>
+                    <span class="muted" id="biRevision"></span>
+                </div>
+                <div class="row">
+                    <textarea id="biConfig" rows="18" spellcheck="false"
+                        style="font-family: Consolas, 'Courier New', monospace; font-size: 12px; line-height: 1.5;"
+                        placeholder="点上面的「读取当前配置」或「填入默认模板」"></textarea>
+                </div>
+                <div class="row">
+                    <button class="btn btn-success" onclick="saveBossIntrusionConfig()">保存并热重载</button>
+                    <span class="muted">保存前会校验：必须是合法 JSON 对象，上限 1 MiB</span>
+                </div>
+                <div id="biMsg"></div>
+            </div>
+
+            <div class="card">
                 <h3>全服弹窗公告</h3>
                 <p class="muted">
                     这是<b>弹窗公告</b>（客户端弹出、需要玩家确认的那种），与上面的滚动公告是两种不同的封包。
@@ -2813,7 +2838,7 @@
             heartbeat: () => loadHeartbeat(),
             registerlimit: () => loadRegisterLimit(),
             invite: () => loadInvites(),
-            announce: () => { loadAnnounceConfig(); loadAnnouncePopups(1); loadAnnounceEvents(1); }
+            announce: () => { loadAnnounceConfig(); loadAnnouncePopups(1); loadAnnounceEvents(1); loadBossIntrusionConfig(); }
         };
 
         document.querySelectorAll('.sidebar-item').forEach(item => {
@@ -5809,6 +5834,77 @@
         }
 
         // 读配置 + 状态概览。三个请求并发，任一失败不影响其他的展示。
+        // ==================== BOSS 乱入配置 ====================
+        //
+        // 网关只负责存和发，**不解释字段**；字段语义在服务端
+        // （Server-S5A3 random_boss_intrusion_config.go）。加字段只改服务端。
+
+        async function loadBossIntrusionConfig() {
+            const data = await api('/api/admin/boss-intrusion/config');
+            if (!data) return;
+            if (!data.ok) {
+                showResult('biMsg', 'error', data.message || data.error || '读取失败');
+                return;
+            }
+            const box = document.getElementById('biConfig');
+            if (data.config) {
+                box.value = JSON.stringify(data.config, null, 2);
+                document.getElementById('biRevision').textContent =
+                    '当前 revision=' + data.revision + '（' + fmtUtcText(data.updated_at) + '）';
+            } else {
+                box.value = '';
+                document.getElementById('biRevision').textContent =
+                    '网关还没有保存过配置（服务端保持启动期那份）';
+            }
+        }
+
+        function fillBossIntrusionTemplate() {
+            document.getElementById('biConfig').value = JSON.stringify({
+                "_说明": [
+                    "开关 / 出现概率(%) / 出现方式(每个地图判定 | 每个地下城最多出现一次)",
+                    "保底掉落装备次数 / 掉落装备概率(%) / 掉落装备次数 / 掉落装备品级(神器 传说 史诗)",
+                    "Boss黑名单 = 怪物 code 列表；装备黑名单 = 装备 item id 列表",
+                    "深渊模式 = true 时深渊局也掷乱入（默认 false，与 A21 原版一致）"
+                ],
+                开关: true,
+                出现概率: 20,
+                出现方式: "每个地下城最多出现一次",
+                保底掉落装备次数: 1,
+                掉落装备概率: 0.7,
+                掉落装备次数: 9,
+                掉落装备品级: { 神器: 50, 传说: 35, 史诗: 15 },
+                Boss黑名单: [],
+                装备黑名单: [],
+                深渊模式: false
+            }, null, 2);
+            document.getElementById('biRevision').textContent = '（模板，尚未保存）';
+        }
+
+        async function saveBossIntrusionConfig() {
+            const raw = document.getElementById('biConfig').value.trim();
+            if (!raw) { showResult('biMsg', 'error', '配置不能为空'); return; }
+            let parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (e) {
+                showResult('biMsg', 'error', '不是合法 JSON：' + e.message);
+                return;
+            }
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                showResult('biMsg', 'error', '配置必须是一个 JSON 对象');
+                return;
+            }
+            const data = await api('/api/admin/boss-intrusion/config', 'POST', parsed);
+            if (!data) return;
+            if (data.ok) {
+                showResult('biMsg', 'success',
+                    '已保存 revision=' + data.revision + '，服务端 10 秒内自动生效');
+                loadBossIntrusionConfig();
+            } else {
+                showResult('biMsg', 'error', data.message || data.error || '保存失败');
+            }
+        }
+
         async function loadAnnounceConfig() {
             fillNoticeStyleSelect('anStyleCleared');
             fillNoticeStyleSelect('anStyleIncomplete');

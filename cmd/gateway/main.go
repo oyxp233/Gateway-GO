@@ -240,6 +240,9 @@ func main() {
 	}, proxyMgr.DefaultPortStore())
 	runtimeBackend := httprouter.NewLocalRuntimeConfigBackend(cfg, settingsEditor, sessionsBackend)
 	announceBackend := httprouter.NewLocalAnnounceBackend(announceSvc)
+	// BOSS 乱入配置（2026-11-03）：纯 DB 读写，没有进程内存快照，
+	// 所以 gateway/admin 各自持一份实例、共用同一个 gateway.db 即可。
+	bossIntrusionSvc := service.NewBossIntrusionConfigService(db, log)
 
 	httpServer := httprouter.NewServer(cfg, log, db, sessionMgr,
 		accountSvc, adminSvc, banSvc, pvfSvc, integritySvc,
@@ -252,6 +255,9 @@ func main() {
 			Runtime:  runtimeBackend,
 			Announce: announceBackend,
 		})
+
+	// BOSS 乱入配置服务（内部 API 下发 + 后台上传），必须在 StartInternal 之前注入。
+	httpServer.SetBossIntrusionConfig(bossIntrusionSvc)
 
 	// 玩家侧（TCP 8000 / HTTP 8080 / 代理 8001+）—— 进程分离后仍然只有这里提供
 	httpServer.StartPublic()

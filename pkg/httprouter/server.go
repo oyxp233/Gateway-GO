@@ -58,6 +58,14 @@ type Server struct {
 	cert        *tls.Certificate
 	portStore   *proxy.PortConfigStore
 
+	// bossIntrusionSvc 是 BOSS 乱入配置（2026-11-03）。
+	//
+	// 走**具体类型 + Setter 注入**而不是 Backends 接口：gateway 和 admin 两个
+	// 进程都直接读写同一个 gateway.db 的 boss_intrusion_config 表，没有
+	// 「内存快照只在网关进程里」的问题（对比 announce 的弹窗队列就必须转发）。
+	// 见 boss_intrusion_handlers.go。
+	bossIntrusionSvc *service.BossIntrusionConfigService
+
 	// plugins 是插件下发目录的扫描器 + sha256 缓存（见 launcher_plugins.go）。
 	//
 	// 纯文件系统，**不依赖网关进程内存**，所以两个进程各持一份、共用同一个目录即可：
@@ -623,6 +631,10 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 
 	// 服务端配置
 
+	// BOSS 乱入配置（2026-11-03）：后台读写，游戏服务端从内部端口轮询。
+	r.HandleFunc("/api/admin/boss-intrusion/config", s.handleAdminBossIntrusionConfigGet).Methods("GET")
+	r.HandleFunc("/api/admin/boss-intrusion/config", s.handleAdminBossIntrusionConfigPost).Methods("POST")
+
 	// 全服公告（配置热重载 / 事件分类查询 / 弹窗公告）
 	r.HandleFunc("/api/admin/announce/config", s.handleAdminAnnounceConfigGet).Methods("GET")
 	r.HandleFunc("/api/admin/announce/config", s.handleAdminAnnounceConfigPost).Methods("POST")
@@ -729,6 +741,10 @@ func (s *Server) registerInternalRoutes(r *mux.Router) {
 	r.HandleFunc("/internal/announce/config", s.checkInternal(s.handleInternalAnnounceConfigGet)).Methods("GET")
 	r.HandleFunc("/internal/announce/config", s.checkInternal(s.handleInternalAnnounceConfigSet)).Methods("POST")
 	r.HandleFunc("/internal/announce/popup", s.checkInternal(s.handleInternalAnnouncePopup)).Methods("POST")
+
+	// BOSS 乱入配置（2026-11-03）：游戏服务端每 10 秒轮询一次，
+	// revision 变了才重建装备池。见 boss_intrusion_handlers.go。
+	r.HandleFunc("/internal/boss-intrusion/config", s.checkInternal(s.handleInternalBossIntrusionConfig)).Methods("GET")
 
 	// 登录器包同步（三服合一，2026-10-24）：主网关做权威，从网关拉取。
 	// 见 launcher_sync.go。

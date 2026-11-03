@@ -448,6 +448,23 @@ func (db *Database) EnsureInitialized() error {
 	-- 该索引统一放到 migrateSchema，紧随 ensureColumn 之后，新旧库都覆盖。
 
 	-- ========================================================================
+	-- BOSS 乱入配置（2026-11-03）
+	--
+	-- 单行表：整份乱入配置（开关/概率/品级权重/Boss黑名单/装备黑名单/深渊模式）
+	-- 以 JSON 原样存一列。网关**不解析字段**，只保证是合法 JSON 对象 ——
+	-- 字段增删由游戏服务端负责，网关跟着演进会把两边版本绑死。
+	--
+	-- revision 每次保存 +1，游戏服务端只在它变化时重建装备池（见
+	-- Server-S5A3 的 random_boss_intrusion_remote.go）。
+	-- ========================================================================
+	CREATE TABLE IF NOT EXISTS boss_intrusion_config (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		config_json TEXT NOT NULL DEFAULT '',
+		revision INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	);
+
+	-- ========================================================================
 	-- 全服公告（2026-09-24）
 	--
 	-- 三张表的分工：

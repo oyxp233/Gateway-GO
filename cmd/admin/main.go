@@ -161,6 +161,10 @@ func main() {
 	// announceSvc 也传 nil：公告配置的快照与弹窗队列都在网关进程，
 	// 本进程通过 Backends.Announce（remote）读写；
 	// 事件列表 / 弹窗历史是纯历史数据，handler 直接读本进程的 db 句柄。
+	// BOSS 乱入配置（2026-11-03）：纯 DB 读写，不走内部 API 转发 ——
+	// 该服务没有内存快照，两个进程直连同一个 gateway.db 就天然一致。
+	bossIntrusionSvc := service.NewBossIntrusionConfigService(db, log)
+
 	server := httprouter.NewServer(cfg, log, db, nil,
 		accountSvc, adminSvc, banSvc, pvfSvc, integritySvc,
 		registerBonusSvc, bonusSvc, deviceSvc, serverMgr, gatewayMgr, settingsEditor,
@@ -176,6 +180,7 @@ func main() {
 
 	// 只起管理端口。玩家链路（8000/8001/20001+/8080）完全不经本进程，
 	// 所以本进程重启/升级对在线玩家是透明的 —— 这就是本次改造的目的。
+	server.SetBossIntrusionConfig(bossIntrusionSvc)
 	server.StartAdmin()
 
 	log.Info(fmt.Sprintf("管理后台进程已启动: HTTP %s:%d（内部 API 依赖 %s）",

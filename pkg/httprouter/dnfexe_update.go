@@ -50,6 +50,14 @@ func (s *Server) handleDnfExeUpdateManifest(w http.ResponseWriter, r *http.Reque
 	}
 	if cur := s.dnfExeUpdate.Current(); cur != nil && cur.Hash != "" {
 		m.Version = cur.Version
+		// ★ 版本号在上传时是**选填**的（ReplaceDnfExe 明确允许留空），但留空会让
+		//   登录器把整个清单当成「无版本信息」静默跳过 —— 后台显示上传成功、
+		//   玩家侧却永远不弹更新，且日志里连一条失败都没有，极难排查。
+		//   所以这里用指纹短码兜底：version 只承担展示与 min_version 比较，
+		//   更新判定永远看 hash，给个假名不会误判。
+		if strings.TrimSpace(m.Version) == "" {
+			m.Version = "build-" + strings.ToUpper(cur.Hash[:12])
+		}
 		m.Hash = cur.Hash
 		m.Size = cur.Size
 		m.StoredUtc = cur.StoredUtc

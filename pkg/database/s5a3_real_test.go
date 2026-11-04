@@ -135,25 +135,55 @@ func TestZZRealS5A3SendMailRoundTrip(t *testing.T) {
 
 	var itemID, itemCount int64
 	var rawEntry []byte
+	// NULL 用 any 接（DSN 带 parseTime=true，非空时会是 time.Time）
+	var attachExpire any
 	if err := db.s5a3DB.QueryRow(
-		"SELECT item_id, item_count, raw_entry FROM "+db.s5a3Table("mail_attachments")+" WHERE character_id = ?",
-		"4").Scan(&itemID, &itemCount, &rawEntry); err != nil {
+		"SELECT item_id, item_count, raw_entry, expire_at FROM "+db.s5a3Table("mail_attachments")+" WHERE character_id = ?",
+		"4").Scan(&itemID, &itemCount, &rawEntry, &attachExpire); err != nil {
 		t.Fatalf("读回附件失败: %v", err)
 	}
-	t.Logf("附件: item_id=%d count=%d raw_entry_len=%d", itemID, itemCount, len(rawEntry))
+	t.Logf("附件: item_id=%d count=%d raw_entry_len=%d expire_at=%v", itemID, itemCount, len(rawEntry), attachExpire)
 	if itemID != 10000001 || itemCount != 3 {
 		t.Fatalf("附件内容不对: id=%d count=%d", itemID, itemCount)
 	}
 
-	var kindValue string
-	if err := db.s5a3DB.QueryRow(
-		"SELECT extra_value FROM "+db.s5a3Table("mail_attachment_extra")+" WHERE character_id = ? AND extra_key = 'item_kind'",
-		"4").Scan(&kindValue); err != nil {
-		t.Fatalf("读回附件属性失败: %v", err)
+	// ★ 附件 expire_at 必须是 NULL。
+	//
+	// 这一列是「附件道具实例的到期时间」，不是「这封邮件多久后过期」
+	// （邮件有效期在 mails.expire_at）。写成 now+expireHours 时，同一件材料
+	// 每发一次就带一个差几秒的到期时间；服务端领取时把它当实例到期时间落进
+	// dnf_inventory_items.expire_at，而合并判据 dnfrepo.CanMergeItemStack 对
+	// 「两边都非零且不相等」直接拒绝合并 ⇒ 背包里被拆成 N 格
+	// （2026-11-04 现场：角色 1 道具 10092947 拆成 7 格）。
+	if attachExpire != nil {
+		t.Fatalf("附件 expire_at 应为 NULL（道具实例到期时间交给服务端按 PVF 投影），实得 %v", attachExpire)
 	}
-	t.Logf("item_kind = %q", kindValue)
-	if kindValue != "3" {
-		t.Fatalf("item_kind 应为 3，实得 %q", kindValue)
+
+	// ★ 不再写 item_kind。
+	//
+	// S5A3 的 item_kind 是运行时 PVF 的**字符串**（stackable / equipment …），
+	// 由服务端领取路径 mergeMailboxItemIdentityExtra 权威补齐。网关能拿到的
+	// item.Kind 是 S4A21 时代的数字常量（默认 3），写进去就是 item_kind="3"，
+	// 而它是 CanMergeItemStack 的身份键之一 ⇒ 网关发的堆栈永远无法与
+	// GM 工具 / 礼盒 / 商城发的同一道具合并（后者是 "stackable"）。
+	var kindRows int
+	if err := db.s5a3DB.QueryRow(
+		"SELECT COUNT(*) FROM "+db.s5a3Table("mail_attachment_extra")+" WHERE character_id = ? AND extra_key = 'item_kind'",
+		"4").Scan(&kindRows); err != nil {
+		t.Fatalf("统计附件属性失败: %v", err)
+	}
+	if kindRows != 0 {
+		t.Fatalf("附件不应写 item_kind（应交给服务端按 PVF 补），实得 %d 行", kindRows)
+	}
+
+	var sourceValue string
+	if err := db.s5a3DB.QueryRow(
+		"SELECT extra_value FROM "+db.s5a3Table("mail_attachment_extra")+" WHERE character_id = ? AND extra_key = 'source'",
+		"4").Scan(&sourceValue); err != nil {
+		t.Fatalf("读回附件来源失败: %v", err)
+	}
+	if sourceValue != s5a3MailSource {
+		t.Fatalf("source 应为 %q，实得 %q", s5a3MailSource, sourceValue)
 	}
 
 	// 清理

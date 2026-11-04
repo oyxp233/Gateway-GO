@@ -710,20 +710,41 @@ func (db *Database) s5a3SendMailWithGold(
 			if count <= 0 {
 				count = 1
 			}
+			// ★★ expire_at 必须留 NULL —— 它是「附件道具实例的到期时间」，
+			//    不是「这封邮件多久后过期」（那个在 mails.expire_at）。
+			//
+			// 踩过的坑（2026-11-04 现场）：这里原来写的是 now+expireHours，
+			//    于是同一件材料每发一次就带一个差几秒的到期时间；服务端领取时把它
+			//    当实例到期时间落进 dnf_inventory_items.expire_at，而合并判据
+			//    dnfrepo.CanMergeItemStack 对「两边都非零且不相等」的到期时间
+			//    直接拒绝合并 ⇒ 同一道具被拆成 N 格。
+			//
+			//    实证（90CN 角色 1，道具 10092947 材料，PVF 无可用期）：
+			//      2:0 expire_at=2026-12-04 07:20:06.494127
+			//      2:1 expire_at=2026-12-04 07:20:11.054626
+			//      2:2 expire_at=2026-12-04 07:20:25.194360 …
+			//      三格 Extra 逐键相同（pvf_path/stackable_type/source 一致），
+			//      唯一差异就是 expire_at ⇒ 判为不同实例，各占一格。
+			//
+			//    GM 工具那条路写的是 sqlTime(attachment.ExpireAt) 的零值 ⇒ NULL，
+			//    所以它不出现这个问题 —— 这是两条路唯一的差异。
+			//
+			//    留 NULL 后服务端走 mailboxAttachmentStack 的既有分支：
+			//    附件没有实例到期时间 ⇒ 用 dnfbridge 按运行时 PVF 投影的
+			//    resolution.ExpireAt（无 [usable period]/[expiration date] 时为零）。
 			if _, err := tx.ExecContext(ctx, attachInsert,
-				charKey, mailKey, index, item.ItemTemplateId, count, expireAt); err != nil {
+				charKey, mailKey, index, item.ItemTemplateId, count, nil); err != nil {
 				return fmt.Errorf("写入 S5A3 邮件附件 %s/%s#%d: %w", charKey, mailKey, index, err)
 			}
-			// item_kind 是服务端判定"装扮/宠物/普通道具"的依据
-			// （mail/body.go 的 mailboxAttachmentIsAvatar 读它），必须落。
-			kind := item.Kind
-			if kind <= 0 {
-				kind = 3
-			}
-			if _, err := tx.ExecContext(ctx, extraInsert,
-				charKey, mailKey, index, "item_kind", strconv.Itoa(kind)); err != nil {
-				return fmt.Errorf("写入 S5A3 附件属性 %s/%s#%d: %w", charKey, mailKey, index, err)
-			}
+			// ★ 不写 item_kind。S5A3 服务端的 item_kind 是运行时 PVF 的**字符串**
+			//   （stackable / equipment / avatar / pet …），由领取路径
+			//   mergeMailboxItemIdentityExtra 用 PVF 权威补齐；而这里能拿到的
+			//   item.Kind 是 S4A21 时代的数字常量（默认 3），写进去就是
+			//   item_kind="3"。它是 CanMergeItemStack 的身份键之一，于是网关发的
+			//   堆栈永远无法与 GM 工具 / 礼盒 / 商城发的同一道具合并
+			//   （后者写的是 item_kind="stackable"）。
+			//   装扮/宠物的容器与行宽判定服务端另有 PVF 依据
+			//   （currentMailboxAvatarResolution / mailbox_equipment_type），不依赖这里。
 			if _, err := tx.ExecContext(ctx, extraInsert,
 				charKey, mailKey, index, "source", s5a3MailSource); err != nil {
 				return fmt.Errorf("写入 S5A3 附件来源 %s/%s#%d: %w", charKey, mailKey, index, err)

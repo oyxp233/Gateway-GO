@@ -48,12 +48,26 @@ mkdir -p "$OUT"
 
 export CGO_ENABLED=0 GOOS GOARCH
 
+# ---- Go 编译器固定 1.26.5 ----
+# 1.27 的 runtime 有死锁 BUG（事件循环永久停摆），网关也有常驻 goroutine，
+# 一律用 1.26.5 编。可用 GO_BIN 覆盖；找不到就回退 PATH 里的 go 并警告。
+GO="${GO_BIN:-}"
+if [ -z "$GO" ]; then
+  for _cand in "/c/Go1.26.5/go/bin/go.exe" "C:/Go1.26.5/go/bin/go.exe"; do
+    if [ -x "$_cand" ]; then GO="$_cand"; break; fi
+  done
+fi
+if [ -z "$GO" ]; then
+  GO="go"
+  echo "!! 警告：未找到 Go 1.26.5，回退到 PATH：$(go version)"
+fi
+
 # -trimpath：去掉本机绝对路径，产物可复现
 # -buildvcs=false：本仓不是标准 git 工作树也能构建
-go build -buildvcs=false -mod=readonly -trimpath -o "$OUT/s5a3-gateway$EXT" ./cmd/gateway
+"$GO" build -buildvcs=false -mod=readonly -trimpath -o "$OUT/s5a3-gateway$EXT" ./cmd/gateway
 echo "  [1/3] s5a3-gateway$EXT"
 
-go build -buildvcs=false -mod=readonly -trimpath -o "$OUT/s5a3-admin$EXT" ./cmd/admin
+"$GO" build -buildvcs=false -mod=readonly -trimpath -o "$OUT/s5a3-admin$EXT" ./cmd/admin
 echo "  [2/3] s5a3-admin$EXT"
 
 # ★ 后台页面：从磁盘读，必须随产物一起交付

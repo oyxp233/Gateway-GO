@@ -5839,6 +5839,42 @@
         // 网关只负责存和发，**不解释字段**；字段语义在服务端
         // （Server-S5A3 random_boss_intrusion_config.go）。加字段只改服务端。
 
+        // 把配置渲染进文本框。
+        //
+        // 为什么不用 JSON.stringify(cfg, null, 2)：两个黑名单加起来 3000+ 条，
+        // 每条占 5 行（{ / id / name / }），整份一万多行，后台文本框里根本没法编辑。
+        // 这里对「元素都是扁平 {id,name} 的数组」改成每条一行，其它字段仍然 2 空格缩进。
+        //
+        // ★ 只影响显示。保存时发回去的仍是文本框内容，网关会按自己的规则归一化
+        //   （见 Gateway-GO pkg/service/boss_intrusion_config.go）。
+        function formatBossIntrusionConfig(cfg) {
+            const isFlatList = (v) => Array.isArray(v) && v.length > 0 && v.every(
+                (x) => x && typeof x === 'object' && !Array.isArray(x) &&
+                       Object.values(x).every((y) => y === null || typeof y !== 'object'));
+            const oneLine = (obj) => '{' + Object.entries(obj)
+                .map(([k, v]) => JSON.stringify(k) + ': ' + JSON.stringify(v))
+                .join(', ') + '}';
+            const lines = ['{'];
+            const keys = Object.keys(cfg);
+            keys.forEach((k, i) => {
+                const v = cfg[k];
+                const tail = i < keys.length - 1 ? ',' : '';
+                const key = JSON.stringify(k);
+                if (isFlatList(v)) {
+                    lines.push('  ' + key + ': [');
+                    v.forEach((item, j) => {
+                        lines.push('    ' + oneLine(item) + (j < v.length - 1 ? ',' : ''));
+                    });
+                    lines.push('  ]' + tail);
+                } else {
+                    const body = JSON.stringify(v, null, 2).split('\n').join('\n  ');
+                    lines.push('  ' + key + ': ' + body + tail);
+                }
+            });
+            lines.push('}');
+            return lines.join('\n');
+        }
+
         async function loadBossIntrusionConfig() {
             const data = await api('/api/admin/boss-intrusion/config');
             if (!data) return;
@@ -5848,7 +5884,7 @@
             }
             const box = document.getElementById('biConfig');
             if (data.config) {
-                box.value = JSON.stringify(data.config, null, 2);
+                box.value = formatBossIntrusionConfig(data.config);
                 document.getElementById('biRevision').textContent =
                     '当前 revision=' + data.revision + '（' + fmtUtcText(data.updated_at) + '）';
             } else {

@@ -1078,6 +1078,47 @@ func parseGameLoginToken(buf []byte) (string, bool) {
 		}
 		return token, true
 	}
+	// 兜底：在首包范围内按前缀找。
+	//
+	// 2026-11-06 加。原来只有上面那条「固定 header 长度 + body[6:38]」的快路径，
+	// 一旦客户端首包的头部长度不在 13/14/16 里、或者令牌不在 body+6，就解析不到，
+	// 归属随即退化成 `[归属=ip-unique]` —— 同一公网 IP 多开时会把连接挂到别人
+	// 会话上（泡点记错人、换号时 closeConns 踢错人）。
+	//
+	// 服务端 `clientLoginTokenFromBody` 本来就有 0..64 的全文扫描兜底，网关没有，
+	// 于是出现「服务端认得出令牌、网关认不出」的偏差（现场：channel 28/192 的
+	// 副连接 10 次 ip-unique，服务端一次都没拒）。这里补齐同一层兜底。
+	//
+	// ★ 仍然要求 de509f65 前缀（normalizeS5A3LoginToken 内部校验）：
+	// 网关拿这个值去**内存会话表**匹配，误命中比不命中更糟（挂错账号），
+	// 所以不学服务端放开前缀。服务端不校验前缀是因为它查库，查不到无副作用。
+	return scanGameLoginToken(buf)
+}
+
+// s5a3LoginTokenScanLimit 是兜底扫描的最大偏移。
+//
+// 实测登录首包 wire 615 字节（header 13 + body 602），1024 足够覆盖任何
+// 合理的 header 差异；超过这个长度说明首包根本不是登录包，继续扫只是白烧 CPU。
+const s5a3LoginTokenScanLimit = 1024
+
+// scanGameLoginToken 在 buf 前 s5a3LoginTokenScanLimit 字节内滑动查找令牌。
+func scanGameLoginToken(buf []byte) (string, bool) {
+	limit := len(buf) - s5a3LoginTokenChars
+	if limit < 0 {
+		return "", false
+	}
+	if limit > s5a3LoginTokenScanLimit {
+		limit = s5a3LoginTokenScanLimit
+	}
+	prefix := []byte(s5a3LoginTokenPrefix)
+	for offset := 0; offset <= limit; offset++ {
+		if !bytes.HasPrefix(buf[offset:], prefix) {
+			continue
+		}
+		if token, ok := normalizeS5A3LoginToken(buf[offset : offset+s5a3LoginTokenChars]); ok {
+			return token, true
+		}
+	}
 	return "", false
 }
 

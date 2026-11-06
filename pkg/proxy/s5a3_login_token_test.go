@@ -62,3 +62,40 @@ func TestParseGameLoginTokenUppercaseFolded(t *testing.T) {
 		t.Fatalf("大写应折成小写，实际 ok=%v got=%q", ok, got)
 	}
 }
+
+// TestParseGameLoginTokenFallsBackToScan 覆盖 2026-11-06 补的兜底扫描。
+//
+// 现场：channel 28/192 的副连接在网关记成 `[归属=ip-unique]`，但服务端能正常
+// 认出令牌（一次都没拒）。原因是网关只认固定 header 长度（13/14/16）+ body[6:38]，
+// 头部长度一变就漏，而服务端有全文扫描兜底。这两个用例分别锁住两种漏法。
+func TestParseGameLoginTokenFallsBackToScan(t *testing.T) {
+	token := "de509f65a1b2c3d4e5f60718293a4b5c"
+
+	t.Run("未知header长度", func(t *testing.T) {
+		// 17 不在快路径的候选里，只能靠兜底扫描命中。
+		buf := buildS5A3FirstPacket(17, token)
+		got, ok := parseGameLoginToken(buf)
+		if !ok || got != token {
+			t.Fatalf("headerSize=17 应靠兜底命中 %q，实际 ok=%v got=%q", token, ok, got)
+		}
+	})
+
+	t.Run("令牌不在body固定偏移", func(t *testing.T) {
+		// body 头部正常但令牌整体后移 14 字节（模拟布局微调）。
+		buf := buildS5A3FirstPacket(13, token)
+		copy(buf[13+6:], make([]byte, 64))
+		copy(buf[13+6+14:], token)
+		got, ok := parseGameLoginToken(buf)
+		if !ok || got != token {
+			t.Fatalf("令牌偏移变化应靠兜底命中 %q，实际 ok=%v got=%q", token, ok, got)
+		}
+	})
+
+	t.Run("兜底仍要求前缀", func(t *testing.T) {
+		// 偏移变化 + 前缀不符 ⇒ 兜底也必须拒绝，避免误归属到别人会话。
+		buf := buildS5A3FirstPacket(17, "aabbccdda1b2c3d4e5f60718293a4b5c")
+		if got, ok := parseGameLoginToken(buf); ok {
+			t.Fatalf("前缀不符不该被兜底命中，实际返回 %q", got)
+		}
+	})
+}

@@ -1767,8 +1767,6 @@
                 <div class="row">
                     <label>单条显示时长(ms)</label>
                     <input type="number" id="anDuration" min="1000" max="60000" step="500" style="width: 100px;">
-                    <label>弹窗 mode</label>
-                    <input type="number" id="anPopupMode" min="0" max="255" style="width: 80px;">
                     <label>事件保留天数</label>
                     <input type="number" id="anRetention" min="0" max="3650" style="width: 90px;">
                     <span class="muted">保留 0 = 不自动清理</span>
@@ -1805,6 +1803,9 @@
                 <div class="row"><label style="width: 90px;">未通关样式</label>
                     <select id="anStyleIncomplete" style="width: 380px;"></select>
                     <span class="muted">留「不指定」时跟随通关样式</span></div>
+                <div class="row"><label style="width: 90px;">弹窗默认样式</label>
+                    <select id="anPopupMode" style="width: 380px;"></select>
+                    <span class="muted">全服弹窗的默认样式；发送时可在下面单条覆盖</span></div>
                 <div class="row">
                     <button class="btn btn-success" onclick="saveAnnounceConfig()">保存并热重载</button>
                     <button class="btn" onclick="loadAnnounceConfig()">放弃修改</button>
@@ -1843,14 +1844,16 @@
                     这是<b>弹窗公告</b>（客户端弹出、需要玩家确认的那种），与上面的滚动公告是两种不同的封包。
                     用于「通知玩家更新下线」「开启活动」这类必须被看见的消息。
                     发出后进入待投递队列，游戏服务端插件在下一次轮询（默认 3 秒内）推送给<b>全部在线玩家</b>。
-                    超过 15 分钟仍未送达的会自动作废（服务端离线时不会积压到第二天才弹）。
+                    超过 15 分钟仍未送达的会自动作废（服务端离线时不会积压到第二天才弹）。<br>
+                    <b>消息样式</b>与上面滚动公告共用同一套 NOTI12 样式；选「不指定」时跟随配置里的
+                    <b>弹窗默认样式</b>，仍为空再兜底通关样式。
                 </p>
                 <div class="row">
                     <textarea id="anPopupText" rows="3" placeholder="例如：服务器将于 22:00 停机维护，请及时下线保存进度。"></textarea>
                 </div>
                 <div class="row">
-                    <label>mode</label>
-                    <input type="number" id="anPopupSendMode" min="0" max="255" value="0" style="width: 80px;">
+                    <label>消息样式</label>
+                    <select id="anPopupSendMode" style="width: 380px;"></select>
                     <button class="btn btn-danger" onclick="sendAnnouncePopup()">发送给全部在线玩家</button>
                     <span class="muted" id="anPopupHint"></span>
                 </div>
@@ -1868,7 +1871,7 @@
                     <button class="btn" onclick="loadAnnouncePopups(1)">查询</button>
                 </div>
                 <table>
-                    <thead><tr><th>#</th><th>内容</th><th>状态</th><th>发起</th><th>创建时间</th><th>投递时间</th><th>操作</th></tr></thead>
+                    <thead><tr><th>#</th><th>内容</th><th>样式</th><th>状态</th><th>发起</th><th>创建时间</th><th>投递时间</th><th>操作</th></tr></thead>
                     <tbody id="anPopupTable"></tbody>
                 </table>
                 <div class="pager">
@@ -5833,6 +5836,56 @@
             el.dataset.filled = '1';
         }
 
+        // ANNOUNCE_STYLE_INDEX 是「样式值 → 完整描述」的索引，弹窗投递记录里当 title 用。
+        const ANNOUNCE_STYLE_INDEX = (() => {
+            const idx = {};
+            ANNOUNCE_NOTICE_STYLES.forEach(group => group.items.forEach(item => {
+                if (item.value !== '') idx[item.value] = item.label;
+            }));
+            return idx;
+        })();
+
+        // fillPopupStyleSelect 给弹窗相关的 <select> 灌入样式选项。
+        //
+        // 与滚动公告的差别只有两点：
+        //   1.「不指定」的说明改成弹窗的兜底链（弹窗默认样式 → 通关样式）；
+        //   2. 剔除样式 0 —— 服务端 announcePopupNoticeType 用 `mode > 0` 判断「是否指定」，
+        //      弹窗的 0 就是未指定（见 S5A3 dungeon_announce_popup.go），
+        //      列出来只会让运营以为选到了「0 · 系统灰白文字」。
+        function fillPopupStyleSelect(id) {
+            const el = document.getElementById(id);
+            if (!el || el.dataset.filled === '1') return;
+            ANNOUNCE_NOTICE_STYLES.forEach(group => {
+                const items = group.items.filter(item => item.value !== '0');
+                if (!items.length) return;
+                const og = document.createElement('optgroup');
+                og.label = group.group;
+                items.forEach(item => {
+                    const opt = document.createElement('option');
+                    opt.value = item.value;
+                    opt.textContent = item.value === ''
+                        ? '不指定（跟随弹窗默认样式 → 通关样式）'
+                        : item.label;
+                    og.appendChild(opt);
+                });
+                el.appendChild(og);
+            });
+            el.dataset.filled = '1';
+        }
+
+        // popupStyleToMode 把下拉值转成服务端认的 mode 整数：空串 = 不指定 = 0。
+        function popupStyleToMode(raw) {
+            const v = parseInt(raw, 10);
+            return Number.isFinite(v) && v > 0 ? v : 0;
+        }
+
+        // announceStyleLabel 把 mode 翻成可读描述（投递记录里显示，便于事后核对）。
+        function announceStyleLabel(mode) {
+            const v = Number(mode) || 0;
+            if (v <= 0) return '跟随默认（弹窗默认样式 → 通关样式）';
+            return ANNOUNCE_STYLE_INDEX[String(v)] || ('样式 ' + v);
+        }
+
         // 读配置 + 状态概览。三个请求并发，任一失败不影响其他的展示。
         // ==================== BOSS 乱入配置 ====================
         //
@@ -5944,6 +5997,8 @@
         async function loadAnnounceConfig() {
             fillNoticeStyleSelect('anStyleCleared');
             fillNoticeStyleSelect('anStyleIncomplete');
+            fillPopupStyleSelect('anPopupMode');
+            fillPopupStyleSelect('anPopupSendMode');
             const data = await api('/api/admin/announce/config');
             if (!data) return;
             if (data.ok === false) {
@@ -5963,7 +6018,7 @@
             document.getElementById('anStats').checked = !!c.pickup_stats;
             document.getElementById('anItemLink').checked = !!c.pickup_item_link;
             document.getElementById('anDuration').value = c.announce_duration_ms || 5000;
-            document.getElementById('anPopupMode').value = c.popup_mode || 0;
+            document.getElementById('anPopupMode').value = c.popup_mode > 0 ? String(c.popup_mode) : '';
             document.getElementById('anRetention').value = c.event_retention_days || 0;
             document.getElementById('anHellName').value = c.hell_difficulty_name || '';
             document.getElementById('anDiffNames').value = (c.difficulty_names || []).join(',');
@@ -5982,8 +6037,8 @@
                 tag.textContent = '公告服务：已停用';
                 tag.className = 'tag tag-off';
             }
-            // 弹窗发送框的 mode 默认跟随配置，但发送时以输入框为准（允许单条覆盖）。
-            document.getElementById('anPopupSendMode').value = c.popup_mode || 0;
+            // 弹窗发送框的样式默认跟随配置，但发送时以选择框为准（允许单条覆盖）。
+            document.getElementById('anPopupSendMode').value = c.popup_mode > 0 ? String(c.popup_mode) : '';
 
             loadAnnounceStats();
         }
@@ -6009,7 +6064,7 @@
                 pickup_stats: document.getElementById('anStats').checked,
                 pickup_item_link: document.getElementById('anItemLink').checked,
                 announce_duration_ms: parseInt(document.getElementById('anDuration').value, 10) || 5000,
-                popup_mode: parseInt(document.getElementById('anPopupMode').value, 10) || 0,
+                popup_mode: popupStyleToMode(document.getElementById('anPopupMode').value),
                 event_retention_days: parseInt(document.getElementById('anRetention').value, 10) || 0,
                 hell_difficulty_name: document.getElementById('anHellName').value.trim(),
                 difficulty_names: document.getElementById('anDiffNames').value
@@ -6033,8 +6088,8 @@
         async function sendAnnouncePopup() {
             const message = document.getElementById('anPopupText').value.trim();
             if (!message) { alert('请先填写弹窗内容'); return; }
-            const mode = parseInt(document.getElementById('anPopupSendMode').value, 10) || 0;
-            if (!confirm(`确认向全部在线玩家推送弹窗公告？\n\n${message}`)) return;
+            const mode = popupStyleToMode(document.getElementById('anPopupSendMode').value);
+            if (!confirm(`确认向全部在线玩家推送弹窗公告？\n\n样式：${announceStyleLabel(mode)}\n\n${message}`)) return;
 
             const data = await api('/api/admin/announce/popup', 'POST', { message: message, mode: mode });
             if (!data) return;
@@ -6062,7 +6117,7 @@
             const tbody = document.getElementById('anPopupTable');
             tbody.innerHTML = '';
             if (data.ok === false) {
-                tbody.innerHTML = `<tr><td colspan="7">${esc(data.error || '查询失败')}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="8">${esc(data.error || '查询失败')}</td></tr>`;
                 return;
             }
 
@@ -6074,6 +6129,7 @@
                 tr.innerHTML =
                     `<td>${p.id}</td>` +
                     `<td>${esc(p.message)}</td>` +
+                    `<td title="${esc(announceStyleLabel(p.mode))}">${p.mode > 0 ? p.mode : '跟随默认'}</td>` +
                     `<td>${esc(announcePopupStatusText(p.status))}</td>` +
                     `<td class="muted">${esc(p.created_by || '-')}</td>` +
                     `<td>${fmtTime(p.created_at)}</td>` +
@@ -6082,7 +6138,7 @@
                 tbody.appendChild(tr);
             });
             if (!tbody.children.length) {
-                tbody.innerHTML = '<tr><td colspan="7" class="muted">没有记录</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" class="muted">没有记录</td></tr>';
             }
             // 撤销按钮：用 addEventListener 而不是内联 onclick，
             // 因为 id 虽是数字，但保持与其它表格一致的做法（避免以后有人把可控字段塞进来）。

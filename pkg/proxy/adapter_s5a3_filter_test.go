@@ -82,9 +82,9 @@ func TestS5A3FilterDropsClosedPortChannels(t *testing.T) {
 	adapter, dst := newS5A3FilterTestAdapter(10010, 10012)
 
 	plain := buildS5A3ChannelPlain([]s5a3TestEntry{
-		{name: "cain-10", port: 10010, ip: "43.142.20.134"},
-		{name: "cain-11", port: 10011, ip: "43.142.20.134"}, // 端口没开 → 应剔除
-		{name: "cain-12", port: 10012, ip: "43.142.20.134"},
+		{name: "cain-10", port: 10010, ip: "203.0.113.100"},
+		{name: "cain-11", port: 10011, ip: "203.0.113.100"}, // 端口没开 → 应剔除
+		{name: "cain-12", port: 10012, ip: "203.0.113.100"},
 	}, 0)
 	frame := wrapS5A3ChannelFrame(t, plain, adapter.rewriter)
 
@@ -160,8 +160,8 @@ func TestS5A3FilterGivesUpWhenNothingLeft(t *testing.T) {
 	adapter, dst := newS5A3FilterTestAdapter() // 一个端口都没开
 
 	plain := buildS5A3ChannelPlain([]s5a3TestEntry{
-		{name: "cain-10", port: 10010, ip: "43.142.20.134"},
-		{name: "cain-11", port: 10011, ip: "43.142.20.134"},
+		{name: "cain-10", port: 10010, ip: "203.0.113.100"},
+		{name: "cain-11", port: 10011, ip: "203.0.113.100"},
 	}, 0)
 	frame := wrapS5A3ChannelFrame(t, plain, adapter.rewriter)
 
@@ -210,7 +210,7 @@ func TestS5A3FilterPassesThroughCorruptBody(t *testing.T) {
 func TestS5A3FilterKeepsResidualFrame(t *testing.T) {
 	adapter, dst := newS5A3FilterTestAdapter(10010)
 	plain := buildS5A3ChannelPlain([]s5a3TestEntry{
-		{name: "cain-10", port: 10010, ip: "43.142.20.134"},
+		{name: "cain-10", port: 10010, ip: "203.0.113.100"},
 	}, 0)
 	frame := wrapS5A3ChannelFrame(t, plain, adapter.rewriter)
 
@@ -237,8 +237,8 @@ func TestS5A3FilterKeepsResidualFrame(t *testing.T) {
 func TestS5A3FilterNoDropIsByteIdentical(t *testing.T) {
 	adapter, dst := newS5A3FilterTestAdapter(10010, 10011)
 	plain := buildS5A3ChannelPlain([]s5a3TestEntry{
-		{name: "cain-10", port: 10010, ip: "43.142.20.134"},
-		{name: "cain-11", port: 10011, ip: "43.142.20.134"},
+		{name: "cain-10", port: 10010, ip: "203.0.113.100"},
+		{name: "cain-11", port: 10011, ip: "203.0.113.100"},
 	}, 0)
 	frame := wrapS5A3ChannelFrame(t, plain, adapter.rewriter)
 

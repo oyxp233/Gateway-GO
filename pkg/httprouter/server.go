@@ -531,6 +531,11 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 
 	// 外挂检测上报（玩家客户端调用）
 	r.HandleFunc("/api/anticheat/report", s.handleAntiCheatReport).Methods("POST")
+
+	// 玩家内辅（上游 PR #71 的服务端接口）转发到账号 API。
+	// 复用 8080 这个 HTTPS 监听：不新开端口、不用新证书。
+	// 见 player_helper_proxy.go。
+	r.HandleFunc(playerHelperProxyPath, s.handlePlayerHelperProxy).Methods("POST")
 }
 
 // registerAdminRoutes 注册管理后台路由。

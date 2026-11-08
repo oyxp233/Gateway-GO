@@ -166,16 +166,16 @@ func NewServer(
 		announceSvc:      announceSvc,
 		httpLimiter: ratelimiter.NewHttpRateLimiter(
 			cfg.RateLimit.Enabled, cfg.RateLimit.HttpRequestsPerMinute),
-		cert:      cert,
-		portStore: portStore,
-		plugins:   newPluginStore(cfg.Launcher.PluginDir),
+		cert:           cert,
+		portStore:      portStore,
+		plugins:        newPluginStore(cfg.Launcher.PluginDir),
 		launcherUpdate: service.NewLauncherUpdateService(cfg, logger),
 		dnfExeUpdate:   service.NewDnfExeUpdateService(cfg, logger),
-		sessions:  b.Sessions,
-		pvf:       b.Pvf,
-		ports:     b.Ports,
-		runtime:   b.Runtime,
-		announce:  b.Announce,
+		sessions:       b.Sessions,
+		pvf:            b.Pvf,
+		ports:          b.Ports,
+		runtime:        b.Runtime,
+		announce:       b.Announce,
 	}
 }
 
@@ -640,6 +640,11 @@ func (s *Server) registerAdminRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/boss-intrusion/config", s.handleAdminBossIntrusionConfigGet).Methods("GET")
 	r.HandleFunc("/api/admin/boss-intrusion/config", s.handleAdminBossIntrusionConfigPost).Methods("POST")
 
+	// 金币寄售回收配置（2026-11-08）：后台读写文件，服务端从内部端口轮询。
+	// 与乱入同一套 revision 机制，只是存储换成 data/gold_consign_buyback.json。
+	r.HandleFunc("/api/admin/gold-consign-buyback/config", s.handleAdminGoldConsignBuybackConfigGet).Methods("GET")
+	r.HandleFunc("/api/admin/gold-consign-buyback/config", s.handleAdminGoldConsignBuybackConfigPost).Methods("POST")
+
 	// 全服公告（配置热重载 / 事件分类查询 / 弹窗公告）
 	r.HandleFunc("/api/admin/announce/config", s.handleAdminAnnounceConfigGet).Methods("GET")
 	r.HandleFunc("/api/admin/announce/config", s.handleAdminAnnounceConfigPost).Methods("POST")
@@ -750,6 +755,10 @@ func (s *Server) registerInternalRoutes(r *mux.Router) {
 	// BOSS 乱入配置（2026-11-03）：游戏服务端每 10 秒轮询一次，
 	// revision 变了才重建装备池。见 boss_intrusion_handlers.go。
 	r.HandleFunc("/internal/boss-intrusion/config", s.checkInternal(s.handleInternalBossIntrusionConfig)).Methods("GET")
+
+	// 金币寄售回收配置（2026-11-08）：服务端每 10 秒轮询，revision 变了才应用。
+	// 见 gold_consign_buyback_handlers.go。
+	r.HandleFunc("/internal/gold-consign-buyback/config", s.checkInternal(s.handleInternalGoldConsignBuybackConfig)).Methods("GET")
 
 	// 登录器包同步（三服合一，2026-10-24）：主网关做权威，从网关拉取。
 	// 见 launcher_sync.go。
@@ -1638,12 +1647,12 @@ func (s *Server) handleAdminPvfHistory(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, map[string]interface{}{
-			"hash":        e.Hash,
-			"size":        e.Size,
-			"name":        e.Name,
-			"filename":    e.Filename,
-			"stored_utc":  e.StoredUtc,
-			"is_current":  strings.EqualFold(e.Hash, currentHash),
+			"hash":       e.Hash,
+			"size":       e.Size,
+			"name":       e.Name,
+			"filename":   e.Filename,
+			"stored_utc": e.StoredUtc,
+			"is_current": strings.EqualFold(e.Hash, currentHash),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2097,13 +2106,13 @@ func (s *Server) handleAdminRuntime(w http.ResponseWriter, r *http.Request) {
 		// 但把原始值也给出，便于排查"为什么按钮不见了"。
 		"s5a3": backend == "s5a3",
 		"capabilities": map[string]interface{}{
-			"delete_account":   backend != "s5a3",
-			"reset_password":   true,
-			"password_plain":   backend == "s5a3", // S5A3 要明文，S4A21 服务端转 MD5
-			"account_sync":     true,
-			"device_binding":   backend != "s5a3", // S5A3 登录器不传 device_secret
-			"game_events":      backend != "s5a3", // S5A3 的活动开关在 GM 工具里
-			"register_limit":   true,
+			"delete_account": backend != "s5a3",
+			"reset_password": true,
+			"password_plain": backend == "s5a3", // S5A3 要明文，S4A21 服务端转 MD5
+			"account_sync":   true,
+			"device_binding": backend != "s5a3", // S5A3 登录器不传 device_secret
+			"game_events":    backend != "s5a3", // S5A3 的活动开关在 GM 工具里
+			"register_limit": true,
 		},
 	})
 }
@@ -3415,8 +3424,8 @@ func (s *Server) handleAdminRegisterLimitGet(w http.ResponseWriter, r *http.Requ
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":            true,
-		"enabled":       rv.Enabled,
+		"ok":             true,
+		"enabled":        rv.Enabled,
 		"per_ip_per_day": rv.PerIPPerDay,
 		"per_machine":    rv.PerMachine,
 		"override_file":  config.OverrideFileName,

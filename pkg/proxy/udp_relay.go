@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"s4a21-gateway/pkg/logger"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,10 +114,10 @@ func NewUDPRelay(serverId, listenHost, backendHost string, ports []int) *UDPRela
 		serverId:   serverId,
 		listenHost: strings.TrimSpace(listenHost),
 		backend:    backendHost,
-		ports:     append([]int(nil), ports...),
-		listeners: make(map[int]*net.UDPConn, len(ports)),
-		sessions:  make(map[int]map[string]*udpRelaySession),
-		stop:      make(chan struct{}),
+		ports:      append([]int(nil), ports...),
+		listeners:  make(map[int]*net.UDPConn, len(ports)),
+		sessions:   make(map[int]map[string]*udpRelaySession),
+		stop:       make(chan struct{}),
 	}
 }
 
@@ -212,7 +215,8 @@ func (r *UDPRelay) serve(port int, conn *net.UDPConn) {
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		if _, err := session.upstream.Write(payload); err != nil {
-			r.dropSession(port, client)
+			r.logSessionError(port, session, "backend_write", err)
+			r.dropSession(port, session)
 		}
 	}
 }
@@ -240,8 +244,8 @@ func (r *UDPRelay) sessionFor(port int, client *net.UDPAddr) *udpRelaySession {
 		r.sessions[port] = byClient
 	}
 	if session, ok := byClient[key]; ok {
-		r.mu.Unlock()
 		session.touch()
+		r.mu.Unlock()
 		return session
 	}
 	r.mu.Unlock()
@@ -265,6 +269,7 @@ func (r *UDPRelay) sessionFor(port int, client *net.UDPAddr) *udpRelaySession {
 	}
 	if existing, ok := r.sessions[port][key]; ok {
 		// 并发首次发包时可能被别人先建好，复用它的 socket。
+		existing.touch()
 		r.mu.Unlock()
 		_ = upstream.Close()
 		return existing
@@ -282,10 +287,14 @@ func (r *UDPRelay) sessionFor(port int, client *net.UDPAddr) *udpRelaySession {
 // pumpBack 把后端回包转回客户端。
 func (r *UDPRelay) pumpBack(port int, session *udpRelaySession) {
 	defer r.wg.Done()
+	// A closed dungeon port can report ICMP/ECONNREFUSED on this connected
+	// socket. Never leave its map entry reusable after the reader has exited.
+	defer r.dropSession(port, session)
 	buf := make([]byte, udpRelayReadBufBytes)
 	for {
 		n, err := session.upstream.Read(buf)
 		if err != nil {
+			r.logSessionError(port, session, "backend_read", err)
 			return
 		}
 		if n <= 0 {
@@ -302,18 +311,26 @@ func (r *UDPRelay) pumpBack(port int, session *udpRelaySession) {
 	}
 }
 
-func (r *UDPRelay) dropSession(port int, client *net.UDPAddr) {
-	key := client.String()
+func (r *UDPRelay) dropSession(port int, session *udpRelaySession) {
+	key := session.client.String()
 	r.mu.Lock()
 	byClient := r.sessions[port]
-	var session *udpRelaySession
-	if byClient != nil {
-		session = byClient[key]
+	// Cleanup can race with a replacement for the same client address. The
+	// old reader/writer owns only its own socket, never the replacement's.
+	if byClient != nil && byClient[key] == session {
 		delete(byClient, key)
 	}
 	r.mu.Unlock()
-	if session != nil {
-		_ = session.upstream.Close()
+	_ = session.upstream.Close()
+}
+
+func (r *UDPRelay) logSessionError(port int, session *udpRelaySession, direction string, err error) {
+	if errors.Is(err, net.ErrClosed) {
+		return
+	}
+	if log := logger.Global(); log != nil {
+		log.Warn(fmt.Sprintf("[UDP] session retired server=%s port=%d client=%s reason=%s error=%v",
+			r.serverId, port, session.client, direction, err))
 	}
 }
 

@@ -102,6 +102,18 @@ func (s *Server) handleInternalGoldConsignBuybackConfig(w http.ResponseWriter, r
 	writeGoldConsignBuybackConfigResponse(w, cfg, false)
 }
 
+// handleInternalGoldConsignBuybackConfigPost 供游戏服务端代 GM 后台写入配置。
+//
+// 为什么不直接让浏览器打 admin 端点：网关的 admin(8443) 只监听 127.0.0.1，
+// GM 前端在公网侧根本连不上。链路是
+//
+//	浏览器 → GMService → PlayerGateway → 游戏服务端 admin API → 这里
+//
+// 所以需要一个用 InternalKey 认证的写入入口，语义与 admin 的 POST 完全一致。
+func (s *Server) handleInternalGoldConsignBuybackConfigPost(w http.ResponseWriter, r *http.Request) {
+	s.saveGoldConsignBuybackConfig(w, r)
+}
+
 // handleAdminGoldConsignBuybackConfigGet 供 GM 后台读当前配置。
 func (s *Server) handleAdminGoldConsignBuybackConfigGet(w http.ResponseWriter, r *http.Request) {
 	goldConsignBuybackConfigMu.Lock()
@@ -115,6 +127,11 @@ func (s *Server) handleAdminGoldConsignBuybackConfigGet(w http.ResponseWriter, r
 // 请求体既接受裸配置对象 `{...}`，也接受包了一层的 `{"config":{...}}`。
 // 只校验「是合法 JSON 对象」——字段语义归服务端，网关不解释。
 func (s *Server) handleAdminGoldConsignBuybackConfigPost(w http.ResponseWriter, r *http.Request) {
+	s.saveGoldConsignBuybackConfig(w, r)
+}
+
+// saveGoldConsignBuybackConfig 是 admin(8443) 与 internal 两个入口共用的写入逻辑。
+func (s *Server) saveGoldConsignBuybackConfig(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, goldConsignBuybackConfigMaxBodyBytes+1))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "message": "读取请求体失败"})

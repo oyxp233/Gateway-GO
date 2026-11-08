@@ -759,6 +759,9 @@ func (s *Server) registerInternalRoutes(r *mux.Router) {
 	// 金币寄售回收配置（2026-11-08）：服务端每 10 秒轮询，revision 变了才应用。
 	// 见 gold_consign_buyback_handlers.go。
 	r.HandleFunc("/internal/gold-consign-buyback/config", s.checkInternal(s.handleInternalGoldConsignBuybackConfig)).Methods("GET")
+	// 代 GM 后台写入：浏览器连不到 admin(8443)，只能经
+	// GMService → PlayerGateway → 游戏服务端 admin API 中转到这里。
+	r.HandleFunc("/internal/gold-consign-buyback/config", s.checkInternal(s.handleInternalGoldConsignBuybackConfigPost)).Methods("POST")
 
 	// 登录器包同步（三服合一，2026-10-24）：主网关做权威，从网关拉取。
 	// 见 launcher_sync.go。

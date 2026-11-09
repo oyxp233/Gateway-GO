@@ -251,8 +251,10 @@ func (s *Server) buildLauncherOnline(game string) (map[string]interface{}, error
 		"count":       len(players), // 在线账号数（= 在线角色数，一个账号同时只跑一个角色）
 		"role_count":  roleTotal,    // 关联到角色的数量；剩下的停在选人界面
 		"server_time": time.Now().UTC().Unix(),
-		// precision 如实说明口径：在线是账号级，角色是按最近活动推定的
-		"precision": "account-session+character.updated_at",
+		// precision 如实说明口径：在线 = 该会话挂着活的游戏频道连接（真的在游戏里），
+		// 角色是按最近活动推定的。别写回 "account-session"——那会让读的人
+		// 以为"有会话"就算在线（2026-11-09 之前正是这个错误口径）。
+		"precision": "ingame-game-connection+character.updated_at",
 		"players":   players,
 	}
 	if game != "" {

@@ -799,6 +799,8 @@ func (s *Server) handleInternalOnline(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
 	}
+	// 只算真的在游戏里的（见 OnlinePlayer.InGame）：只开登录器不算在线。
+	players = filterInGame(players)
 
 	// 维护页只要一个数字，别为它序列化整份在线名单
 	if r.URL.Query().Get("count_only") == "1" {
@@ -1448,6 +1450,8 @@ func (s *Server) handleAdminOnline(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// 只算真的在游戏里的（见 OnlinePlayer.InGame）：只开登录器不算在线。
+	online = filterInGame(online)
 
 	// 角色名 / 等级（2026-11-01）。
 	//
@@ -2074,7 +2078,8 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	// 取不到就整列按"离线"处理 —— 状态列少一个在线标签，总好过整个列表 500。
 	online := make(map[string]struct{})
 	if players, err := s.sessions.List(); err == nil {
-		for _, p := range players {
+		// 只标真的在游戏里的账号：只开登录器不算在线。
+		for _, p := range filterInGame(players) {
 			online[p.Account] = struct{}{}
 		}
 	}

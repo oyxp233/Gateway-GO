@@ -120,9 +120,20 @@ func newLauncherOnlineDB(t *testing.T) *database.Database {
 
 func newLauncherOnlineServer(t *testing.T, players []OnlinePlayer) *Server {
 	t.Helper()
+	// 这些用例考的是分组 / 角色解析，不是"在不在游戏里"；
+	// 一律标成在游戏内，免得被 filterInGame 当成"只开了登录器"滤掉。
+	// 「只开登录器要排除」由 TestBuildLauncherOnlineExcludesLauncherOnlySessions 单独覆盖。
+	inGame := make([]OnlinePlayer, len(players))
+	for i, p := range players {
+		p.InGame = true
+		if p.GameConns == 0 {
+			p.GameConns = 1
+		}
+		inGame[i] = p
+	}
 	return &Server{
 		db:       newLauncherOnlineDB(t),
-		sessions: &fakeSessionBackend{players: players},
+		sessions: &fakeSessionBackend{players: inGame},
 	}
 }
 

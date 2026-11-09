@@ -174,6 +174,9 @@ func (s *Server) buildLauncherOnline(game string) (map[string]interface{}, error
 	if err != nil {
 		return nil, err
 	}
+	// ★ 只算**真的在游戏里**的：会话在登录器登录时就建好了，玩家开着登录器
+	//   但游戏没启动/已退出时也会有一条会话，不过滤就会显示成"在线"。
+	online = filterInGame(online)
 
 	// 单服视图：先按 GameId 过滤。空 GameId 的会话（老登录器/默认服登录）
 	// 只在 game 也为空（或 game 为默认服 Id）时出现 —— 精确匹配空串会让

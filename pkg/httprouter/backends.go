@@ -81,6 +81,14 @@ type OnlinePlayer struct {
 	// GameId 是该会话选服的 Id（2026-10-17 双服）。
 	// 老会话为空串 = 默认服。空串在展示层归入默认服而不是"未知服"。
 	GameId string `json:"game_id"`
+	// InGame 表示该会话当前**挂着活的游戏频道连接**（真的在游戏里）。
+	//
+	// 会话在登录器登录时就建好了，所以"有会话"不等于"在玩游戏"：
+	// 玩家开着登录器没启动游戏、或者游戏已经退出，会话还在且照常心跳。
+	// 所有对外的「在线」展示都应以 InGame 为准（见 filterInGame）。
+	InGame bool `json:"in_game"`
+	// GameConns 是当前游戏频道连接数（多开/多频道时为 >1）。
+	GameConns int `json:"game_conns"`
 }
 
 // SessionBackend 抽象网关内存里的会话表。
@@ -230,9 +238,11 @@ func (b *localSessionBackend) List() ([]OnlinePlayer, error) {
 	}
 
 	now := time.Now().Unix()
+	// 游戏连接数必须在会话管理器持锁时取（连接表是共享 map）。
+	inGame := b.mgr.InGameConnCounts()
 	players := make([]OnlinePlayer, 0, len(sessions))
 	for _, s := range sessions {
-		players = append(players, OnlinePlayer{
+		item := OnlinePlayer{
 			Account:       s.Account,
 			IP:            s.ClientIP,
 			OnlineMinutes: int((now - s.CreatedAt) / 60),
@@ -240,9 +250,29 @@ func (b *localSessionBackend) List() ([]OnlinePlayer, error) {
 			BonusGranted:  s.BonusGranted,
 			Cera:          ceraMap[s.Account],
 			GameId:        s.GameId,
-		})
+		}
+		if conns, ok := inGame[s.Token]; ok {
+			item.InGame = true
+			item.GameConns = conns
+		}
+		players = append(players, item)
 	}
 	return players, nil
+}
+
+// filterInGame 只保留**真正在游戏里**的会话。
+//
+// 所有对外展示的「在线」都必须过这一道：会话是登录器登录时就建的，
+// 只开登录器不启动游戏也会有一条会话（见 OnlinePlayer.InGame 注释）。
+// 返回值是新切片，不改动入参。
+func filterInGame(players []OnlinePlayer) []OnlinePlayer {
+	out := make([]OnlinePlayer, 0, len(players))
+	for _, p := range players {
+		if p.InGame {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (b *localSessionBackend) Kick(account string) (int, error) {
@@ -268,7 +298,8 @@ func (b *localSessionBackend) Count() (int, error) {
 	if b.mgr == nil {
 		return 0, fmt.Errorf("会话管理器未初始化")
 	}
-	return b.mgr.SessionCount(), nil
+	// 对外展示的"在线"= 在游戏里，不含"只开了登录器"的会话。
+	return b.mgr.SessionCountInGame(), nil
 }
 
 type localPvfBackend struct {

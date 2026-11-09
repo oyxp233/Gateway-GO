@@ -452,6 +452,49 @@ func (sm *SessionManager) SessionCount() int {
 	return len(sm.sessions)
 }
 
+// InGameConnCounts 返回 token → 当前挂着的**游戏频道连接数**（锁内快照）。
+//
+// 为什么要它（2026-11-09 现场）：会话是**登录器登录**时就建的，
+// 玩家开着登录器但游戏没启动、甚至游戏已经退出，会话照样在表里且照常心跳，
+// 于是"在线"列表把这些人算成在线。真正的判据是这条会话有没有活着的游戏频道
+// 连接 —— 也就是 `GameProxyConnections`（proxy.go 建立/断开连接时增删）。
+//
+// 连接表是 map，必须在本方法持锁时读长度：GetAllSessions 返回的是值拷贝，
+// 但其中的 map 仍与运行态共享底层，在外面 `len()` 会与增删并发、构成数据竞争。
+func (sm *SessionManager) InGameConnCounts() map[string]int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	out := make(map[string]int, len(sm.sessions))
+	for token, s := range sm.sessions {
+		if s == nil {
+			continue
+		}
+		if n := len(s.GameProxyConnections); n > 0 {
+			out[token] = n
+		}
+	}
+	return out
+}
+
+// SessionCountInGame 返回**真正在游戏里**的会话数（挂着至少一条游戏频道连接）。
+//
+// 与 SessionCount 的区别：后者含"只开了登录器"的会话，只适合做容量/会话管理；
+// 任何对外展示的"在线人数"都应当用这个。
+func (sm *SessionManager) SessionCountInGame() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	n := 0
+	for _, s := range sm.sessions {
+		if s == nil {
+			continue
+		}
+		if len(s.GameProxyConnections) > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // IsIPAllowed 检查 IP 是否在已登录玩家白名单中。
 func (sm *SessionManager) IsIPAllowed(ip string) bool {
 	sm.mu.RLock()

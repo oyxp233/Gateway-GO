@@ -3789,6 +3789,12 @@ type AntiCheatDetection struct {
 	// 老客户端不发时为 0，与「城镇/未知」同义，不区分。
 	RoomNumber int `json:"roomNumber"`
 	MapID      int `json:"mapId"`
+	// 读内存者身份（2026-11-12，规则 MemoryReader）：进程名 / 产品名 / 公司名 / 窗口标题。
+	// 老客户端不发，缺省空串 —— 后台按软件聚合时它们只是"未知"，不影响其它规则。
+	ProcName    string `json:"procName"`
+	ProductName string `json:"productName"`
+	CompanyName string `json:"companyName"`
+	WindowTitle string `json:"windowTitle"`
 }
 
 // handleAntiCheatReport 接收客户端外挂检测上报。
@@ -3865,6 +3871,10 @@ func (s *Server) handleAntiCheatReport(w http.ResponseWriter, r *http.Request) {
 			RoomNumber:     d.RoomNumber,
 			MapID:          d.MapID,
 			PlayerName:     playerName,
+			ProcName:       strings.TrimSpace(d.ProcName),
+			ProductName:    strings.TrimSpace(d.ProductName),
+			CompanyName:    strings.TrimSpace(d.CompanyName),
+			WindowTitle:    strings.TrimSpace(d.WindowTitle),
 		}
 	}
 
@@ -3917,6 +3927,12 @@ type AntiCheatDetectionResponse struct {
 	// RoomNumber / MapID 触发时所在房间号与地图ID。0 = 客户端未提供（老客户端）。
 	RoomNumber int `json:"roomNumber"`
 	MapID      int `json:"mapId"`
+	// 读内存者身份（2026-11-12）：后台按软件聚合 / 分诊用。
+	// ★ 版本信息由软件自己写、可伪造，只作线索；判据是「持有 PROCESS_VM_READ 句柄」。
+	ProcName    string `json:"procName"`
+	ProductName string `json:"productName"`
+	CompanyName string `json:"companyName"`
+	WindowTitle string `json:"windowTitle"`
 }
 
 // toAntiCheatResponses 把库记录转成后台响应体。
@@ -3941,6 +3957,10 @@ func toAntiCheatResponses(detections []database.AntiCheatDetection) []AntiCheatD
 			PlayerName:     d.PlayerName,
 			RoomNumber:     d.RoomNumber,
 			MapID:          d.MapID,
+			ProcName:       d.ProcName,
+			ProductName:    d.ProductName,
+			CompanyName:    d.CompanyName,
+			WindowTitle:    d.WindowTitle,
 		}
 	}
 	return resp

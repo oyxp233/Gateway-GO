@@ -15,7 +15,7 @@ import "s4a21-gateway/pkg/models"
 //
 // caps[] 是清单下发的能力位，与 GateBlock 的字段一一对应：
 //
-//	"policy" / "pvf" / "plugins" / "integrity" / "kernel"
+//	"policy" / "pvf" / "plugins" / "integrity" / "kernel" / "dnfexe"
 //
 // ★ 为什么 caps 优先于协议：评估文档（第三章 3.2）指出原实现的"缺口 B" ——
 //   S5A3 五项全关是写死在协议判定里的，运营即使给 S5A3 开了白名单也打不开。
@@ -51,6 +51,8 @@ func GateSwitchesFor(profile GameServerEntry, found bool) models.GateBlock {
 			Plugins:   false,
 			Integrity: false,
 			Kernel:    false,
+			// DNF95 的客户端主程序是 ARAD.exe，不走 dnfexe 通道（那条通道只认 DNF.exe）。
+			DnfExe: false,
 		}
 	case ProtocolS5A3:
 		return models.GateBlock{}
@@ -82,13 +84,22 @@ func gateBlockFromCaps(caps []string) models.GateBlock {
 			g.Integrity = true
 		case "kernel":
 			g.Kernel = true
+		case "dnfexe":
+			g.DnfExe = true
 		}
 	}
 	return g
 }
 
 // AllGatesOn 是"全门禁"，也是未知/异常情形下的回落值（宁可多拦，不可漏拦）。
-var AllGatesOn = models.GateBlock{Policy: true, Pvf: true, Plugins: true, Integrity: true, Kernel: true}
+var AllGatesOn = models.GateBlock{
+	Policy:    true,
+	Pvf:       true,
+	Plugins:   true,
+	Integrity: true,
+	Kernel:    true,
+	DnfExe:    true,
+}
 
 // DefaultCapsFor 按协议返回默认能力位列表（供服清单下发用）。
 //
@@ -104,7 +115,7 @@ func DefaultCapsFor(protocol string) []string {
 	// 用空 ListCaps 走协议默认分支（nil 会进 caps 分支，语义不同）
 	g := GateSwitchesFor(GameServerEntry{Protocol: protocol, ListCaps: nil}, true)
 
-	caps := make([]string, 0, 5)
+	caps := make([]string, 0, 6)
 	if g.Policy {
 		caps = append(caps, "policy")
 	}
@@ -119,6 +130,9 @@ func DefaultCapsFor(protocol string) []string {
 	}
 	if g.Kernel {
 		caps = append(caps, "kernel")
+	}
+	if g.DnfExe {
+		caps = append(caps, "dnfexe")
 	}
 	return caps
 }

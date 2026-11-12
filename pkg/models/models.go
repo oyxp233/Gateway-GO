@@ -309,6 +309,13 @@ type GateBlock struct {
 	Integrity bool `json:"integrity"`
 	// Kernel 内核 / 易语言环境扫描。
 	Kernel bool `json:"kernel"`
+	// DnfExe 客户端主程序（DNF.exe）哈希门禁（2026-11-12）。
+	//
+	// 与 Integrity 的分工：Integrity 管游戏目录里的 DLL，本项只管 DNF.exe 本体。
+	// 单独一项的理由是**哈希来源不同** —— 主程序的权威哈希在 dnfexe 更新通道
+	// （`/api/dnfexe/update`），换 exe 时那里自动更新；若把 DNF.exe 塞进完整性
+	// 白名单，每次换主程序都要同步改白名单，漏一次就是全员「指纹不一致」。
+	DnfExe bool `json:"dnfexe"`
 }
 
 // RoleInfo 表示游戏角色的简要信息。

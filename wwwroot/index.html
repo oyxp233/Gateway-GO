@@ -1363,7 +1363,7 @@
                 <div style="overflow-x: auto;">
                 <table>
                     <thead><tr>
-                        <th>发生时间</th><th>账号</th><th>角色</th><th>规则</th><th>豁免</th>
+                        <th>发生时间</th><th>账号</th><th>角色</th><th>规则</th><th>软件</th><th>豁免</th>
                         <th>说明</th><th>实际 / 阈值</th><th>副本 / 房间</th><th>客户端IP</th><th>证据</th>
                     </tr></thead>
                     <tbody id="acDetectionTable"></tbody>
@@ -5207,7 +5207,7 @@
             if (next) next.disabled = (to >= total);
 
             if (list.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="10" class="muted">没有符合条件的记录</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="11" class="muted">没有符合条件的记录</td></tr>';
                 return;
             }
             list.forEach(d => {
@@ -5222,6 +5222,7 @@
                     <td>${d.account ? esc(d.account) : '<span class="muted">-</span>'}</td>
                     <td>${d.playerName ? esc(d.playerName) : '<span class="muted">-</span>'}</td>
                     <td>${esc(d.ruleName)}</td>
+                    <td>${acSoftwareCell(d)}</td>
                     <td>${ex}</td>
                     <td>${esc(d.description)}</td>
                     <td style="white-space:nowrap;">${esc(d.actualValue)} / ${esc(d.thresholdValue)}</td>
@@ -5230,6 +5231,29 @@
                     <td style="min-width:240px;">${renderEvidence(d.ruleName, d.evidence)}</td>
                 </tr>`;
             });
+        }
+
+        // 软件列：规则 MemoryReader 会带进程名/产品名/公司名/窗口标题。
+        // ★ 版本信息是软件自己写的、可伪造 —— 这里是分诊线索，不是判据。
+        // 其它规则没这几个字段，一律显示 '-'。
+        function acSoftwareCell(d) {
+            const proc = (d.procName || '').trim();
+            const product = (d.productName || '').trim();
+            const company = (d.companyName || '').trim();
+            const title = (d.windowTitle || '').trim();
+            if (!proc && !product && !company && !title) return '<span class="muted">-</span>';
+
+            const main = product || proc || title;
+            const lines = [];
+            if (proc) lines.push('进程: ' + proc);
+            if (product) lines.push('产品: ' + product);
+            if (company) lines.push('公司: ' + company);
+            if (title) lines.push('窗口: ' + title);
+
+            const sub = (company && company !== main)
+                ? `<div class="muted" style="font-size:11px;">${esc(company)}</div>`
+                : '';
+            return `<span title="${escAttr(lines.join('\n'))}">${esc(main)}</span>${sub}`;
         }
 
         // 副本 / 房间。0 一律当"未提供"显示成 '-'：老客户端不上报这两个字段，

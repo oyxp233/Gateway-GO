@@ -55,14 +55,14 @@ func TestGateSwitchesForProtocol(t *testing.T) {
 			name:  "S4A21 全开",
 			entry: config.GameServerEntry{Id: "s4a21", Protocol: config.ProtocolS4A21},
 			found: true,
-			want:  GateSwitches{Policy: true, Pvf: true, Plugins: true, Integrity: true, Kernel: true},
+			want:  GateSwitches{Policy: true, Pvf: true, Plugins: true, Integrity: true, Kernel: true, DnfExe: true},
 		},
 		{
 			// DNF95 客户端没有登记 PVF、没有受管插件，内核扫描误伤面未评估（设计文档 §5.3 的 v1 口径）。
 			name:  "S5A95 只留策略",
 			entry: config.GameServerEntry{Id: "s5a95", Protocol: config.ProtocolS5A95},
 			found: true,
-			want:  GateSwitches{Policy: true, Pvf: false, Plugins: false, Integrity: false, Kernel: false},
+			want:  GateSwitches{Policy: true, Pvf: false, Plugins: false, Integrity: false, Kernel: false, DnfExe: false},
 		},
 		{
 			// 未知服 → 全开（fail-closed）。未知服本该被登录面 1038 拒掉，
@@ -70,7 +70,7 @@ func TestGateSwitchesForProtocol(t *testing.T) {
 			name:  "未知服回落全开",
 			entry: config.GameServerEntry{},
 			found: false,
-			want:  GateSwitches{Policy: true, Pvf: true, Plugins: true, Integrity: true, Kernel: true},
+			want:  GateSwitches{Policy: true, Pvf: true, Plugins: true, Integrity: true, Kernel: true, DnfExe: true},
 		},
 	}
 

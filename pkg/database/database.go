@@ -436,7 +436,15 @@ func (db *Database) EnsureInitialized() error {
 		map_id INTEGER DEFAULT 0,
 		-- 角色名：插件从 [Identity] playerName 取（登录器渲染，可能为空）；
 		-- 空串表示「该客户端没提供角色」，与老版本客户端字段缺失同义。
-		player_name TEXT DEFAULT ''
+		player_name TEXT DEFAULT '',
+		-- 读内存者身份（2026-11-12，规则 MemoryReader）：
+		-- 让后台能按「哪个软件在读内存」聚合，而不是只能从 evidence 自由文本里 grep。
+		-- ★ 版本信息是软件自己写的、**可伪造**，只作分诊线索，不作判据；
+		--   真判据仍然是「持有 PROCESS_VM_READ 句柄」这个行为本身。
+		proc_name TEXT DEFAULT '',
+		product_name TEXT DEFAULT '',
+		company_name TEXT DEFAULT '',
+		window_title TEXT DEFAULT ''
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_anticheat_rule ON anticheat_detections(rule_name);
@@ -621,6 +629,22 @@ func (db *Database) migrateSchema() error {
 		return err
 	}
 	if err := db.ensureColumn("anticheat_detections", "player_name", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+
+	// anticheat_detections.proc_name / product_name / company_name / window_title：
+	// 「读内存者是谁」（2026-11-12）。老库没有这四列，缺列会让整批上报写失败
+	// （INSERT 列数与表不符），必须在这里补，且 INSERT 语句已同步带上。
+	if err := db.ensureColumn("anticheat_detections", "proc_name", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("anticheat_detections", "product_name", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("anticheat_detections", "company_name", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("anticheat_detections", "window_title", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
 	if _, err := db.gatewayDB.Exec(
@@ -1998,17 +2022,23 @@ type AntiCheatDetection struct {
 	MapID      int
 	// PlayerName 角色名。空串 = 客户端未提供（老客户端，或登录器没渲染该字段）。
 	PlayerName string
+	// 读内存者身份（2026-11-12，规则 MemoryReader）：进程名 / 产品名 / 公司名 / 窗口标题。
+	// 后台据此按软件聚合；★ 版本信息可伪造，只作分诊线索。
+	ProcName    string
+	ProductName string
+	CompanyName string
+	WindowTitle string
 }
 
 // antiCheatInsertSQL 单条 / 批量插入共用，避免两处列名与占位符数量不一致。
 // 列序与建表处 + ensureColumn 的追加顺序一致（查询都是显式列名，不依赖顺序）。
-const antiCheatInsertSQL = "INSERT INTO anticheat_detections (rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at, exempt, dedup_id, room_number, map_id, player_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+const antiCheatInsertSQL = "INSERT INTO anticheat_detections (rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at, exempt, dedup_id, room_number, map_id, player_name, proc_name, product_name, company_name, window_title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
 // InsertAntiCheatDetection 插入外挂检测记录。
 func (db *Database) InsertAntiCheatDetection(d *AntiCheatDetection) error {
 	_, err := db.gatewayDB.Exec(
 		antiCheatInsertSQL,
-		d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt, d.Exempt, d.DedupID, d.RoomNumber, d.MapID, d.PlayerName,
+		d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt, d.Exempt, d.DedupID, d.RoomNumber, d.MapID, d.PlayerName, d.ProcName, d.ProductName, d.CompanyName, d.WindowTitle,
 	)
 	return err
 }
@@ -2024,7 +2054,7 @@ func (db *Database) InsertAntiCheatDetections(detections []AntiCheatDetection) e
 	for _, d := range detections {
 		_, err := tx.Exec(
 			antiCheatInsertSQL,
-			d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt, d.Exempt, d.DedupID, d.RoomNumber, d.MapID, d.PlayerName,
+			d.RuleName, d.Description, d.ActualValue, d.ThresholdValue, d.EventTimestamp, d.Evidence, d.ClientIP, d.Account, d.ReportedAt, d.Exempt, d.DedupID, d.RoomNumber, d.MapID, d.PlayerName, d.ProcName, d.ProductName, d.CompanyName, d.WindowTitle,
 		)
 		if err != nil {
 			return err
@@ -2072,10 +2102,13 @@ func (f AntiCheatFilter) where() (string, []interface{}) {
 		args = append(args, *f.ExemptFilter)
 	}
 	if f.Keyword != "" {
+		// 把 proc_name / product_name 也纳入：后台最常见的问法是
+		// 「有没有人用过 Cheat Engine」—— 直接搜 "cheat" 就能命中，不用翻 evidence 自由文本。
 		clauses = append(clauses,
-			"(account LIKE ? OR player_name LIKE ? OR evidence LIKE ? OR description LIKE ?)")
+			"(account LIKE ? OR player_name LIKE ? OR evidence LIKE ? OR description LIKE ?"+
+				" OR proc_name LIKE ? OR product_name LIKE ?)")
 		kw := "%" + f.Keyword + "%"
-		args = append(args, kw, kw, kw, kw)
+		args = append(args, kw, kw, kw, kw, kw, kw)
 	}
 	if f.Since > 0 {
 		clauses = append(clauses, "reported_at >= ?")
@@ -2092,7 +2125,7 @@ func (f AntiCheatFilter) where() (string, []interface{}) {
 }
 
 // antiCheatSelectCols 明细查询的列清单，三处 SELECT 共用，避免列数与 Scan 错位。
-const antiCheatSelectCols = "id, rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at, exempt, dedup_id, room_number, map_id, player_name"
+const antiCheatSelectCols = "id, rule_name, description, actual_value, threshold_value, event_timestamp, evidence, client_ip, account, reported_at, exempt, dedup_id, room_number, map_id, player_name, proc_name, product_name, company_name, window_title"
 
 // QueryAntiCheatDetections 按条件分页查询检测明细，返回 (记录, 命中总数, 错误)。
 //
@@ -2120,7 +2153,8 @@ func (db *Database) QueryAntiCheatDetections(f AntiCheatFilter, limit, offset in
 		var d AntiCheatDetection
 		if err := rows.Scan(&d.ID, &d.RuleName, &d.Description, &d.ActualValue, &d.ThresholdValue,
 			&d.EventTimestamp, &d.Evidence, &d.ClientIP, &d.Account, &d.ReportedAt, &d.Exempt,
-			&d.DedupID, &d.RoomNumber, &d.MapID, &d.PlayerName); err != nil {
+			&d.DedupID, &d.RoomNumber, &d.MapID, &d.PlayerName,
+			&d.ProcName, &d.ProductName, &d.CompanyName, &d.WindowTitle); err != nil {
 			return nil, 0, err
 		}
 		detections = append(detections, d)

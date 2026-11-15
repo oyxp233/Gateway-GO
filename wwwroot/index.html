@@ -362,6 +362,9 @@
         /* ── 工具类 ── */
         .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
         .row input, .row select { margin-right: 0; }
+        /* 事件记录筛选的勾选框：inline-flex 保证「框 + 文字」不被 flex 换行拆开 */
+        .check-inline { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+        .check-inline input[type="checkbox"] { width: auto; margin: 0; }
         .muted { color: var(--text-muted); font-size: 12px; }
         .dim { color: var(--text-dim); }
         .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #fff; font-weight: 500; }
@@ -1887,6 +1890,8 @@
                     通关 / 未通关 / 装备拾取的流水都落在网关数据库里。拾取记录只统计<b>装备类</b>物品
                     （材料、消耗品没有品级意义，不进榜单）。
                 </p>
+                <!-- 四个文本筛选彼此独立：副本名 / 账号 / 角色名 / 物品名各自查自己的列，
+                     不再用一个「关键词」把三列 OR 在一起（那样输入副本名会把同名物品也带出来）。 -->
                 <div class="row">
                     <label>类型</label>
                     <select id="anEventKind">
@@ -1895,20 +1900,25 @@
                         <option value="incomplete">未通关</option>
                         <option value="pickup">拾取</option>
                     </select>
-                    <input type="text" id="anEventKeyword" placeholder="角色名 / 物品名 / 副本名">
+                    <input type="text" id="anEventDungeon" placeholder="副本名">
                     <input type="text" id="anEventAccount" placeholder="账号(m_id)">
+                    <input type="text" id="anEventCharacter" placeholder="角色名">
+                    <input type="text" id="anEventItem" placeholder="物品名">
                 </div>
                 <div class="row">
-                    <label>最低品级</label>
-                    <select id="anEventMinRarity">
-                        <option value="0">不限</option>
-                        <option value="2">稀有及以上</option>
-                        <option value="3">神器及以上</option>
-                        <option value="4">史诗及以上</option>
-                        <option value="6">仅传说</option>
-                    </select>
-                    <label><input type="checkbox" id="anEventBroadcastOnly"> 只看广播过的</label>
+                    <label>品级</label>
+                    <!-- value 是 PVF rarity 编号：3=神器 4=史诗 5=异界(chronicle) 6=传说 -->
+                    <label class="check-inline"><input type="checkbox" class="anEventRarity" value="3"> 神器</label>
+                    <label class="check-inline"><input type="checkbox" class="anEventRarity" value="4"> 史诗</label>
+                    <label class="check-inline"><input type="checkbox" class="anEventRarity" value="6"> 传说</label>
+                    <label class="check-inline"><input type="checkbox" class="anEventRarity" value="5"> 异界</label>
+                    <span class="muted">全不选 = 不限；多选为「命中其中任一品级」</span>
+                </div>
+                <div class="row">
+                    <label class="check-inline"><input type="checkbox" id="anEventBroadcastOnly"> 只看广播过的</label>
                     <button class="btn" onclick="loadAnnounceEvents(1)">查询</button>
+                    <button class="btn btn-sm" onclick="resetAnnounceEventFilter()">重置</button>
+                    <span class="muted">文本框回车即查；下拉与勾选改动后自动重查。「已播报」= 该拾取确实发出过全服公告。</span>
                 </div>
                 <table>
                     <thead><tr><th>时间</th><th>类型</th><th>角色</th><th>账号</th><th>副本 / 难度</th><th>物品</th><th>品级</th><th>属性</th><th>用时</th></tr></thead>
@@ -5721,12 +5731,13 @@
 
         // ==================== 公告管理 ====================
 
-        // 品级编号与服务端一致：稀有=2、神器=3、史诗=4（5 也按史诗）、传说=6。
-        // 5 必须显示成「史诗」，否则服务端按 5 处理的那批装备在后台会显示成空品级。
+        // 品级编号与 PVF `[rarity weight]` 一致：
+        // 0=普通 1=高级 2=稀有 3=神器 4=史诗 5=异界(chronicle/勇者) 6=传说。
+        // ★ 5 曾经显示成「史诗」，与后台新加的「异界」勾选项对不上（2026-11-15 更正）。
         function announceRarityText(r) {
             switch (r) {
                 case 6: return '传说';
-                case 5: return '史诗';
+                case 5: return '异界';
                 case 4: return '史诗';
                 case 3: return '神器';
                 case 2: return '稀有';
@@ -6187,18 +6198,36 @@
 
         let anEventPage = 1;
 
+        // 四个文本筛选各自下发一个参数，空值就不下发 —— 后端按「非空才加条件」处理，
+        // 所以任意组合都是 AND，不会出现旧版 keyword 那种「副本名把同名物品也捞出来」。
+        function setAnnounceEventQs(qs, key, id) {
+            const el = document.getElementById(id);
+            const v = el ? String(el.value || '').trim() : '';
+            if (v) qs.set(key, v);
+        }
+
+        // 清空全部筛选并立即重查。重置不能只清 UI 不刷新表格，否则列表还停在旧结果上。
+        function resetAnnounceEventFilter() {
+            ['anEventKind', 'anEventDungeon', 'anEventAccount', 'anEventCharacter', 'anEventItem'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.value = '';
+            });
+            document.querySelectorAll('.anEventRarity').forEach(cb => { cb.checked = false; });
+            document.getElementById('anEventBroadcastOnly').checked = false;
+            loadAnnounceEvents(1);
+        }
+
         async function loadAnnounceEvents(page) {
             if (page < 1) page = 1;
             anEventPage = page;
             const qs = new URLSearchParams({ page: String(page), page_size: '50' });
-            const kind = document.getElementById('anEventKind').value;
-            const keyword = document.getElementById('anEventKeyword').value.trim();
-            const account = document.getElementById('anEventAccount').value.trim();
-            const minRarity = document.getElementById('anEventMinRarity').value;
-            if (kind) qs.set('kind', kind);
-            if (keyword) qs.set('keyword', keyword);
-            if (account) qs.set('account', account);
-            if (minRarity && minRarity !== '0') qs.set('min_rarity', minRarity);
+            setAnnounceEventQs(qs, 'kind', 'anEventKind');
+            setAnnounceEventQs(qs, 'dungeon', 'anEventDungeon');
+            setAnnounceEventQs(qs, 'account', 'anEventAccount');
+            setAnnounceEventQs(qs, 'character', 'anEventCharacter');
+            setAnnounceEventQs(qs, 'item', 'anEventItem');
+            const rarities = Array.from(document.querySelectorAll('.anEventRarity:checked')).map(cb => cb.value);
+            if (rarities.length) qs.set('rarities', rarities.join(','));
             if (document.getElementById('anEventBroadcastOnly').checked) qs.set('broadcast_only', '1');
 
             const data = await api('/api/admin/announce/events?' + qs.toString());
@@ -6244,7 +6273,16 @@
         }
 
         document.getElementById('anPopupFilter').addEventListener('change', () => loadAnnouncePopups(1));
+        // ★ 修复「只看广播过的」勾了没反应：旧版只有类型下拉绑了 change，其它筛选
+        // 必须再点一次「查询」。现在下拉 / 勾选一律即时重查；文本框走回车，
+        // 避免每敲一个字就打一次接口（GBK 中文输入法的组字过程也会触发 input）。
         document.getElementById('anEventKind').addEventListener('change', () => loadAnnounceEvents(1));
+        document.querySelectorAll('.anEventRarity, #anEventBroadcastOnly').forEach(el =>
+            el.addEventListener('change', () => loadAnnounceEvents(1)));
+        ['anEventDungeon', 'anEventAccount', 'anEventCharacter', 'anEventItem'].forEach(id =>
+            document.getElementById(id).addEventListener('keydown', e => {
+                if (e.key === 'Enter') loadAnnounceEvents(1);
+            }));
 
         // ==================== 初始化 ====================
 

@@ -274,15 +274,20 @@ func (s *Server) handleAdminAnnounceEvents(w http.ResponseWriter, r *http.Reques
 	}
 
 	q := r.URL.Query()
+	broadcastRaw := strings.TrimSpace(q.Get("broadcast_only"))
 	filter := database.AnnounceEventFilter{
 		Kind:          strings.TrimSpace(q.Get("kind")),
 		Account:       strings.TrimSpace(q.Get("account")),
-		Keyword:       strings.TrimSpace(q.Get("keyword")),
+		CharacterName: strings.TrimSpace(q.Get("character")),
 		DungeonName:   strings.TrimSpace(q.Get("dungeon")),
+		ItemName:      strings.TrimSpace(q.Get("item")),
+		// 旧版三合一关键词 / 最低品级只留兼容，新页面四个框与品级勾选框走独立参数。
+		Keyword:       strings.TrimSpace(q.Get("keyword")),
+		Rarities:      parseAnnounceRarities(q.Get("rarities")),
 		MinRarity:     atoiDefault(q.Get("min_rarity"), 0),
 		From:          int64(atoiDefault(q.Get("from"), 0)),
 		To:            int64(atoiDefault(q.Get("to"), 0)),
-		BroadcastOnly: q.Get("broadcast_only") == "1",
+		BroadcastOnly: broadcastRaw == "1" || strings.EqualFold(broadcastRaw, "true"),
 		Page:          atoiDefault(q.Get("page"), 1),
 		PageSize:      atoiDefault(q.Get("page_size"), 50),
 	}
@@ -477,6 +482,25 @@ func (s *Server) handleLauncherItemRanking(w http.ResponseWriter, r *http.Reques
 		out[rk.Tier] = rk
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// parseAnnounceRarities 解析 rarities=3,4,5,6（后台品级勾选框）。
+//
+// 只接受 database.AnnounceRarityValues 白名单里的四个编号；非法值直接丢弃而不是
+// 整页报错 —— 运营手改 URL / 浏览器插件塞了脏参数时，页面仍要能出结果。
+// 去重是必要的：重复编号会让 IN(...) 多几个占位符，虽不影响结果但会污染慢查询日志。
+func parseAnnounceRarities(raw string) []int {
+	out := []int{}
+	seen := map[int]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || !database.IsValidAnnounceRarity(n) || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
 }
 
 // atoiDefault 解析整数查询参数，失败或为空时返回默认值。

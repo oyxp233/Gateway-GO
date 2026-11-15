@@ -227,6 +227,63 @@ func TestAnnounceEventInsertQueryAndStats(t *testing.T) {
 	}
 }
 
+// TestQueryAnnounceEventsIndependentFilters 四个文本筛选彼此独立 + 品级多选 + 只看广播过。
+//
+// 区分力设计：故意放一条「角色名叫阿波菲斯、物品却叫史诗戒指」的记录。
+// item=阿波菲斯 只能命中真正的魔剑，character=阿波菲斯 只能命中那条角色 ——
+// 旧版三合一 keyword 会把两条都捞出来，正是这次要修的串列问题。
+func TestQueryAnnounceEventsIndependentFilters(t *testing.T) {
+	db := newAnnounceTestDB(t)
+	events := []models.AnnounceEvent{
+		{Kind: models.AnnounceKindPickup, Account: "acc-a", CharacterName: "剑魂甲",
+			DungeonName: "悲鸣洞穴", ItemName: "魔剑·阿波菲斯", ItemRarity: 6, IsEquipment: true, Broadcast: true},
+		{Kind: models.AnnounceKindPickup, Account: "acc-b", CharacterName: "剑魂乙",
+			DungeonName: "悲鸣洞穴", ItemName: "异界手镯", ItemRarity: 5, IsEquipment: true},
+		{Kind: models.AnnounceKindPickup, Account: "acc-a", CharacterName: "阿波菲斯",
+			DungeonName: "幽暗密林", ItemName: "史诗戒指", ItemRarity: 4, IsEquipment: true},
+		{Kind: models.AnnounceKindPickup, Account: "acc-c", CharacterName: "奶妈",
+			DungeonName: "天空之城", ItemName: "神器项链", ItemRarity: 3, IsEquipment: true, Broadcast: true},
+		{Kind: models.AnnounceKindCleared, Account: "acc-a", CharacterName: "剑魂甲", DungeonName: "悲鸣洞穴"},
+	}
+	if n, err := db.InsertAnnounceEvents(events); err != nil || n != len(events) {
+		t.Fatalf("写入失败: n=%d err=%v", n, err)
+	}
+
+	cases := []struct {
+		name   string
+		filter AnnounceEventFilter
+		want   int
+	}{
+		{"账号独立", AnnounceEventFilter{Account: "acc-a"}, 3},
+		{"角色名独立", AnnounceEventFilter{CharacterName: "剑魂"}, 3},
+		{"副本名独立", AnnounceEventFilter{DungeonName: "悲鸣"}, 3},
+		{"物品名独立", AnnounceEventFilter{ItemName: "阿波菲斯"}, 1},
+		{"角色名与物品名不串", AnnounceEventFilter{CharacterName: "阿波菲斯"}, 1},
+		{"四条件组合 AND", AnnounceEventFilter{Account: "acc-a", CharacterName: "剑魂甲", DungeonName: "悲鸣", ItemName: "魔剑"}, 1},
+		{"品级多选 传说+异界", AnnounceEventFilter{Rarities: []int{5, 6}}, 2},
+		{"品级多选 神器+史诗", AnnounceEventFilter{Rarities: []int{3, 4}}, 2},
+		{"品级去重", AnnounceEventFilter{Rarities: []int{6, 6, 6}}, 1},
+		{"只看广播过", AnnounceEventFilter{BroadcastOnly: true}, 2},
+		{"品级+广播组合", AnnounceEventFilter{Rarities: []int{3}, BroadcastOnly: true}, 1},
+		{"旧 min_rarity 兼容", AnnounceEventFilter{MinRarity: 6}, 1},
+		{"旧 keyword 兼容", AnnounceEventFilter{Keyword: "阿波菲斯"}, 2},
+	}
+	for _, tc := range cases {
+		tc.filter.Page, tc.filter.PageSize = 1, 50
+		total, rows, err := db.QueryAnnounceEvents(tc.filter)
+		if err != nil {
+			t.Fatalf("%s: 查询失败: %v", tc.name, err)
+		}
+		if total != tc.want || len(rows) != tc.want {
+			t.Errorf("%s: 期望 %d 条，实得 total=%d rows=%d", tc.name, tc.want, total, len(rows))
+		}
+	}
+
+	if _, _, err := db.QueryAnnounceEvents(AnnounceEventFilter{Rarities: []int{99}}); err == nil {
+		t.Error("非法品级应报错，不能静默变成「不限」返回全表")
+	}
+}
+
 // TestResolveMIdByCharacterID 角色 → m_id 反查；查不到的路径必须是 (\"\", nil) 而不是错误。
 func TestResolveMIdByCharacterID(t *testing.T) {
 	db := newAnnounceTestDB(t)
@@ -358,13 +415,14 @@ func TestAnnouncePopupDeletePending(t *testing.T) {
 func TestBuildAnnounceRankings(t *testing.T) {
 	db := newAnnounceTestDB(t)
 
-	// 品级：3=神器、4/5=史诗、6=传说。塞两条白装(0)与一条材料，验证它们不进任何榜。
+	// 品级：3=神器、4=史诗、5=异界、6=传说。异界(5) 不进三榜（登录器只认三个 tier），
+	// 白装(0) 与材料同样不进任何榜。
 	rows := []models.AnnounceEvent{
 		{Kind: models.AnnounceKindPickup, CharacterName: "msp", ItemID: 1, ItemName: "魔剑", ItemRarity: 6, IsEquipment: true},
 		{Kind: models.AnnounceKindPickup, CharacterName: "msp", ItemID: 1, ItemName: "魔剑", ItemRarity: 6, IsEquipment: true},
 		{Kind: models.AnnounceKindPickup, CharacterName: "pp", ItemID: 2, ItemName: "太刀", ItemRarity: 6, IsEquipment: true},
 		{Kind: models.AnnounceKindPickup, CharacterName: "msp", ItemID: 3, ItemName: "史诗戒指", ItemRarity: 4, IsEquipment: true},
-		{Kind: models.AnnounceKindPickup, CharacterName: "ss", ItemID: 4, ItemName: "史诗腰带", ItemRarity: 5, IsEquipment: true},
+		{Kind: models.AnnounceKindPickup, CharacterName: "ss", ItemID: 4, ItemName: "异界腰带", ItemRarity: 5, IsEquipment: true},
 		{Kind: models.AnnounceKindPickup, CharacterName: "pp", ItemID: 5, ItemName: "神器项链", ItemRarity: 3, IsEquipment: true},
 		{Kind: models.AnnounceKindPickup, CharacterName: "pp", ItemID: 6, ItemName: "白装布甲", ItemRarity: 0, IsEquipment: true},
 		{Kind: models.AnnounceKindPickup, CharacterName: "pp", ItemID: 7, ItemName: "无色小晶块", ItemRarity: 0, IsEquipment: false},
@@ -402,11 +460,11 @@ func TestBuildAnnounceRankings(t *testing.T) {
 	}
 
 	epic := byTier["epic"]
-	if epic.Total != 2 {
-		t.Fatalf("史诗榜 total 应为 2（品级 4 与 5 合并），实得 %d", epic.Total)
+	if epic.Total != 1 {
+		t.Fatalf("史诗榜 total 应为 1（只认品级 4，异界 5 不再并入），实得 %d", epic.Total)
 	}
-	if len(epic.Players) != 2 {
-		t.Fatalf("史诗榜应有 2 个玩家，实得 %+v", epic.Players)
+	if len(epic.Players) != 1 {
+		t.Fatalf("史诗榜应有 1 个玩家，实得 %+v", epic.Players)
 	}
 
 	unique := byTier["unique"]
@@ -419,8 +477,8 @@ func TestBuildAnnounceRankings(t *testing.T) {
 	for _, r := range rankings {
 		sum += r.Total
 	}
-	if sum != 6 {
-		t.Fatalf("三榜合计应为 6 条（不含白装/材料），实得 %d", sum)
+	if sum != 5 {
+		t.Fatalf("三榜合计应为 5 条（不含异界/白装/材料），实得 %d", sum)
 	}
 
 	// since 过滤：把窗口抬到未来 → 全部落空

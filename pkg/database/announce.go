@@ -252,15 +252,42 @@ func (db *Database) InsertAnnounceEvents(events []models.AnnounceEvent) (int, er
 	return inserted, err
 }
 
+// AnnounceRarityValues 是后台「品级」勾选框的合法取值。
+//
+// 编号来自 PVF `[rarity weight]` 的顺序：
+// common=0 / uncommon=1 / rare=2 / unique=3 / epic=4 / chronicle=5 / legendary=6。
+//
+// ★ 5 是「异界（勇者 / chronicle）」，不是史诗。旧版把 5 并进史诗榜、后台也显示成
+// 「史诗」，结果异界装备既没有独立筛选项、又被算进史诗榜（2026-11-15 按运营口径更正）。
+var AnnounceRarityValues = map[int]string{
+	3: "神器",
+	4: "史诗",
+	5: "异界",
+	6: "传说",
+}
+
+// IsValidAnnounceRarity 判断一个品级编号能否用于分类查询。
+func IsValidAnnounceRarity(v int) bool {
+	_, ok := AnnounceRarityValues[v]
+	return ok
+}
+
 // AnnounceEventFilter 是分类查询的过滤条件。
 type AnnounceEventFilter struct {
 	// Kind 为空表示不限；否则必须是 cleared / incomplete / pickup。
 	Kind string
-	// Account / Keyword / DungeonName 均为模糊匹配（空 = 不限）。
-	Account     string
-	Keyword     string
-	DungeonName string
-	// MinRarity ≥2 时才生效（拾取查询用）。
+	// 四个独立筛选，均为模糊匹配（空 = 不限）。互不干扰、可任意组合：
+	// 账号只查 account、角色名只查 character_name、副本名只查 dungeon_name、物品名只查 item_name。
+	Account       string
+	CharacterName string
+	DungeonName   string
+	ItemName      string
+	// Keyword 是旧版「角色名 / 物品名 / 副本名」三合一，只为兼容老链接与老书签保留；
+	// 新版后台四个框各自独立，不再发送这个参数。
+	Keyword string
+	// Rarities 精确品级集合（多选勾选框）。空 = 不限；与 MinRarity 同时给时以 Rarities 为准。
+	Rarities []int
+	// MinRarity 兼容旧版 min_rarity= 的「≥N」口径，≥2 时才生效。
 	MinRarity int
 	// From / To 是 Unix 秒，0 = 不限。
 	From int64
@@ -294,16 +321,43 @@ func (db *Database) QueryAnnounceEvents(f AnnounceEventFilter) (int, []models.An
 		where = append(where, "account LIKE ?")
 		args = append(args, "%"+v+"%")
 	}
-	if v := strings.TrimSpace(f.Keyword); v != "" {
-		where = append(where, "(character_name LIKE ? OR item_name LIKE ? OR dungeon_name LIKE ?)")
-		like := "%" + v + "%"
-		args = append(args, like, like, like)
+	if v := strings.TrimSpace(f.CharacterName); v != "" {
+		where = append(where, "character_name LIKE ?")
+		args = append(args, "%"+v+"%")
 	}
 	if v := strings.TrimSpace(f.DungeonName); v != "" {
 		where = append(where, "dungeon_name LIKE ?")
 		args = append(args, "%"+v+"%")
 	}
-	if f.MinRarity >= 2 {
+	if v := strings.TrimSpace(f.ItemName); v != "" {
+		where = append(where, "item_name LIKE ?")
+		args = append(args, "%"+v+"%")
+	}
+	// 旧版三合一关键词：保留兼容，但与上面四个独立条件是 AND 关系（不是覆盖）。
+	if v := strings.TrimSpace(f.Keyword); v != "" {
+		where = append(where, "(character_name LIKE ? OR item_name LIKE ? OR dungeon_name LIKE ?)")
+		like := "%" + v + "%"
+		args = append(args, like, like, like)
+	}
+	if len(f.Rarities) > 0 {
+		// 品级是精确集合而不是「≥N」：运营要的是「神器+传说」这种任意组合，
+		// 用 min_rarity 会把夹在中间的史诗一起带出来。
+		seen := map[int]bool{}
+		valid := make([]int, 0, len(f.Rarities))
+		for _, r := range f.Rarities {
+			if !IsValidAnnounceRarity(r) {
+				return 0, nil, fmt.Errorf("未知的品级: %d", r)
+			}
+			if !seen[r] {
+				seen[r] = true
+				valid = append(valid, r)
+			}
+		}
+		where = append(where, "item_rarity IN ("+strings.TrimRight(strings.Repeat("?,", len(valid)), ",")+")")
+		for _, r := range valid {
+			args = append(args, r)
+		}
+	} else if f.MinRarity >= 2 {
 		where = append(where, "item_rarity >= ?")
 		args = append(args, f.MinRarity)
 	}
@@ -543,9 +597,12 @@ func (db *Database) DeleteAnnouncePopup(id int64) (bool, error) {
 
 // announceTier 是"一档品级"的定义。
 //
-// 品级编号来自服务端注释实证：稀有=2、神器=3、史诗=4（5 也按史诗处理）、传说=6。
-// 用户口径是"史诗/传说/神器分开为三个榜单"，所以这里就是三个 tier，
-// 而不是"一张榜按品级排序"。
+// 品级编号来自 PVF `[rarity weight]`：稀有=2、神器=3、史诗=4、异界(chronicle)=5、传说=6。
+// 登录器只展示史诗/传说/神器三个榜单，所以这里仍是三个 tier。
+//
+// ★ 2026-11-15：epic 从 {4,5} 收窄成 {4}。5 是异界装备，旧版把它并进史诗榜，
+// 与后台新加的「异界」筛选项口径打架（勾异界查出来的记录却算在史诗榜里）。
+// 异界暂不单独成榜 —— 登录器端目前只认三个 tier，加第四榜要两边一起改。
 type announceTier struct {
 	Tier     string
 	Label    string
@@ -553,7 +610,7 @@ type announceTier struct {
 }
 
 var announceTiers = []announceTier{
-	{Tier: "epic", Label: "史诗", Rarities: []int{4, 5}},
+	{Tier: "epic", Label: "史诗", Rarities: []int{4}},
 	{Tier: "legend", Label: "传说", Rarities: []int{6}},
 	{Tier: "unique", Label: "神器", Rarities: []int{3}},
 }

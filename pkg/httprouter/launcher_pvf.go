@@ -73,5 +73,10 @@ func (s *Server) handleLauncherPvfDelta(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("X-Delta-From", d.FromHash)
 	w.Header().Set("X-Delta-To", d.ToHash)
 	w.Header().Set("X-Delta-To-Size", strconv.FormatInt(d.ToSize, 10))
-	http.ServeFile(w, r, d.Path)
+	tw, release, ok := s.dl.Begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	http.ServeFile(tw, r, d.Path)
 }

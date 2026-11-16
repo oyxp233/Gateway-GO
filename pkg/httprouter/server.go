@@ -85,6 +85,13 @@ type Server struct {
 	// 下一次请求自动感知新版本，不需要跨进程通知。
 	dnfExeUpdate *service.DnfExeUpdateService
 
+	// dl 是下载通道限速（2026-11-16，见 download_throttle.go）。
+	//
+	// 四条下载链路（PVF 增量 / 登录器自更新 / DNF.exe / 插件）共用这一份状态：
+	// 全局总出口 8MB/s、单 IP 2MB/s、并发 8 路。参数走环境变量，改完重启网关生效。
+	// ★ 必须是**同一份**：每次请求新建 limiter 等于没有全局限速。
+	dl *downloadLimiter
+
 	// peerSync 是网关间同步服务，**只在主网关**非 nil（配了 Signing.Peers）。
 	//
 	// 用途：上传/回退登录器版本成功后，主动把新版本推送给从网关，
@@ -171,6 +178,7 @@ func NewServer(
 		plugins:        newPluginStore(cfg.Launcher.PluginDir),
 		launcherUpdate: service.NewLauncherUpdateService(cfg, logger),
 		dnfExeUpdate:   service.NewDnfExeUpdateService(cfg, logger),
+		dl:             newDownloadLimiter(),
 		sessions:       b.Sessions,
 		pvf:            b.Pvf,
 		ports:          b.Ports,

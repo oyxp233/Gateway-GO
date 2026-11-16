@@ -81,7 +81,12 @@ func (s *Server) handleLauncherUpdateExe(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("ETag", `"`+cur.Hash+`"`)
 		w.Header().Set("X-Launcher-Version", cur.Version)
 	}
-	http.ServeFile(w, r, path)
+	tw, release, ok := s.dl.Begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	http.ServeFile(tw, r, path)
 }
 
 // handleLauncherUpdateDelta 按需增量。与 PVF delta 同语义：
@@ -113,7 +118,12 @@ func (s *Server) handleLauncherUpdateDelta(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-Delta-From", d.FromHash)
 	w.Header().Set("X-Delta-To", d.ToHash)
 	w.Header().Set("X-Delta-To-Size", strconv.FormatInt(d.ToSize, 10))
-	http.ServeFile(w, r, d.Path)
+	tw, release, ok := s.dl.Begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	http.ServeFile(tw, r, d.Path)
 }
 
 // handleAdminLauncherVersions 当前版 + 历史表（后台「登录器版本」区）。

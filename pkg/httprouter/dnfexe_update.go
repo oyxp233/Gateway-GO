@@ -82,7 +82,12 @@ func (s *Server) handleDnfExeUpdateExe(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"`+cur.Hash+`"`)
 		w.Header().Set("X-DnfExe-Version", cur.Version)
 	}
-	http.ServeFile(w, r, path)
+	tw, release, ok := s.dl.Begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	http.ServeFile(tw, r, path)
 }
 
 // handleDnfExeUpdateDelta 按需增量。与登录器 delta 同语义：
@@ -112,7 +117,12 @@ func (s *Server) handleDnfExeUpdateDelta(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("X-Delta-From", d.FromHash)
 	w.Header().Set("X-Delta-To", d.ToHash)
 	w.Header().Set("X-Delta-To-Size", strconv.FormatInt(d.ToSize, 10))
-	http.ServeFile(w, r, d.Path)
+	tw, release, ok := s.dl.Begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	http.ServeFile(tw, r, d.Path)
 }
 
 // handleAdminDnfExeVersions 当前版 + 历史表（后台「DNF.EXE 版本」区）。

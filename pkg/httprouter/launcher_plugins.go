@@ -642,5 +642,10 @@ func (s *Server) handleLauncherPluginFile(w http.ResponseWriter, r *http.Request
 	w.Header().Set("ETag", `"`+sum+`"`)
 	// 便于线上对拍"客户端下的到底是哪一份"
 	w.Header().Set("X-Content-SHA256", sum)
-	http.ServeFile(w, r, absPath)
+	tw, release, ok := s.dl.Begin(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+	http.ServeFile(tw, r, absPath)
 }

@@ -61,6 +61,12 @@ func (s *Server) handleDnfExeUpdateManifest(w http.ResponseWriter, r *http.Reque
 		m.Hash = cur.Hash
 		m.Size = cur.Size
 		m.StoredUtc = cur.StoredUtc
+
+		// 全量包外部分发（2026-11-16）：与登录器同构 —— 只换 full_url，
+		// delta_url 留在网关（按需增量现场生成，对象存储里没有现成文件）。
+		if base := strings.TrimSpace(s.config.DnfExe.ExeBaseUrl); base != "" {
+			m.FullURL = strings.TrimRight(base, "/") + "/dnfexe/" + cur.Hash + ".exe"
+		}
 	}
 	writeJSON(w, http.StatusOK, m)
 }

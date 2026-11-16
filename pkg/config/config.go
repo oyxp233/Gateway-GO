@@ -791,6 +791,18 @@ type PvfSection struct {
 	// 按需增量按 from_<HASH>.delta 缓存在同一目录，上传新版时全部作废清除。
 	DeltaDir string `json:"DeltaDir"`
 
+	// BaseUrl 是 PVF **全量包**的外部分发基址（CDN / 对象存储），可留空。
+	//
+	// 非空时 policy 的 pvf 对象会带 full_url = `<base>/pvf/<当前 hash>.pvf`，
+	// 客户端在「本地版本既不等于当前版、又没有可用增量」时下载全量并校验。
+	//
+	// 为什么需要它：PVF 增量只能覆盖「相邻版本」和「history 里还有的版本」，
+	// 玩家落后太多（或历史被清）时，原先只能提示手动更新客户端 —— 有了全量地址
+	// 就能自动修复。126MB 走对象存储不占网关带宽（14Mbps 的机器扛不住）。
+	//
+	// ★ 与 delta 的关系：delta 仍走网关（按需现场生成），只有全量走外部地址。
+	BaseUrl string `json:"BaseUrl"`
+
 	// HistoryDir 是 PVF 历史版本目录（默认 "./pvf_history"）。
 	//
 	// 内容寻址存储：每个出现过的版本一份 <大写SHA-256>.pvf + index.json 元数据
@@ -832,6 +844,20 @@ type LauncherSection struct {
 	// 非空时可用于把插件字节的分发挪到 CDN / 对象存储：**网关只出清单（权威），
 	// 字节从别处来**，服务器出网带宽为零。清单里的 sha256 始终由网关算，改不了。
 	PluginBaseUrl string `json:"PluginBaseUrl"`
+
+	// UpdateBaseUrl 是登录器**全量包**的外部分发基址（CDN / 对象存储），可留空。
+	//
+	// 非空时清单的 full_url = `<base>/launcher/<当前版本 hash>.exe`（绝对 https），
+	// 客户端 ResolveUrl 直接采用；留空则维持 `/api/launcher/update/exe` 走网关。
+	//
+	// 用版本 hash 命名（而不是 current.exe）：内容寻址，换版不与旧对象同名，
+	// 对象存储 / 浏览器 / 中间层都不需要额外的缓存失效逻辑。
+	//
+	// ★★★ **只影响 full_url，delta_url 必须留在网关**：
+	//   按需增量（?from=<本地hash>）是**请求时现场生成**的，对象存储里没有现成
+	//   文件。若把 delta_url 也指向对象存储，客户端带 ?from= 只会拿到一个基线
+	//   不符的包（或 404），校验失败后回退全量 —— 反而更糟。
+	UpdateBaseUrl string `json:"UpdateBaseUrl"`
 
 	// PluginEnabled 是插件下发的总开关。**缺省（nil）视为开。**
 	//
@@ -974,6 +1000,13 @@ type DnfExeSection struct {
 	// 与 Launcher.UpdateKeep=4 不同：DNF.EXE 一版约 20 MB，8 版 ≈ 160 MB，
 	// 覆盖「当前 + 最近七版」—— 比最老历史还老的客户端自动回退全量下载。
 	UpdateKeep int `json:"UpdateKeep"`
+
+	// ExeBaseUrl 是 DNF.exe **全量包**的外部分发基址（CDN / 对象存储），可留空。
+	//
+	// 语义与 Launcher.UpdateBaseUrl 完全一致：非空时清单的 full_url 变成
+	// `<base>/dnfexe/<hash>.exe`（绝对 https）；**delta_url 仍留在网关**
+	// —— 按需增量是请求时现场生成的，对象存储里没有现成文件。
+	ExeBaseUrl string `json:"ExeBaseUrl"`
 
 	// UpdateEnabled 是 DNF.EXE 自更新总开关。**缺省（nil）视为开。**
 	//

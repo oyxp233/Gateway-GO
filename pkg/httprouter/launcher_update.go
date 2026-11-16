@@ -58,6 +58,17 @@ func (s *Server) handleLauncherUpdateManifest(w http.ResponseWriter, r *http.Req
 		m.Hash = cur.Hash
 		m.Size = cur.Size
 		m.StoredUtc = cur.StoredUtc
+
+		// 全量包外部分发（2026-11-16）：配了 UpdateBaseUrl 就把 full_url 换成
+		// 对象存储/CDN 的**绝对地址**，玩家下载不再经过网关（14Mbps 的机器扛不住
+		// 130MB × N 人）。对象名用版本 hash ⇒ 内容寻址，换版不需要缓存失效。
+		//
+		// ★ delta_url 刻意**不换**：按需增量是请求时现场生成的，对象存储里没有
+		//   现成文件；换成外部地址会让客户端带 ?from= 拿到基线不符的包，校验失败
+		//   后回退全量，反而更糟。
+		if base := strings.TrimSpace(s.config.Launcher.UpdateBaseUrl); base != "" {
+			m.FullURL = strings.TrimRight(base, "/") + "/launcher/" + cur.Hash + ".exe"
+		}
 	}
 	writeJSON(w, http.StatusOK, m)
 }

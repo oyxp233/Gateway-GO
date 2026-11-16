@@ -1331,6 +1331,17 @@ func (s *Server) handleLauncherPolicy(w http.ResponseWriter, r *http.Request) {
 			"size": pvfInfo.Size, "modified_utc": pvfUtc,
 		}
 	}
+	// PVF 全量包外部分发（2026-11-16）：配了 Pvf.BaseUrl 就补一个 full_url。
+	//
+	// 客户端只在「本地 PVF 既不等于当前版、又没有可用增量」时才用它：下载 126MB
+	// 全量 → 整文件 SHA-256 校验 → 原子替换。对象名用 hash（内容寻址，换版不撞名）。
+	// ★ 走 COS 是为了不占网关出口带宽（90CN 只有 14Mbps），delta 仍留在网关。
+	if pvfInfo != nil {
+		if base := strings.TrimSpace(s.config.Pvf.BaseUrl); base != "" {
+			pvfObj["full_url"] = strings.TrimRight(base, "/") + "/pvf/" + pvfInfo.Hash + ".pvf"
+		}
+	}
+
 	// PVF 增量更新（2026-09-30）：只有当网关手里有一份「上一版 → 当前版」的增量包，
 	// 且它的 to_hash 就是当前 PVF 时才下发（GetDelta 内部已校）。
 	//

@@ -50,7 +50,9 @@ type BackupFile struct {
 //   - 2026-10-16 起：产物改为分类压缩包 db-/pvf-/logs-<北京时间>.tar.gz。
 //
 // ★ .gz 这一类是**必须**加的：漏了它就正好重演注释里写的那个历史缺陷 ——
-//   备份明明成功、界面却显示"暂无备份"。每加一种产出格式都要回来看这里。
+//
+//	备份明明成功、界面却显示"暂无备份"。每加一种产出格式都要回来看这里。
+//
 // 按修改时间**倒序**（最新备份在前），同秒时用文件名兜底保证顺序稳定。
 func ListBackups(backupDir string) ([]BackupFile, error) {
 	entries, err := os.ReadDir(backupDir)
@@ -344,14 +346,16 @@ func (db *Database) GetCeraMap(names []string) (map[string]int64, error) {
 		return result, nil
 	}
 	if db.GameBackend() == "s5a3" {
-		for _, name := range names {
-			if cera, _, _, ok := db.s5a3GetCurrencyTriple(name); ok {
-				result[name] = cera
-			} else {
-				result[name] = 0
-			}
-		}
-		return result, nil
+		// ★ 审查 H1（2026-11-17）：names 是【账号名】（tianzi），
+		// 而 s5a3GetCurrencyTriple 执行 `WHERE account_id = ?`，要的是 dnf:10043。
+		// 旧代码直接把 name 传进去 → 恒查不到 → 在线列表 cera 全 0。
+		// 这里先把账号名解析成 account_id 再查（与 GetMIdsByNames 的 S5A3 分支同口径）。
+		return getCeraMapS5A3(names,
+			func(name string) (string, error) { return db.S5A3AccountIDByName(name) },
+			func(accountID string) (int64, bool) {
+				cera, _, _, ok := db.s5a3GetCurrencyTriple(accountID)
+				return cera, ok
+			}), nil
 	}
 	if !db.GameConfigured() {
 		return result, nil
@@ -368,6 +372,31 @@ func (db *Database) GetCeraMap(names []string) (map[string]int64, error) {
 		result[name] = cera
 	}
 	return result, nil
+}
+
+// getCeraMapS5A3 是 GetCeraMap 的 S5A3 分支核心逻辑，解析与查询都作为参数注入。
+//
+// ★ 为什么拆出来：S5A3 的余额查的是 MariaDB（dnf_account_metadata），本地测试没有
+// 真实库、也没有 sqlmock。把「账号名→account_id」和「account_id→cera」两步注入后，
+// 就能用一个假实现精确锁住审查 H1 的区分力 —— 传账号名查必得 0、传 account_id 才得钱，
+// 这样旧 bug 一旦回归，单测立刻变红，不必依赖线上真实数据。
+//
+// 解析失败 / 查不到账号 / 查询失败都记 0，不影响整张在线表（fail-soft，与其余后端一致）。
+func getCeraMapS5A3(names []string, resolve func(string) (string, error), getCera func(string) (int64, bool)) map[string]int64 {
+	result := make(map[string]int64)
+	for _, name := range names {
+		accountID, err := resolve(name)
+		if err != nil || strings.TrimSpace(accountID) == "" {
+			result[name] = 0
+			continue
+		}
+		if cera, ok := getCera(accountID); ok {
+			result[name] = cera
+		} else {
+			result[name] = 0
+		}
+	}
+	return result
 }
 
 // GetCeraByMId 通过 MId 获取点券余额（游戏库）。

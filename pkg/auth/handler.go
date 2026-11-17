@@ -178,7 +178,8 @@ func (h *Handler) handleRegister(req *models.GatewayRequest, clientIP string) *m
 // 主网关不需要配这一项（它自己就是权威）。
 //
 // ★ 与 httprouter 的 Web 注册共用同一个判据 —— 两个入口必须都拒绝，
-//   否则玩家可以从 Web 端绕到从网关注册。
+//
+//	否则玩家可以从 Web 端绕到从网关注册。
 func (h *Handler) isSlaveGateway() bool {
 	return h.config != nil && strings.TrimSpace(h.config.Signing.PeerInternalUrl) != ""
 }
@@ -297,7 +298,8 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	// 「踢掉之前的会话并继续」；带 force 的重复登录会踢旧会话（真断开）
 	// 并把在线时长/泡点进度结转到新会话，时长不再因重复登录清零。
 	_, alreadyOnline := h.sessionMgr.FindSessionByAccount(account)
-	if alreadyOnline && !deref(req.ForceLogin, false) {
+	staleReconnect := false
+	if alreadyOnline {
 		// ★ 掉线重连自动放行（2026-10-10）。
 		//
 		// 玩家掉线后重开登录器登录时，旧会话往往还没到心跳超时就被判"已在线"，
@@ -307,15 +309,18 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 		// 仍然走 1023 弹窗，顶号保护不受影响。
 		if stale, ok := h.sessionMgr.FindStaleSessionForReconnect(
 			account, clientIP, deviceSecret, h.config.Heartbeat.StaleForceSeconds); ok {
+			staleReconnect = true
 			h.logger.Warn(fmt.Sprintf(
 				"自动放行掉线重连: 账号=%s IP=%s 旧会话心跳停滞=%ds 旧IP=%s 阈值=%ds",
 				account, clientIP, time.Now().Unix()-stale.LastHeartbeat, stale.ClientIP,
 				h.config.Heartbeat.StaleForceSeconds))
-		} else {
-			h.logger.Warn(fmt.Sprintf("拒绝重复登录: 账号=%s 已在线 IP=%s", account, clientIP))
-			return failureResponse(req.Cmd, models.Err.AccountOnline,
-				"该账号已登录，如需继续将断开之前的会话")
 		}
+	}
+	reject, carryOver := duplicateLoginDecision(alreadyOnline, deref(req.ForceLogin, false), staleReconnect)
+	if reject {
+		h.logger.Warn(fmt.Sprintf("拒绝重复登录: 账号=%s 已在线 IP=%s", account, clientIP))
+		return failureResponse(req.Cmd, models.Err.AccountOnline,
+			"该账号已登录，如需继续将断开之前的会话")
 	}
 
 	// G-13（2026-10-04 审查）：原先写成 `token, _ := ...` 吞掉错误。
@@ -323,7 +328,7 @@ func (h *Handler) handleLogin(req *models.GatewayRequest, clientIP string) *mode
 	// 登录响应 200 但 token 为空，玩家心跳与游戏连接全部鉴权失败，而服务端日志
 	// 却显示"登录成功"，极难定位。这里显式判错并回报服务端错误。
 	// gameId 一并写进会话：在线统计/后台展示按服分流（2026-10-17 双服）。
-	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, gameId, alreadyOnline)
+	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, result.DeviceSecret, gameId, carryOver)
 	if err != nil {
 		h.logger.Error(fmt.Sprintf("创建会话失败: 账号=%s IP=%s: %v", account, clientIP, err))
 		return failureResponse(req.Cmd, models.Err.DatabaseError, "服务器内部错误，请稍后重试")
@@ -378,7 +383,30 @@ func (h *Handler) handleLoginS5A3(req *models.GatewayRequest, clientIP, gameId s
 		return failureResponse(req.Cmd, result.ErrorCode, msg)
 	}
 
-	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, "", gameId, false)
+	// ★ 审查 H2（2026-11-17）：S5A3 路径此前直接 ReplaceAccountSessions(..., false)，
+	// 缺 S4A21 路径那套「1023 / ForceLogin / 掉线重连放行 / carryOver」判定 ——
+	// 异地二次登录静默踢掉第一个玩家、无「账号已在线」提示，且在线时长/泡点清零。
+	// 这里补齐，与 S4A21 共用同一判定（duplicateLoginDecision），保证三服行为一致。
+	_, alreadyOnline := h.sessionMgr.FindSessionByAccount(account)
+	staleReconnect := false
+	if alreadyOnline {
+		if stale, ok := h.sessionMgr.FindStaleSessionForReconnect(
+			account, clientIP, "", h.config.Heartbeat.StaleForceSeconds); ok {
+			staleReconnect = true
+			h.logger.Warn(fmt.Sprintf(
+				"S5A3 自动放行掉线重连: 账号=%s IP=%s 旧会话心跳停滞=%ds 旧IP=%s 阈值=%ds",
+				account, clientIP, time.Now().Unix()-stale.LastHeartbeat, stale.ClientIP,
+				h.config.Heartbeat.StaleForceSeconds))
+		}
+	}
+	reject, carryOver := duplicateLoginDecision(alreadyOnline, deref(req.ForceLogin, false), staleReconnect)
+	if reject {
+		h.logger.Warn(fmt.Sprintf("S5A3 拒绝重复登录: 账号=%s 已在线 IP=%s", account, clientIP))
+		return failureResponse(req.Cmd, models.Err.AccountOnline,
+			"该账号已登录，如需继续将断开之前的会话")
+	}
+
+	token, err := h.sessionMgr.ReplaceAccountSessions(account, result.MId, clientIP, "", gameId, carryOver)
 	if err != nil {
 		h.logger.Error(fmt.Sprintf("S5A3 登录创建会话失败: 账号=%s IP=%s: %v", account, clientIP, err))
 		return failureResponse(req.Cmd, models.Err.DatabaseError, "服务器内部错误，请稍后重试")
@@ -411,6 +439,34 @@ func (h *Handler) handleLoginS5A3(req *models.GatewayRequest, clientIP, gameId s
 	resp.LaunchArgs = strPtr(result.LaunchArgs)
 	resp.Gates = h.gatesFor(gameId)
 	return resp
+}
+
+// duplicateLoginDecision 给出「账号已在线时这次登录该怎么办」的统一判定。
+//
+// ★ 为什么抽出来（审查 H2，2026-11-17）：
+// 原 S4A21 路径有完整的 1023 / ForceLogin / 掉线重连放行 / carryOver 逻辑，
+// 但 S5A3 路径直接 ReplaceAccountSessions(..., false) —— 异地二次登录静默踢号、
+// 在线时长与泡点清零。两条路径必须共用同一判定，否则三服行为再次漂移。
+//
+// 参数：
+//   - alreadyOnline：FindSessionByAccount 的结果（该账号当前是否已有会话）
+//   - forceLogin：请求里的 force_login（登录器弹窗确认后带上来）
+//   - staleReconnect：同端 + 心跳停滞，判定为掉线重连（免弹窗自动放行）
+//
+// 返回：
+//   - reject=true  → 回 1023，让登录器弹「是否断开之前的会话」
+//   - carryOver    → 传给 ReplaceAccountSessions：已在线（被顶/重连）时结转
+//     在线时长与泡点，避免重复登录清零。
+func duplicateLoginDecision(alreadyOnline, forceLogin, staleReconnect bool) (reject bool, carryOver bool) {
+	if !alreadyOnline {
+		return false, false
+	}
+	// 已在线：带 force 或判定为同端掉线重连才放行，否则弹窗确认。
+	if !forceLogin && !staleReconnect {
+		return true, true
+	}
+	// 无论是 force 顶号还是掉线重连，旧会话的在线事实都要结转。
+	return false, true
 }
 
 // gatesFor 返回本服该跑哪几道门禁（随登录响应下发）。

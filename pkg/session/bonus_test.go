@@ -183,7 +183,11 @@ func TestCollectBonusAwardsStopsAfterCleanExpiredSessions(t *testing.T) {
 		t.Fatalf("在游戏内应发 1 次，实际 %+v", got)
 	}
 
-	// 心跳停在中途 → 超时清理把会话摘掉（连接也一并断开）
+	// 心跳停在中途 → 超时清理把会话摘掉（连接也一并断开）。
+	// ★ 2026-11-17：先撤掉游戏连接 —— 有活跃游戏连接的会话=玩家还在游戏里，
+	//   不再被心跳超时清理（见 ingame_presence_test.go）。这里要测的是
+	//   "会话被清后泡点停发"，所以模拟玩家已退出游戏、只留频道连接。
+	sm.removeGameProxyConnectionAt(sess, client, now)
 	sess.LastHeartbeat = now - 3600
 	if n := sm.CleanExpiredSessions(60); n != 1 {
 		t.Fatalf("应清理 1 个会话，实际 %d", n)

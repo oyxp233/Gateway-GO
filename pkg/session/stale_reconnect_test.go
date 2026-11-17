@@ -130,8 +130,10 @@ func TestCleanExpiredSessionsWithDetailsReportsStaleness(t *testing.T) {
 	ageSession(gone, 300)
 	alive := newSessionWith(t, sm, "still_here", "5.6.7.8", "s2")
 
-	gameSide, _ := pipePair(t)
-	sm.AddGameProxyConnection(gone, gameSide)
+	// ★ 2026-11-17：有活跃游戏连接的会话不再被清（那是玩家还在游戏里）。
+	//   明细测试改用频道连接，仍验证"超时会话带连接时被清、明细记录在线状态"。
+	channelSide, _ := pipePair(t)
+	sm.AddProxyConnection(gone, channelSide)
 
 	n, details := sm.CleanExpiredSessionsWithDetails(60)
 	if n != 1 || len(details) != 1 {
@@ -144,8 +146,8 @@ func TestCleanExpiredSessionsWithDetailsReportsStaleness(t *testing.T) {
 	if d.StaleSecs < 300 {
 		t.Fatalf("心跳停滞秒数偏小: %d", d.StaleSecs)
 	}
-	if d.GameConns != 1 {
-		t.Fatalf("应记到 1 条游戏连接（说明玩家当时在游戏内），实际 %d", d.GameConns)
+	if d.ProxyConns != 1 {
+		t.Fatalf("应记到 1 条频道连接（说明玩家当时还挂在频道里），实际 %d", d.ProxyConns)
 	}
 	if d.ClientIP != "1.2.3.4" {
 		t.Fatalf("明细 IP 不对: %s", d.ClientIP)

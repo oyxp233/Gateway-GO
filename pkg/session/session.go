@@ -756,6 +756,13 @@ func (sm *SessionManager) addGameProxyConnectionAt(session *models.Session, conn
 	if first {
 		session.BonusTickAt = now
 	}
+	// ★ 建连即刷新心跳（2026-11-17 90CN 挂机批量掉线根治）。
+	//   会话的 LastHeartbeat 原本只由登录器 HTTP 心跳更新；但游戏代理连接
+	//   是按 S5A3Token 精确挂到会话上的，建连本身就是玩家在线的权威证据。
+	//   不刷新会让"刚建连的会话"沿用远超 60s 的旧心跳，被下一轮巡检当成
+	//   僵尸清掉并强关这条刚建立的游戏连接（现场：fh480512 09:56:44 建连、
+	//   09:57:30 被按"心跳停滞 80s"清理）。
+	session.LastHeartbeat = now
 }
 
 // RemoveGameProxyConnection 从会话移除 Game 代理连接。
@@ -973,6 +980,21 @@ func (sm *SessionManager) CleanExpiredSessionsWithDetails(timeoutSeconds int) (i
 	var details []ExpiredSessionInfo
 	for token, s := range sm.sessions {
 		if s.LastHeartbeat < cutoff {
+			// ★ 有活跃游戏连接 = 玩家还在游戏频道里，绝不能清理
+			//   （2026-11-17 90CN 挂机批量掉线根治）。
+			//
+			//   LastHeartbeat 只由登录器 HTTP 心跳更新，玩家把登录器关掉或
+			//   休眠、只留游戏客户端挂着时它会停；但游戏连接还在 = 人在游戏里。
+			//   旧逻辑在这里把会话连同连接一起强关，现场明细写着
+			//   "心跳停滞=76s 游戏连接=1" —— 正是这种误杀。
+			//
+			//   判据与泡点计费口径统一：GameProxyConnections>0 就是"在游戏内"。
+			//   兜底：代理层 copyWithTimeout 有 idleTimeout（默认 1800s），
+			//   僵死连接会自行超时断开并走 RemoveGameProxyConnection；届时
+			//   连接数归零，下一个巡检 tick 就会按心跳超时正常清理，不会泄漏。
+			if len(s.GameProxyConnections) > 0 {
+				continue
+			}
 			toRemove = append(toRemove, token)
 			removed = append(removed, s)
 			details = append(details, ExpiredSessionInfo{

@@ -89,22 +89,27 @@ func TestCleanExpiredSessionsClosesProxyConn(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
 	expired := newTestSession(t, sm, "crashed_guy")
-	staleSide, stalePeer := pipePair(t)
+	staleSide, _ := pipePair(t)
 	sm.AddGameProxyConnection(expired, staleSide)
 
 	fresh := newTestSession(t, sm, "still_alive")
 	freshSide, freshPeer := pipePair(t)
 	sm.AddGameProxyConnection(fresh, freshSide)
 
-	// 把 expired 的心跳时间推到一个小时前（CleanExpiredSessions 的判据是 time.Now()）
+	// 把 expired 的心跳时间推到一个小时前（CleanExpiredSessions 的判据是 time.Now()）。
+	// ★ 2026-11-17：先撤掉它的游戏连接 —— 有游戏连接=玩家还在游戏里，不该被清。
+	//   本测试要锁的是"会话被清时连接必须一起关"，所以挂一条频道连接来当被强关的对象。
+	sm.RemoveGameProxyConnection(expired, staleSide)
+	channelSide, channelPeer := pipePair(t)
+	sm.AddProxyConnection(expired, channelSide)
 	expired.LastHeartbeat = time.Now().Unix() - 3600
 
 	if got := sm.CleanExpiredSessions(60); got != 1 {
 		t.Fatalf("应清理 1 个过期会话，实际 %d 个", got)
 	}
 
-	if !isPeerClosed(t, stalePeer) {
-		t.Fatalf("过期会话的游戏连接未被关闭（代理 goroutine 要等 1800s 才回收）")
+	if !isPeerClosed(t, channelPeer) {
+		t.Fatalf("过期会话的频道连接未被关闭（代理 goroutine 要等 1800s 才回收）")
 	}
 	if isPeerClosed(t, freshPeer) {
 		t.Fatalf("未过期的会话被判过期并断连 —— 误伤在线玩家")

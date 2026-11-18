@@ -374,7 +374,7 @@ func (h *Handler) handleLoginS5A3(req *models.GatewayRequest, clientIP, gameId s
 			"该服要求登录器上报明文密码，请使用支持 S5A3 的登录器版本")
 	}
 
-	result := h.accountSvc.LoginS5A3(account, password, gameId, clientIP)
+	result := h.accountSvc.LoginS5A3(account, password, gameId, clientIP, deref(req.DiagnosticCorrelationID, ""))
 	if result.ErrorCode != models.Err.Ok {
 		msg := errorMessages[result.ErrorCode]
 		if result.Message != nil && *result.Message != "" {
@@ -438,6 +438,11 @@ func (h *Handler) handleLoginS5A3(req *models.GatewayRequest, clientIP, gameId s
 	resp.MId = strPtr(result.MId)
 	resp.LaunchArgs = strPtr(result.LaunchArgs)
 	resp.Gates = h.gatesFor(gameId)
+	// 增强诊断授权（仅 S5A3、仅玩家开启诊断时存在）。
+	// 网关不解析，原样转发；空 map 不序列化（omitempty）。
+	if len(result.Diagnostics) > 0 {
+		resp.Diagnostics = result.Diagnostics
+	}
 	return resp
 }
 

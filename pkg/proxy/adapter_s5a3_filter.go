@@ -52,7 +52,15 @@ import (
 
 const (
 	// s5a3ChannelInfoMsgID 是 CHANNELINFO 的 opcode 字节（帧头 [1]）。
-	// dnfenum.LegacyMsgChannelInfo = 28434 = 0x6F12，低字节 0x12。
+	// dnfenum.LegacyMsgChannelInfo = 28434 = 0x6F12，**下行只取低字节 0x12** ——
+	// 依据 Server-S5A3 `protocol.writeLegacyHeader`：header[1] = byte(msg)。
+	//
+	// ★ 2026-11-18 复核：下行帧就是 **11 字节头**（不是 13）。
+	//   [0]=class(0x7c)  [1]=msgID(byte)  [2:6]=总长(LE32)  [6:10]=0  [10]=1  body@11
+	//   无 checksum。两条独立证据：① `BuildLegacyChannelPacket` → `LegacyChannelHeaderSize=11`
+	//   ② 真实抓包夹具 `testdata/s5a3_real_channelinfo.bin`：LE32@2 == 文件长度 3403，
+	//      且 body[11:13] 就是 zlib 头 78 9c。
+	//   （13 字节头那条是**上行**通道包 ParseChannelPacket 的口径，别混用。）
 	s5a3ChannelInfoMsgID = 0x12
 
 	// s5a3ChannelPrefixSize 是 S5A3 频道列表明文前缀长度：
@@ -136,11 +144,16 @@ func (a *S5A3ChannelAdapter) writeFilteredFrame(frame []byte, view *portView, ds
 	plaintext, key, ok := a.rewriter.decryptAnyS5A3(body)
 	if !ok {
 		// 解密或结构校验失败：原样转发（服务端改了编码/密钥时自动降级）
+		// ★ 必须留痕：这个分支一旦命中，端口改写就不生效，客户端会拿到后端口，
+		//   现场表现是"选频道连不上、每 3 秒重连"——没有这条日志就完全看不出来。
+		a.warn(fmt.Sprintf(
+			"[S5A3 频道列表] 解密/结构校验失败（body=%d 字节），已原样透传 —— 端口改写本次未生效",
+			len(body)))
 		_, _ = dst.Write(frame)
 		return
 	}
 
-	filtered, kept, dropped := filterS5A3ChannelList(plaintext, view)
+	filtered, kept, dropped, rewritten := filterS5A3ChannelList(plaintext, view)
 	if dropped > 0 && kept == 0 {
 		// 安全阀：一条都没命中 ⇒ 端口表与频道表口径对不上。
 		// 此时过滤会让客户端看到空列表，比"看到进不去的频道"更糟。
@@ -150,8 +163,13 @@ func (a *S5A3ChannelAdapter) writeFilteredFrame(frame []byte, view *portView, ds
 		_, _ = dst.Write(frame)
 		return
 	}
-	if dropped == 0 {
-		// 没有需要剔除的条目：一个字节都不改
+	// ★ 2026-11-18 BUG 修复：这里原先是 `if dropped == 0 { 原样转发 }`。
+	//   端口映射场景（20006→10006）下所有端口都开着 ⇒ dropped==0，
+	//   但 **条目里的端口必须改写**，否则改写结果被这一行丢掉，
+	//   客户端拿到的仍是后端口 100xx（安全组不放行）⇒ 选频道连不上、每 3 秒重连。
+	//   判据改成"没过滤且没改写"才原样透传。
+	if dropped == 0 && !rewritten {
+		// 没有需要剔除的条目、也没有端口需要改写：一个字节都不改
 		_, _ = dst.Write(frame)
 		return
 	}
@@ -162,6 +180,9 @@ func (a *S5A3ChannelAdapter) writeFilteredFrame(frame []byte, view *portView, ds
 		return
 	}
 
+	// 重建 11 字节 legacy 头：只需要回填总长（[2:6]，含头）。
+	// legacy 频道包**没有校验和**（服务端 writeLegacyHeader 只写 cmd/msgID/len + 固定保留位），
+	// 所以这里不能凭空写 CRC —— 会把保留位写脏。
 	header := make([]byte, channelFrameHeaderSize)
 	copy(header, frame[:channelFrameHeaderSize])
 	binary.LittleEndian.PutUint32(header[channelFrameLenOffset:], uint32(channelFrameHeaderSize+len(encrypted)))
@@ -169,7 +190,11 @@ func (a *S5A3ChannelAdapter) writeFilteredFrame(frame []byte, view *portView, ds
 	_, _ = dst.Write(header)
 	_, _ = dst.Write(encrypted)
 
-	a.info(fmt.Sprintf("[S5A3 频道列表] 已隐藏 %d 个已关闭端口的频道，保留 %d 个", dropped, kept))
+	if dropped > 0 {
+		a.info(fmt.Sprintf("[S5A3 频道列表] 已隐藏 %d 个已关闭端口的频道，保留 %d 个", dropped, kept))
+	} else {
+		a.info(fmt.Sprintf("[S5A3 频道列表] 已按端口表改写 %d 个频道的对外端口（保留 %d 个）", kept, kept))
+	}
 }
 
 func (a *S5A3ChannelAdapter) warn(msg string) {
@@ -252,40 +277,52 @@ func validS5A3ChannelEntry(plain []byte, index int) bool {
 // 一条 Enabled=true 的映射才算可进。端口被停用/删除/从未纳管时网关不为它
 // 开监听，客户端连上去必然失败，因此直接从列表移除。
 //
-// **不改写 IP 与端口**：S5A3 的条目 IP 来自服务端 DNFBRIDGE_SERVER_IP，
-// 已是玩家可达的公网地址；端口是 1:1 映射，改它反而会错。
+// **默认不改写 IP 与端口**：S5A3 的条目 IP 来自服务端 DNFBRIDGE_SERVER_IP，
+// 已是玩家可达的公网地址；端口默认是 1:1 映射，改它反而会错。
 //
-// 返回 (过滤后明文, 保留数, 剔除数)。dropped==0 时返回原切片（调用方据此跳过重加密）。
-func filterS5A3ChannelList(plain []byte, view *portView) ([]byte, int, int) {
+// 2026-11-18：新增**可选端口改写**——当端口表里 public != backend 时
+// （运维要把后端 10006 对外映射成 20006），把条目端口改写成 public。
+// 这是给「安全组只放行了 20000-20299，不想再开 100xx」的场景用的。
+// public == backend 时行为与改动前**逐字节相同**（仍返回原 plain，不重加密）。
+//
+// 返回 (过滤后明文, 保留数, 剔除数)。dropped==0 且无端口改写时返回原切片（调用方据此跳过重加密）。
+func filterS5A3ChannelList(plain []byte, view *portView) ([]byte, int, int, bool) {
 	if len(plain) < s5a3ChannelPrefixSize {
-		return plain, 0, 0
+		return plain, 0, 0, false
 	}
 	count := int(binary.LittleEndian.Uint32(plain[s5a3ChannelCountOffset:s5a3ChannelPrefixSize]))
 	if count <= 0 {
-		return plain, 0, 0
+		return plain, 0, 0, false
 	}
 
 	keep := make([]bool, count)
+	publicPorts := make([]int, count)
 	kept := 0
+	rewritten := false
 	for i := 0; i < count; i++ {
 		off := s5a3ChannelPrefixSize + i*s5a3ChannelEntrySize
 		if off+s5a3ChannelEntrySize > len(plain) {
 			break
 		}
 		port := int(binary.LittleEndian.Uint32(plain[off+s5a3ChannelPortOffset : off+s5a3ChannelPortOffset+4]))
-		if _, ok := view.publicFor(port); !ok {
+		public, ok := view.publicFor(port)
+		if !ok {
 			continue
 		}
 		keep[i] = true
+		publicPorts[i] = public
+		if public != port {
+			rewritten = true
+		}
 		kept++
 	}
 
 	dropped := count - kept
-	if dropped == 0 {
-		return plain, kept, 0
+	if dropped == 0 && !rewritten {
+		return plain, kept, 0, false
 	}
 	if kept == 0 {
-		return plain, 0, dropped
+		return plain, 0, dropped, false
 	}
 
 	out := make([]byte, s5a3ChannelPrefixSize+kept*s5a3ChannelEntrySize)
@@ -300,7 +337,13 @@ func filterS5A3ChannelList(plain []byte, view *portView) ([]byte, int, int) {
 		}
 		src := s5a3ChannelPrefixSize + i*s5a3ChannelEntrySize
 		copy(out[dst:dst+s5a3ChannelEntrySize], plain[src:src+s5a3ChannelEntrySize])
+		// 端口改写：仅当端口表里 public != backend（20006:10006 这种映射）。
+		// public == backend 时这行写入原值，与改动前逐字节等价。
+		binary.LittleEndian.PutUint32(
+			out[dst+s5a3ChannelPortOffset:dst+s5a3ChannelPortOffset+4],
+			uint32(publicPorts[i]),
+		)
 		dst += s5a3ChannelEntrySize
 	}
-	return out, kept, dropped
+	return out, kept, dropped, rewritten
 }

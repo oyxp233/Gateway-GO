@@ -202,6 +202,13 @@ type GatewayRequest struct {
 	Password        *string `json:"password,omitempty"`
 	OldPwdMd5       *string `json:"old_pwd_md5,omitempty"`
 	NewPwdMd5       *string `json:"new_pwd_md5,omitempty"`
+
+	// DiagnosticCorrelationID 是登录器增强诊断的关联编号（32 位小写 hex）。
+	//
+	// 只在玩家**同意开启增强诊断**时下发（2026-11-18）。网关原样转给 S5A3 账号 API，
+	// 由服务端签发一个只读 read_token 并与本次游戏令牌在内存中绑定。
+	// 关闭诊断时不发送；老网关忽略它、老服务端忽略它，登录都不受影响。
+	DiagnosticCorrelationID *string `json:"diagnosticCorrelationId,omitempty"`
 	// OldPassword / NewPassword 是**明文**，只有 S5A3 服的改密用（2026-10-29）。
 	//
 	// 为什么 S5A3 需要明文：服务端登录时用
@@ -295,6 +302,16 @@ type GatewayResponse struct {
 	//
 	// 缺省（字段不出现）= 老网关，登录器按"全开"处理（fail-closed）。
 	Gates *GateBlock `json:"gates,omitempty"`
+
+	// Diagnostics 是增强诊断的只读授权（2026-11-18，仅 S5A3 服会带）。
+	//
+	// 由 S5A3 账号 API 在登录时签发，与本次游戏令牌在服务端内存中绑定；
+	// 网关**不解析、不存储**，原样透传给登录器。字段形如
+	// {"version":1,"correlation_id":"…","read_token":"…","expires_utc":"…"}。
+	//
+	// 关闭诊断的登录器不发 correlation id ⇒ 上游不签发 ⇒ 这里恒为空。
+	// 老登录器收到未知字段直接忽略，行为不变。
+	Diagnostics map[string]interface{} `json:"diagnostics,omitempty"`
 }
 
 // GateBlock 是登录响应里的门禁开关（与 /api/launcher/policy 的 gates 段同形）。
@@ -653,6 +670,10 @@ type LoginResult struct {
 	DeviceSecret  string
 	DeviceChanged bool
 	LaunchArgs    string
+
+	// Diagnostics 是 S5A3 登录时签发的增强诊断只读授权（未开启诊断时为空）。
+	// 网关不解析内容，只在登录响应里原样透传给登录器。
+	Diagnostics map[string]interface{}
 }
 
 // Session 表示一个在线会话。

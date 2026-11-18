@@ -65,7 +65,7 @@ func TestS5A3AccountForwardsClientIP(t *testing.T) {
 	}
 
 	gotXFF = ""
-	if _, code, msg := client.login(context.Background(), "player1", "pw", "198.51.100.9"); code != 0 {
+	if _, code, msg := client.login(context.Background(), "player1", "pw", "198.51.100.9", ""); code != 0 {
 		t.Fatalf("login 失败: code=%d msg=%s", code, msg)
 	}
 	if gotXFF != "198.51.100.9" {

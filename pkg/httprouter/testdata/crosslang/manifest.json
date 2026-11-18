@@ -45,6 +45,6 @@
   "servers_json": "[{\"auth_port\":8000,\"caps\":[\"policy\",\"pvf\",\"plugins\",\"integrity\",\"kernel\",\"dnfexe\"],\"host\":\"1.1.1.1\",\"http_port\":8080,\"id\":\"s4a21\",\"min_launcher_version\":\"2.5.0\",\"name\":\"A21 正式服\",\"protocol\":\"s4a21\",\"tls\":false},{\"auth_port\":8000,\"caps\":[],\"host\":\"2.2.2.2\",\"http_port\":8080,\"id\":\"s5a3\",\"name\":\"90CN\",\"protocol\":\"s5a3\",\"tls\":false},{\"auth_port\":8000,\"caps\":[\"policy\",\"integrity\"],\"host\":\"3.3.3.3\",\"http_port\":8080,\"id\":\"s5a95\",\"name\":\"DNF95\",\"protocol\":\"s5a95\",\"tls\":false}]",
   "signature": "a634b180b79598cdd14ba320fcd6873a1f47f9a0658fc62d16f36d03059f3da2ab6ba59b0e5447abb9b68bd43715b476b327de042d9be78bf4170a3c96404c01",
   "public_key": "a6808e270e89466b095e50d1106d179cc611224ed54924bbb0a68b1793ae33c3",
-  "generated_at": 1794499939,
-  "expires_at": 1794500239
+  "generated_at": 1795008661,
+  "expires_at": 1795008961
 }

@@ -511,6 +511,15 @@ func (s *Server) registerPublicRoutes(r *mux.Router) {
 	// 免鉴权，因此已挂 GroupLauncher 限流，且响应里不含账号名/IP。
 	r.HandleFunc("/api/launcher/online", s.handleLauncherOnline).Methods("GET")
 
+	// 增强诊断上下文（2026-11-18，仅 S5A3）。
+	//
+	//	POST /api/diagnostics/context?game=s5a3
+	//
+	// 账号 API 只绑 127.0.0.1，玩家直连不到，所以由网关做这一条转发。
+	// 鉴权是 body 里的 read_token（服务端校验），网关不解析、不记录。
+	// 只放行 POST —— 参考实现同样只给网关加这一条白名单。
+	r.HandleFunc("/api/diagnostics/context", s.handleLauncherDiagnostics).Methods("POST")
+
 	// 插件下发（2026-09-30 插件增量更新，公开只读）。
 	//
 	// ★ 必须走 /api 路由：玩家端口(8080) 由 usePublicOnlyMiddleware 把非 /api 路径
@@ -1258,8 +1267,15 @@ func (s *Server) launcherChannelInfo() map[string]interface{} {
 	open := make([]int, 0, len(active))
 	for port := range active {
 		// 只认游戏口。频道引导口是 7001、内部口在 18080，都不在这个区间。
-		if port > 10000 && port < 20000 {
+		//
+		// 2026-11-18：除默认的 10000+频道号，再认 **20000+频道号**（端口映射档：
+		// 后端 10006 对外映射 20006 时，频道号仍是 6）。两档都按"高位去减"换算，
+		// 保持频道号语义不变；其它区间一律不算游戏口。
+		switch {
+		case port > 10000 && port < 20000:
 			open = append(open, port-10000)
+		case port >= 20000 && port < 30000:
+			open = append(open, port-20000)
 		}
 	}
 	sort.Ints(open)

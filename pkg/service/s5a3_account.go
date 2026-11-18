@@ -81,6 +81,11 @@ func newS5A3AccountClient(profile config.GameServerEntry) *s5a3AccountClient {
 type s5a3CredentialRequest struct {
 	Account  string `json:"account"`
 	Password string `json:"password"`
+
+	// DiagnosticCorrelationID 只在玩家同意开启增强诊断时下发，
+	// 由 S5A3 账号 API 签发只读 read_token（见 launcher_diagnostics.go）。
+	// 为空时上游不签发授权，登录行为完全不变。
+	DiagnosticCorrelationID string `json:"diagnosticCorrelationId,omitempty"`
 }
 
 type s5a3AccountResponse struct {
@@ -88,6 +93,9 @@ type s5a3AccountResponse struct {
 	AccountID string `json:"account_id"`
 	Token     string `json:"token"`
 	Message   string `json:"message"`
+
+	// Diagnostics 是增强诊断的只读授权（原样透传给登录器，网关不解析）。
+	Diagnostics map[string]interface{} `json:"diagnostics,omitempty"`
 }
 
 // s5a3Call 是三个接口共用的调用骨架，返回 (响应, HTTP 状态码, error)。
@@ -169,8 +177,12 @@ func (c *s5a3AccountClient) register(ctx context.Context, account, password, cli
 //
 // 返回的 token 是**服务端签发**的启动串令牌，必须原样写进 launch_args；
 // 网关不得用 security.GenerateToken() 替换它。
-func (c *s5a3AccountClient) login(ctx context.Context, account, password, clientIP string) (s5a3AccountResponse, int, string) {
-	result, status, err := c.call(ctx, "/api/account/login", s5a3CredentialRequest{Account: account, Password: password}, clientIP)
+func (c *s5a3AccountClient) login(ctx context.Context, account, password, clientIP, diagnosticCorrelationID string) (s5a3AccountResponse, int, string) {
+	result, status, err := c.call(ctx, "/api/account/login", s5a3CredentialRequest{
+		Account:                 account,
+		Password:                password,
+		DiagnosticCorrelationID: diagnosticCorrelationID,
+	}, clientIP)
 	if err != nil {
 		return result, models.Err.AccountUpstream, "账号服务暂时不可用，请稍后重试"
 	}
@@ -392,7 +404,7 @@ func (s *AccountService) registerS5A3Upstream(client *s5a3AccountClient, gameID,
 // 拼进启动串会被 S5A3 直接拒绝 —— 表现是"登录成功但游戏连不上"。
 // clientIP 是玩家真实 IP，经 X-Forwarded-For 交给服务端 ——
 // 服务端用它写 last_login_ip（后台"账号管理"显示的那一列）并按 IP 限流。
-func (s *AccountService) LoginS5A3(name, password, gameId, clientIP string) *models.LoginResult {
+func (s *AccountService) LoginS5A3(name, password, gameId, clientIP, diagnosticCorrelationID string) *models.LoginResult {
 	name = utils.TrimSpace(name)
 	password = strings.TrimSpace(password)
 
@@ -416,7 +428,7 @@ func (s *AccountService) LoginS5A3(name, password, gameId, clientIP string) *mod
 		return &models.LoginResult{ErrorCode: models.Err.PasswordEmpty}
 	}
 
-	response, code, msg := client.login(context.Background(), name, password, clientIP)
+	response, code, msg := client.login(context.Background(), name, password, clientIP, diagnosticCorrelationID)
 	if code != models.Err.Ok {
 		result := &models.LoginResult{ErrorCode: code}
 		if msg != "" {
@@ -467,6 +479,8 @@ func (s *AccountService) LoginS5A3(name, password, gameId, clientIP string) *mod
 		Token:      response.Token,
 		MId:        identity,
 		LaunchArgs: launchArgs,
+		// 诊断授权原样回给登录器（网关不解析）。未开启诊断时上游不签发 ⇒ nil。
+		Diagnostics: response.Diagnostics,
 	}
 }
 

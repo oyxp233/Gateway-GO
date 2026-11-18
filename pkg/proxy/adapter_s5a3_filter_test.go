@@ -49,7 +49,10 @@ func buildS5A3ChannelPlain(entries []s5a3TestEntry, serverID uint32) []byte {
 	return out
 }
 
-// wrapS5A3ChannelFrame 把明文加密并包成 11 字节头的完整帧。
+// wrapS5A3ChannelFrame 把明文加密并包成 **11 字节 legacy 头** 的完整帧。
+//
+// 与服务端 buildLegacyPacket / 真实夹具一致：[0]=class、[1]=msgID 低字节、
+// [2:6]=总长(LE32)、[10]=1，body 从 11 开始，无 checksum。
 func wrapS5A3ChannelFrame(t *testing.T, plain []byte, r *ChannelListRewriter) []byte {
 	t.Helper()
 	encrypted := r.encrypt(plain, r.currentKey())
@@ -137,6 +140,81 @@ func TestS5A3FilterDropsClosedPortChannels(t *testing.T) {
 	}
 }
 
+// newS5A3FilterTestAdapterMapped 构造带端口映射的适配器（backend -> public 不一致）。
+func newS5A3FilterTestAdapterMapped(mapping map[int]int) (*S5A3ChannelAdapter, *s5CollectConn) {
+	view := newPortView()
+	for backend, public := range mapping {
+		view.backendToPublic[backend] = public
+	}
+	holder := &atomic.Pointer[portView]{}
+	holder.Store(view)
+	r := NewChannelListRewriter(0)
+	return &S5A3ChannelAdapter{rewriter: r, ports: holder}, &s5CollectConn{}
+}
+
+// TestS5A3FilterRewritesPortWhenMapped 回归用例（2026-11-18）。
+//
+// 现场 bug：端口表把 10010 映射成 20010 对外（安全组只放行 200xx），
+// 但频道表里仍有 10010。此时**所有端口都开着** ⇒ dropped==0，
+// 旧代码在 `if dropped == 0 { 原样转发 }` 处把改写结果丢掉，
+// 客户端拿到的仍是 10010 → 安全组过滤 → 每 3 秒重连频道口，表现为"连不上频道"。
+//
+// 本用例钉住：dropped==0 但端口需要改写时，必须重新加密下发，且：
+//   · 条目端口 = public（20010）
+//   · 条目数不变、前缀前 8 字节不变、IP 不变
+func TestS5A3FilterRewritesPortWhenMapped(t *testing.T) {
+	adapter, dst := newS5A3FilterTestAdapterMapped(map[int]int{10010: 20010, 10012: 20012})
+
+	plain := buildS5A3ChannelPlain([]s5a3TestEntry{
+		{name: "cain-10", port: 10010, ip: "43.136.78.193"},
+		{name: "cain-12", port: 10012, ip: "43.136.78.193"},
+	}, 0)
+	frame := wrapS5A3ChannelFrame(t, plain, adapter.rewriter)
+
+	if rest := adapter.ProcessDownlink(frame, dst); rest != nil {
+		t.Fatalf("完整帧不该留下残包，实际 %d 字节", len(rest))
+	}
+
+	written := dst.written
+	if len(written) < channelFrameHeaderSize {
+		t.Fatalf("输出过短: %d 字节", len(written))
+	}
+	if total := int(binary.LittleEndian.Uint32(written[channelFrameLenOffset:])); total != len(written) {
+		t.Fatalf("帧头长度 %d 与实际 %d 不符", total, len(written))
+	}
+
+	decrypted, _, ok := adapter.rewriter.decryptAnyS5A3(written[channelFrameHeaderSize:])
+	if !ok {
+		t.Fatal("输出帧无法解密回合法频道列表")
+	}
+
+	count := int(binary.LittleEndian.Uint32(decrypted[s5a3ChannelCountOffset:s5a3ChannelPrefixSize]))
+	if count != 2 {
+		t.Fatalf("条目数 = %d，期望 2（只改端口不该过滤）", count)
+	}
+	if !bytes.Equal(decrypted[0:8], plain[0:8]) {
+		t.Fatalf("前缀 server_count/server_id 被改动: %x vs %x", decrypted[0:8], plain[0:8])
+	}
+
+	wantPorts := []int{20010, 20012}
+	for i, want := range wantPorts {
+		off := s5a3ChannelPrefixSize + i*s5a3ChannelEntrySize
+		got := int(binary.LittleEndian.Uint32(decrypted[off+s5a3ChannelPortOffset : off+s5a3ChannelPortOffset+4]))
+		if got != want {
+			t.Fatalf("第 %d 条端口 = %d，期望 %d（未改写回 public）", i+1, got, want)
+		}
+		gotIP := decrypted[off+s5a3ChannelIPOffset : off+s5a3ChannelIPOffset+16]
+		if !bytes.HasPrefix(gotIP, []byte("43.136.78.193")) {
+			t.Fatalf("第 %d 条 IP 被改写: %q", i+1, gotIP)
+		}
+	}
+
+	// 再直接验一次返回值语义：dropped==0 但 rewritten==true
+	if _, kept, dropped, rewritten := filterS5A3ChannelList(plain, adapter.ports.Load()); kept != 2 || dropped != 0 || !rewritten {
+		t.Fatalf("filter 返回值 kept=%d dropped=%d rewritten=%v，期望 2/0/true", kept, dropped, rewritten)
+	}
+}
+
 // TestS5A3FilterKeepsIPUntouched 钉住"S5A3 不改 IP"这条与 S4A21 的关键差异。
 func TestS5A3FilterKeepsIPUntouched(t *testing.T) {
 	adapter, _ := newS5A3FilterTestAdapter(10010)
@@ -145,7 +223,7 @@ func TestS5A3FilterKeepsIPUntouched(t *testing.T) {
 		{name: "cain-99", port: 10099, ip: "1.2.3.4"}, // 剔除
 	}, 0)
 
-	filtered, kept, dropped := filterS5A3ChannelList(plain, adapter.ports.Load())
+	filtered, kept, dropped, _ := filterS5A3ChannelList(plain, adapter.ports.Load())
 	if kept != 1 || dropped != 1 {
 		t.Fatalf("kept=%d dropped=%d，期望 1/1", kept, dropped)
 	}

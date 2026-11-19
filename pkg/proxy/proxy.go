@@ -852,8 +852,11 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 	// 带 Endpoint(地址,端口)，由 gameAdapter 改写；S4A21 无游戏口下行
 	// 适配器 = 纯透传）。
 	downlinkDone := make(chan struct{})
+	// downEnd 由下行 goroutine 写、close(downlinkDone) 之后主 goroutine 读；
+	// close 建立 happens-before，无数据竞争。用于断链日志判断"谁先断"。
+	var downEnd copyEnd
 	go func() {
-		p.copyDownlink(backend, client, p.gameAdapter, fmt.Sprintf("Game %d 下行", publicPort))
+		downEnd = p.copyDownlink(backend, client, p.gameAdapter, fmt.Sprintf("Game %d 下行", publicPort))
 		close(downlinkDone)
 	}()
 
@@ -984,6 +987,7 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 	// GameProxyConnections（= 玩家真的连上了游戏频道），泡点主循环才累计
 	// 时长；这里 defer 断开后计时立即停止。改动本函数的连接登记时机
 	// 会直接影响泡点发放，见 session.CollectBonusAwards。
+	connectedAt := time.Now()
 	p.sessionManager.AddGameProxyConnection(sessionObj, client)
 	defer p.sessionManager.RemoveGameProxyConnection(sessionObj, client)
 
@@ -1005,10 +1009,23 @@ func (p *ProxyServer) handleGameClient(client net.Conn, publicPort, backendPort 
 		joined, remoteIP, backendPort, route, adm.cred))
 
 	// 上行：客户端 -> 后端
-	p.copyWithTimeout(client, backend, fmt.Sprintf("Game %d 上行", publicPort))
+	upEnd := p.copyWithTimeout(client, backend, fmt.Sprintf("Game %d 上行", publicPort))
 
 	// 等待下行结束
 	<-downlinkDone
+
+	// ★ 断链日志（2026-11-19）：一条 Game 连接从建立到关闭必有这一行，
+	// 记录账号 / 来源 IP / 存活时长 / 归属方式 / 上下行各自结束原因。
+	// 排查「挂机掉线」时用它一眼区分：
+	//   · idle-timeout(1800s无数据) = 代理层 30 分钟空闲超时断链（头号嫌疑）
+	//   · eof                       = 客户端自己关（正常退出 / 崩 client / 休眠）
+	//   · local-close               = 本端主动关（踢线 / 会话清理 / 网关重启）
+	//   · write-error               = 对端写不进（网络中断 / RST）
+	// 措辞以「Game 连接已关闭」开头，便于与已有的「Game 连接已建立」配对 grep。
+	p.logger.Info(fmt.Sprintf(
+		"Game 连接已关闭: %s (%s) -> %d [存活=%s][归属=%s][上行=%s][下行=%s]",
+		joined, remoteIP, publicPort, time.Since(connectedAt).Truncate(time.Millisecond),
+		route, upEnd.String(), downEnd.String()))
 }
 
 // gamePacketHeaderSize 是服务端 GamePacketHeader（Pack = 1）的线上长度：
@@ -1478,49 +1495,97 @@ func isNumericMIdStrict(mId string) bool {
 	return true
 }
 
-// copyWithTimeout 双向透传，带空闲超时。
-func (p *ProxyServer) copyWithTimeout(src, dst net.Conn, context string) {
+// copyEnd 描述一条 copy 方向为何结束。
+//
+// 背景（2026-11-19）：此前 copyWithTimeout / copyDownlink 遇到 EOF、空闲
+// 超时、写失败一律静默 return，游戏连接「怎么断的」在网关侧零留痕，
+// 排查「挂机掉线」时只能看到「会话超时清理：游戏连接=0」，无法区分
+// 客户端自己关、30 分钟 idle 超时、还是服务端主动强关。这里把结束原因
+// 结构化返回，由 handleGameClient 汇总成一条断链日志。
+type copyEnd struct {
+	cause  string // shutdown / idle-timeout / eof / read-error / write-error / zero-read
+	detail string // 底层错误文本（仅异常原因填写）
+}
+
+func (e copyEnd) String() string {
+	if e.detail == "" {
+		return e.cause
+	}
+	return e.cause + "(" + e.detail + ")"
+}
+
+// classifyReadEnd 把 readTimeout 的错误归类成可读的断链原因。
+func classifyReadEnd(err error, idle time.Duration) copyEnd {
+	switch {
+	case err == nil:
+		return copyEnd{cause: "zero-read"}
+	case errors.Is(err, errShutdown):
+		return copyEnd{cause: "shutdown"}
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return copyEnd{cause: "idle-timeout", detail: fmt.Sprintf("%ds无数据", int(idle.Seconds()))}
+	case errors.Is(err, net.ErrClosed):
+		// 本端主动 Close：踢线、会话清理、网关重启都会走这里。
+		// 与 eof（对端先关）区分开，是"谁先断"的第一手证据。
+		return copyEnd{cause: "local-close"}
+	case errors.Is(err, io.EOF):
+		return copyEnd{cause: "eof"}
+	default:
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return copyEnd{cause: "idle-timeout", detail: fmt.Sprintf("%ds无数据", int(idle.Seconds()))}
+		}
+		return copyEnd{cause: "read-error", detail: err.Error()}
+	}
+}
+
+// copyWithTimeout 双向透传，带空闲超时。返回值描述结束原因（见 copyEnd）。
+func (p *ProxyServer) copyWithTimeout(src, dst net.Conn, context string) copyEnd {
 	buf := make([]byte, copyBufferSize)
 	for {
 		select {
 		case <-p.shutdown:
-			return
+			return copyEnd{cause: "shutdown"}
 		default:
 		}
 
 		n, err := p.readTimeout(src, buf, p.idleTimeout)
-		if err != nil || n <= 0 {
-			return
+		if err != nil {
+			return classifyReadEnd(err, p.idleTimeout)
+		}
+		if n <= 0 {
+			return copyEnd{cause: "zero-read"}
 		}
 
 		if _, err := dst.Write(buf[:n]); err != nil {
-			return
+			return copyEnd{cause: "write-error", detail: err.Error()}
 		}
 	}
 }
 
 // copyDownlink 下行透传；adapter 非 nil 时按帧交给适配器改写
 // （频道口 / 游戏口共用，协议差异在适配器里）。
-func (p *ProxyServer) copyDownlink(src, dst net.Conn, adapter DownlinkAdapter, context string) {
+func (p *ProxyServer) copyDownlink(src, dst net.Conn, adapter DownlinkAdapter, context string) copyEnd {
 	buf := make([]byte, copyBufferSize)
 	pending := make([]byte, 0, copyBufferSize)
 
 	if adapter == nil {
 		// 纯透传
-		p.copyWithTimeout(src, dst, context)
-		return
+		return p.copyWithTimeout(src, dst, context)
 	}
 
 	for {
 		select {
 		case <-p.shutdown:
-			return
+			return copyEnd{cause: "shutdown"}
 		default:
 		}
 
 		n, err := p.readTimeout(src, buf, p.idleTimeout)
-		if err != nil || n <= 0 {
-			return
+		if err != nil {
+			return classifyReadEnd(err, p.idleTimeout)
+		}
+		if n <= 0 {
+			return copyEnd{cause: "zero-read"}
 		}
 
 		// 追加到缓冲区

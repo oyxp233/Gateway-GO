@@ -166,8 +166,8 @@ func TestS5A3FilterRewritesPortWhenMapped(t *testing.T) {
 	adapter, dst := newS5A3FilterTestAdapterMapped(map[int]int{10010: 20010, 10012: 20012})
 
 	plain := buildS5A3ChannelPlain([]s5a3TestEntry{
-		{name: "cain-10", port: 10010, ip: "43.136.78.193"},
-		{name: "cain-12", port: 10012, ip: "43.136.78.193"},
+		{name: "cain-10", port: 10010, ip: "198.51.100.10"},
+		{name: "cain-12", port: 10012, ip: "198.51.100.10"},
 	}, 0)
 	frame := wrapS5A3ChannelFrame(t, plain, adapter.rewriter)
 
@@ -204,7 +204,7 @@ func TestS5A3FilterRewritesPortWhenMapped(t *testing.T) {
 			t.Fatalf("第 %d 条端口 = %d，期望 %d（未改写回 public）", i+1, got, want)
 		}
 		gotIP := decrypted[off+s5a3ChannelIPOffset : off+s5a3ChannelIPOffset+16]
-		if !bytes.HasPrefix(gotIP, []byte("43.136.78.193")) {
+		if !bytes.HasPrefix(gotIP, []byte("198.51.100.10")) {
 			t.Fatalf("第 %d 条 IP 被改写: %q", i+1, gotIP)
 		}
 	}

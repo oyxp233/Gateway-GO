@@ -1,0 +1,69 @@
+name: Build and push S5A3 Gateway image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Gitee branch or tag to build
+        required: true
+        type: string
+        default: feature/s5a3-standalone
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GITEE_REPO: https://gitee.com/msp520/Gateway-GO.git
+  DEFAULT_REF: feature/s5a3-standalone
+  IMAGE: ghcr.io/oyxp233/s5a3-gateway
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (contains the fixed Dockerfile)
+        uses: actions/checkout@v4
+
+      - name: Clone source from Gitee
+        run: |
+          REF="${{ inputs.ref }}"
+          [ -n "$REF" ] || REF="$DEFAULT_REF"
+          echo "Building ref: $REF"
+          git clone --depth 1 --branch "$REF" "$GITEE_REPO" src
+          # Gitee 仓库里的旧 Dockerfile 是 S4A21 时代的，必须用本仓库的修复版覆盖。
+          # 修复版产出 s5a3-gateway + s5a3-admin，并把 wwwroot 打进镜像。
+          cp ./docker/Dockerfile ./src/Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.run_number }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      - name: Make package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/$(basename "$IMAGE")/visibility" \
+            -f visibility=public

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Gitee branch or tag to build
+        description: Source branch in this repo to build
         required: true
         type: string
         default: feature/s5a3-standalone
@@ -16,7 +16,6 @@ permissions:
   packages: write
 
 env:
-  GITEE_REPO: https://gitee.com/msp520/Gateway-GO.git
   DEFAULT_REF: feature/s5a3-standalone
   IMAGE: ghcr.io/oyxp233/s5a3-gateway
 
@@ -24,18 +23,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout this repo (contains the fixed Dockerfile)
+      - name: Checkout source branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'feature/s5a3-standalone' }}
 
-      - name: Clone source from Gitee
+      - name: Use fixed Dockerfile
         run: |
-          REF="${{ inputs.ref }}"
-          [ -n "$REF" ] || REF="$DEFAULT_REF"
-          echo "Building ref: $REF"
-          git clone --depth 1 --branch "$REF" "$GITEE_REPO" src
-          # Gitee 仓库里的旧 Dockerfile 是 S4A21 时代的，必须用本仓库的修复版覆盖。
+          # 源码分支里的旧 Dockerfile 是 S4A21 时代的，必须用 main 上的修复版覆盖。
           # 修复版产出 s5a3-gateway + s5a3-admin，并把 wwwroot 打进镜像。
-          cp ./docker/Dockerfile ./src/Dockerfile
+          curl -fsSL https://raw.githubusercontent.com/oyxp233/Gateway-GO/main/docker/Dockerfile -o Dockerfile
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,8 +47,8 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: ./src
-          file: ./src/Dockerfile
+          context: .
+          file: ./Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE }}:latest
